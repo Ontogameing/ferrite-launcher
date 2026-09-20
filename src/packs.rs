@@ -2266,4 +2266,72 @@ mod tests {
         let error = inspect(&pack).unwrap_err().to_string();
         assert!(error.contains("Modrinth or CurseForge"));
     }
+
+    #[test]
+    fn absolute_and_dotdot_entry_names_are_rejected() {
+        let temp = TempDir::new("abs-paths");
+        for name in [
+            "/etc/passwd",
+            "C:/Windows/system32/evil.dll",
+            "mods/../../escape.txt",
+        ] {
+            let pack = temp.0.join(format!(
+                "bad-{}.zip",
+                TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            make_zip(&pack, &[(name, b"x")]);
+            assert!(
+                matches!(inspect(&pack), Err(PackError::Security(_))),
+                "expected Security for {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn archive_entry_count_limit_is_enforced() {
+        let temp = TempDir::new("entry-limit");
+        let pack = temp.0.join("many.zip");
+        let file = File::create(&pack).unwrap();
+        let mut zip = ZipWriter::new(file);
+        for i in 0..5 {
+            zip.start_file(format!("f{i}.txt"), FileOptions::default())
+                .unwrap();
+            zip.write_all(b"x").unwrap();
+        }
+        zip.finish().unwrap();
+        let limits = ArchiveLimits {
+            max_entries: 3,
+            max_file_bytes: 1024 * 1024,
+            max_total_bytes: 1024 * 1024,
+        };
+        assert!(matches!(
+            inspect_with_limits(&pack, limits),
+            Err(PackError::Limit(_))
+        ));
+    }
+
+    #[test]
+    fn archive_file_and_total_size_limits_are_enforced() {
+        let temp = TempDir::new("size-limit");
+        let pack = temp.0.join("big.zip");
+        make_zip(&pack, &[("mods/big.jar", &[0u8; 64])]);
+        let per_file = ArchiveLimits {
+            max_entries: 100,
+            max_file_bytes: 16,
+            max_total_bytes: 1024 * 1024,
+        };
+        assert!(matches!(
+            inspect_with_limits(&pack, per_file),
+            Err(PackError::Limit(_))
+        ));
+        let total = ArchiveLimits {
+            max_entries: 100,
+            max_file_bytes: 1024 * 1024,
+            max_total_bytes: 32,
+        };
+        assert!(matches!(
+            inspect_with_limits(&pack, total),
+            Err(PackError::Limit(_))
+        ));
+    }
 }

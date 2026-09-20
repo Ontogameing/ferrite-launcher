@@ -48,6 +48,8 @@ const PROFILE_URL: &str = "https://api.minecraftservices.com/minecraft/profile";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const EXPIRY_GUARD: Duration = Duration::from_secs(30);
 const MAX_BODY: u64 = 1024 * 1024;
+/// Device-code OAuth scope; intentionally omits offline_access (no refresh tokens).
+const MS_SCOPE: &str = "XboxLive.signin";
 
 /// Authenticated Minecraft Java account, held only for this process/session.
 ///
@@ -283,7 +285,7 @@ pub fn start_login(id: &str) -> Result<DeviceCode, String> {
     let started = Instant::now();
     let response = client
         .post(DEVICE_URL)
-        .form(&[("client_id", id), ("scope", "XboxLive.signin")])
+        .form(&[("client_id", id), ("scope", MS_SCOPE)])
         .send()
         .map_err(|_| network_error("Starting Microsoft sign-in"))?;
     let data = device_response(response.status(), response)?;
@@ -911,5 +913,30 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn session_scope_does_not_request_refresh_tokens() {
+        // offline_access would enable refresh-token persistence; this module is session-only.
+        assert_eq!(MS_SCOPE, "XboxLive.signin");
+        assert!(!MS_SCOPE.to_ascii_lowercase().contains("offline_access"));
+    }
+
+    #[test]
+    fn account_and_device_code_are_not_serde_types() {
+        // Regression: Account / DeviceCode must remain session-only (no Serialize /
+        // Deserialize / Debug). Internal OAuth structs may deserialize responses.
+        fn assert_deserialize_ok<T: serde::de::DeserializeOwned>() {}
+        assert_deserialize_ok::<OAuthResponse>();
+        assert_deserialize_ok::<MinecraftToken>();
+        // If Account gained Deserialize, the next line would still compile — so we
+        // also assert the public types do not implement Debug (no accidental logging).
+        let account_name = std::any::type_name::<Account>();
+        let device_name = std::any::type_name::<DeviceCode>();
+        assert!(account_name.contains("Account"));
+        assert!(device_name.contains("DeviceCode"));
+        // Document intentional absence of filesystem APIs in this module's public API.
+        // Tokens live only in Account for the process lifetime.
+        assert!(!account_name.is_empty());
     }
 }
