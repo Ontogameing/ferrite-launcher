@@ -156,8 +156,13 @@ pub fn save(profiles: &[InstanceProfile]) -> Result<(), InstanceError> {
 ///
 /// Existing directories are accepted. Other filesystem conflicts and permission
 /// failures are returned without changing profile metadata.
+///
+/// Security: refuses to create unless the resolved game directory is a strict
+/// lexical child of the instances root (same gate as [`delete_game_dir`]).
 pub fn create_game_dir(profile: &InstanceProfile) -> Result<(), InstanceError> {
-    fs::create_dir_all(profile.game_dir())?;
+    let path = profile.game_dir();
+    ensure_game_dir_contained(&path)?;
+    fs::create_dir_all(&path)?;
     Ok(())
 }
 
@@ -172,7 +177,8 @@ pub fn create_game_dir(profile: &InstanceProfile) -> Result<(), InstanceError> {
 /// Security: refuses to delete unless the resolved game directory is a strict
 /// lexical child of the instances root. This blocks malicious `directory`
 /// values restored from metadata (absolute paths, `..` traversal) from causing
-/// `remove_dir_all` outside the launcher-owned instance tree.
+/// `remove_dir_all` outside the launcher-owned instance tree. Create uses the
+/// same containment gate.
 pub fn delete_game_dir(profile: &InstanceProfile) -> Result<(), InstanceError> {
     let path = profile.game_dir();
     ensure_game_dir_contained(&path)?;
@@ -183,6 +189,7 @@ pub fn delete_game_dir(profile: &InstanceProfile) -> Result<(), InstanceError> {
 }
 
 /// Rejects paths that escape [`instances_dir`] via absolute components or `..`.
+/// Used by both create and delete so neither can act outside the instances tree.
 fn ensure_game_dir_contained(path: &Path) -> Result<(), InstanceError> {
     let root = instances_dir();
     if is_contained_instance_path(path, &root) {
@@ -191,7 +198,7 @@ fn ensure_game_dir_contained(path: &Path) -> Result<(), InstanceError> {
         Err(InstanceError::Io(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "refusing to delete path outside instances root ({}): {}",
+                "refusing to modify path outside instances root ({}): {}",
                 root.display(),
                 path.display()
             ),
@@ -326,6 +333,28 @@ mod tests {
                 || msg.contains("PermissionDenied")
                 || msg.contains("refusing"),
             "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn create_game_dir_refuses_escaped_profile_directory() {
+        let profile = InstanceProfile {
+            name: "escape".to_owned(),
+            version: "1.20.1".to_owned(),
+            loader: "Vanilla".to_owned(),
+            directory: "../../outside-ferrite-create-target".to_owned(),
+        };
+        let err = create_game_dir(&profile).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("outside instances root")
+                || msg.contains("PermissionDenied")
+                || msg.contains("refusing"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("modify") || msg.contains("refusing"),
+            "expected generalized refusal message, got: {msg}"
         );
     }
 }
