@@ -470,7 +470,14 @@ mod tests {
         assert!(uninstall(&dir.0, "directory.jar").is_err());
         assert!(set_enabled(&dir.0, "directory.jar", true).is_err());
         assert!(list(dir.0.join("missing")).unwrap().is_empty());
-        assert!(list(dir.0.join("missing/../other")).is_err());
+        // Use a plain absolute path: joining onto a canonicalized `\\?\` base would
+        // have `PathBuf::push` drop the `..` before the check could see it.
+        let traversal = if cfg!(windows) {
+            r"C:\missing\..\other"
+        } else {
+            "/missing/../other"
+        };
+        assert!(list(Path::new(traversal)).is_err());
         fs::write(dir.0.join("file"), b"x").unwrap();
         assert!(list(dir.0.join("file")).is_err());
     }
