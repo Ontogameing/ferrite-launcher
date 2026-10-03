@@ -5,6 +5,8 @@ use super::*;
 use crate::core::paths::StorageMode;
 use crate::core::paths::test_support::paths_in;
 use std::cell::Cell;
+use std::collections::BTreeMap;
+use std::fs::File;
 use std::time::Duration;
 
 const V0: &str =
