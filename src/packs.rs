@@ -30,7 +30,7 @@
 //! overrides roots. Volatile/user-specific paths are excluded, worlds are opt-in, and
 //! symlinks or special files abort export. Output paths must be absolute. The completed ZIP
 //! is published with a no-clobber hard link; file systems without hard links (FAT32/exFAT)
-//! fall back to an exclusive-create copy, and a confirmed replace renames over the old file.
+//! fall back to a no-replace rename of the finished temp file, and a confirmed replace renames over the old file.
 //! Loader pins are metadata
 //! only in every format; installing the requested loader remains the caller's responsibility.
 
@@ -2060,10 +2060,13 @@ fn check_output(output: &Path, replace_existing: bool) -> Result<()> {
 /// * Replace: `rename` over the old file, which is atomic on every supported OS.
 /// * No-clobber: a hard link publishes atomically and fails if the output appeared
 ///   meanwhile. File systems without hard links (FAT32/exFAT report `EPERM`, others
-///   `ENOTSUP`/`ERROR_INVALID_FUNCTION`) get a fallback: create the output with
-///   `create_new` (still no-clobber), copy, `sync_all`. That copy is not atomic (a
-///   partial file is visible while copying), and on failure only the file created here
-///   is deleted.
+///   `ENOTSUP`/`ERROR_INVALID_FUNCTION`) fall back to renaming the temporary file (already
+///   complete and synced, in the same folder) into place with
+///   [`ferrite_launcher::core::fsutil::rename_no_replace`], which never replaces an
+///   existing file. Both paths are atomic: the output is either absent or complete.
+///   Where the OS has no exclusive rename for that file system (rare; e.g. some macOS
+///   network mounts), `rename_no_replace` checks for the output right before a plain
+///   rename, leaving a tiny race window.
 ///
 /// The temporary file is removed on success.
 fn publish_export(temporary: &Path, output: &Path, replace: bool, link: LinkFn<'_>) -> Result<()> {
@@ -2079,29 +2082,24 @@ fn publish_export(temporary: &Path, output: &Path, replace: bool, link: LinkFn<'
             return Err(PackError::AlreadyExists(output.to_owned()));
         }
         Err(link_error) => {
-            let mut destination = match OpenOptions::new().write(true).create_new(true).open(output)
-            {
-                Ok(file) => file,
+            // No hard links (FAT32/exFAT, some network shares): the finished temp file
+            // already sits in the destination folder and is synced, so rename it into
+            // place without replacing anything. The output is never half-written.
+            match ferrite_launcher::core::fsutil::rename_no_replace(temporary, output) {
+                Ok(()) => {
+                    eprintln!(
+                        "Ferrite export: hard links unavailable for {} ({link_error}); \
+                         renamed into place instead",
+                        output.display()
+                    );
+                    sync_parent(output);
+                    return Ok(());
+                }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                     return Err(PackError::AlreadyExists(output.to_owned()));
                 }
                 Err(error) => return Err(error.into()),
-            };
-            let copied = (|| -> io::Result<()> {
-                let mut source = File::open(temporary)?;
-                io::copy(&mut source, &mut destination)?;
-                destination.sync_all()
-            })();
-            if let Err(error) = copied {
-                drop(destination);
-                // Only the file this call created; the output did not exist before.
-                let _ = fs::remove_file(output);
-                return Err(error.into());
             }
-            eprintln!(
-                "Ferrite export: hard links unavailable for {} ({link_error}); copied instead",
-                output.display()
-            );
         }
     }
     fs::remove_file(temporary)?;
@@ -2804,7 +2802,7 @@ mod tests {
     }
 
     #[test]
-    fn link_failure_falls_back_to_exclusive_copy() {
+    fn link_failure_falls_back_to_no_replace_rename() {
         let temp = TempDir::new("nolink");
         let game = game_dir(&temp);
         let output = temp.0.join("Pack 1.20.zip");
@@ -2826,6 +2824,7 @@ mod tests {
         assert!(leftover_temporaries(&temp.0).is_empty());
 
         // The fallback is still no-clobber.
+        let output = temp.0.join("Second.zip");
         let result = export_directory_with(
             &game,
             &output,
@@ -2838,29 +2837,35 @@ mod tests {
                 Err(io::Error::from(io::ErrorKind::Unsupported))
             },
         );
-        assert!(result.is_err());
+        assert!(matches!(result, Err(PackError::AlreadyExists(_))));
+        assert_eq!(fs::read(&output).unwrap(), b"theirs");
         assert!(leftover_temporaries(&temp.0).is_empty());
     }
 
     #[test]
-    fn fallback_copy_failure_removes_only_its_own_file() {
-        let temp = TempDir::new("copyfail");
+    fn fallback_rename_is_atomic_and_never_replaces() {
+        let temp = TempDir::new("renamefallback");
         let output = temp.0.join("out.zip");
         let temporary = temp.0.join(".out.zip.export.1.1.tmp");
-        // A missing temporary makes the copy fail after the output was created.
-        let result = publish_export(&temporary, &output, false, &|_, _| {
+        let no_links = |_: &Path, _: &Path| -> io::Result<()> {
             Err(io::Error::from(io::ErrorKind::Unsupported))
-        });
+        };
+        // A missing temporary fails without creating anything at the output.
+        let result = publish_export(&temporary, &output, false, &no_links);
         assert!(result.is_err());
-        assert!(!output.exists(), "the partially written output is removed");
+        assert!(!output.exists());
 
-        // An output that existed before is never removed by the fallback.
-        fs::write(&output, b"theirs").unwrap();
-        let result = publish_export(&temporary, &output, false, &|_, _| {
-            Err(io::Error::from(io::ErrorKind::Unsupported))
-        });
+        // The complete file appears in one step and the temporary is gone.
+        fs::write(&temporary, b"complete archive").unwrap();
+        publish_export(&temporary, &output, false, &no_links).unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"complete archive");
+        assert!(!temporary.exists());
+
+        // An existing output is never replaced by the fallback.
+        fs::write(&temporary, b"second").unwrap();
+        let result = publish_export(&temporary, &output, false, &no_links);
         assert!(matches!(result, Err(PackError::AlreadyExists(_))));
-        assert_eq!(fs::read(&output).unwrap(), b"theirs");
+        assert_eq!(fs::read(&output).unwrap(), b"complete archive");
     }
 
     #[test]
