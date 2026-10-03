@@ -832,15 +832,20 @@ impl Ferrite {
                         quilt_badge(ui, &profile.loader, muted_color);
                     });
                     ui.text_edit_singleline(&mut self.pack_loader_version);
-                    muted(
-                        ui,
+                    // Only claim a prefill when there was one (unknown stays empty).
+                    let help = if self.pack_loader_version.trim().is_empty() {
                         format!(
-                            "These pack formats record the exact {} version. Ferrite filled in \
-                             the one this instance uses.",
+                            "These pack formats record the exact {} version.",
                             profile.loader
-                        ),
-                        muted_color,
-                    );
+                        )
+                    } else {
+                        format!(
+                            "These pack formats record the exact {} version. Ferrite filled \
+                             in the one this instance uses.",
+                            profile.loader
+                        )
+                    };
+                    muted(ui, help, muted_color);
                 }
                 ui.checkbox(&mut self.pack_include_worlds, "Include worlds");
                 if matches!(

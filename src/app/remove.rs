@@ -622,6 +622,8 @@ fn delete_dialog_ui(
                     ))
                     .wrap(),
                 );
+            } else if dialog.missing {
+                ui.add(egui::Label::new(format!("{name} will be removed from Ferrite.")).wrap());
             } else {
                 ui.add(
                     egui::Label::new(format!(

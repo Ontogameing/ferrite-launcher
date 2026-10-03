@@ -286,7 +286,7 @@ impl Ferrite {
         ui.horizontal(|ui| {
             let create = ui.add_enabled(
                 lock.is_none(),
-                egui::Button::new(RichText::new("＋ Create instance").color(Color32::WHITE))
+                egui::Button::new(RichText::new("+ Create instance").color(Color32::WHITE))
                     .fill(self.accent_color()),
             );
             if create.clicked() {
@@ -662,7 +662,7 @@ fn instance_card(
         ) {
             action = Some(CardAction::Mods(index));
         }
-        let menu = ui.menu_button("⋯", |ui| card_menu(ui, index, instance, info));
+        let menu = ui.menu_button("…", |ui| card_menu(ui, index, instance, info));
         if let Some(Some(menu_action)) = menu.inner {
             action = Some(menu_action);
         }

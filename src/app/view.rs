@@ -119,19 +119,16 @@ impl Ferrite {
                             .strong(),
                         );
                         if let Some(instance) = &selected {
-                            ui.horizontal(|ui| {
-                                super::dialogs::loader_text(
-                                    ui,
-                                    &instance.loader,
-                                    RichText::new(format!(
-                                        "Minecraft {}  ·  {}",
-                                        instance.version, instance.loader
-                                    ))
-                                    .size(15.0)
-                                    .color(MUTED),
-                                    MUTED,
-                                );
-                            });
+                            ui.label(
+                                RichText::new(format!(
+                                    "Minecraft {}  ·  {}",
+                                    instance.version, instance.loader
+                                ))
+                                .size(15.0)
+                                .color(MUTED),
+                            );
+                            // Centered under the line in this centered layout.
+                            super::dialogs::quilt_badge(ui, &instance.loader, MUTED);
                         } else {
                             ui.label(
                                 RichText::new("Create or import an instance to get started.")
