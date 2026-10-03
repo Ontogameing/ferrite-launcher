@@ -26,10 +26,10 @@
 //! dispatch until the marker is committed.
 
 use crate::minecraft::{self, FerriteError, Result};
+use ferrite_launcher::core::paths::AppPaths;
 use reqwest::blocking::Client;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 const NEO_MAVEN: &str = "https://maven.neoforged.net/releases";
 const LEGACY_META: &str =
@@ -47,8 +47,8 @@ enum NeoCoord {
 }
 
 /// Installs the latest available NeoForge build for `mc_version`.
-pub fn install(mc_version: &str) -> Result<()> {
-    install_version(mc_version, None)
+pub fn install(paths: &AppPaths, mc_version: &str) -> Result<()> {
+    install_version(paths, mc_version, None)
 }
 
 /// Installs a requested NeoForge version, or discovers the latest compatible build.
@@ -59,8 +59,8 @@ pub fn install(mc_version: &str) -> Result<()> {
 /// Java synchronously, discovers its output, flattens inherited metadata, ensures
 /// a client jar, copies natives, and writes the marker last. Errors leave any
 /// completed shared-cache work in place. Installer-file removal is best-effort.
-pub fn install_version(mc_version: &str, requested: Option<&str>) -> Result<()> {
-    minecraft::install_version(mc_version)?;
+pub fn install_version(paths: &AppPaths, mc_version: &str, requested: Option<&str>) -> Result<()> {
+    minecraft::install_version(paths, mc_version)?;
 
     let client = Client::new();
     let coord = match requested.map(str::trim).filter(|value| !value.is_empty()) {
@@ -82,7 +82,7 @@ pub fn install_version(mc_version: &str, requested: Option<&str>) -> Result<()> 
     };
     println!("Latest NeoForge for {mc_version} is {neo_label}");
 
-    let vanilla_dir = minecraft::version_dir(mc_version);
+    let vanilla_dir = paths.version_dir(mc_version);
     let vanilla_client = vanilla_dir.join("client.jar");
     let vanilla_named = vanilla_dir.join(format!("{mc_version}.jar"));
     if !vanilla_named.exists() {
@@ -101,7 +101,7 @@ pub fn install_version(mc_version: &str, requested: Option<&str>) -> Result<()> 
         NeoCoord::Legacy { full } => format!("forge-{full}-installer.jar"),
         NeoCoord::Modern { neo } => format!("neoforge-{neo}-installer.jar"),
     };
-    let installer_path = minecraft::base_dir().join(installer_name);
+    let installer_path = paths.downloads_dir().join(installer_name);
     if let Some(parent) = installer_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -109,16 +109,16 @@ pub fn install_version(mc_version: &str, requested: Option<&str>) -> Result<()> 
     minecraft::download_file(&client, &installer_url, &installer_path, None)?;
 
     // Same check as Forge: the installer refuses to run without this file.
-    ensure_launcher_profiles(&minecraft::base_dir())?;
+    ensure_launcher_profiles(paths.storage_root())?;
 
     println!("Running NeoForge installer (this can take a while)...");
-    run_installer(&installer_path, &minecraft::base_dir())?;
+    run_installer(&installer_path, paths.storage_root())?;
     let _ = fs::remove_file(&installer_path);
 
-    let composite_id = find_installed_neoforge_id(mc_version, &neo_label)?;
+    let composite_id = find_installed_neoforge_id(paths, mc_version, &neo_label)?;
     println!("NeoForge installer created version id `{composite_id}`");
 
-    let composite_dir = minecraft::version_dir(&composite_id);
+    let composite_dir = paths.version_dir(&composite_id);
     let json_path = composite_dir.join(format!("{composite_id}.json"));
     let neo_json: serde_json::Value = serde_json::from_str(&fs::read_to_string(&json_path)?)?;
 
@@ -130,22 +130,22 @@ pub fn install_version(mc_version: &str, requested: Option<&str>) -> Result<()> 
     fs::write(&json_path, serde_json::to_string_pretty(&merged)?)?;
 
     ensure_client_jar(&composite_dir, &composite_id, &vanilla_client)?;
-    minecraft::copy_natives(mc_version, &composite_id)?;
+    minecraft::copy_natives(paths, mc_version, &composite_id)?;
 
-    fs::write(marker_path(mc_version), &composite_id)?;
+    fs::write(marker_path(paths, mc_version), &composite_id)?;
     println!("NeoForge {neo_label} installed for Minecraft {mc_version}.");
     Ok(())
 }
 
 /// Reads the installer-created synthetic id recorded for `mc_version`.
 /// Any marker read failure is intentionally exposed as `LoaderNotInstalled`.
-pub fn installed_composite_id(mc_version: &str) -> Result<String> {
-    fs::read_to_string(marker_path(mc_version))
+pub fn installed_composite_id(paths: &AppPaths, mc_version: &str) -> Result<String> {
+    fs::read_to_string(marker_path(paths, mc_version))
         .map_err(|_| FerriteError::LoaderNotInstalled(mc_version.to_string()))
 }
 
-fn marker_path(mc_version: &str) -> PathBuf {
-    minecraft::version_dir(mc_version).join("neoforge-loader.txt")
+fn marker_path(paths: &AppPaths, mc_version: &str) -> PathBuf {
+    paths.version_dir(mc_version).join("neoforge-loader.txt")
 }
 
 // ---------------------------------------------------------------------
@@ -247,12 +247,7 @@ fn run_installer(installer: &Path, minecraft_dir: &Path) -> Result<()> {
     let minecraft_abs = fs::canonicalize(minecraft_dir)?;
     let installer_abs = fs::canonicalize(installer)?;
 
-    let output = Command::new("java")
-        .arg("-jar")
-        .arg(&installer_abs)
-        .arg("--installClient")
-        .arg(&minecraft_abs)
-        .output()?;
+    let output = super::installer_command(&installer_abs, &minecraft_abs).output()?;
 
     if !output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -270,7 +265,11 @@ fn run_installer(installer: &Path, minecraft_dir: &Path) -> Result<()> {
 /// NeoForge-named directories for JSON mentioning the selected build and enough
 /// evidence of the requested parent. Unreadable entries are skipped. No match
 /// after a successful installer run is classified as `InstallerFailed`.
-fn find_installed_neoforge_id(mc_version: &str, neo_label: &str) -> Result<String> {
+fn find_installed_neoforge_id(
+    paths: &AppPaths,
+    mc_version: &str,
+    neo_label: &str,
+) -> Result<String> {
     let candidates = [
         format!("neoforge-{neo_label}"),
         format!("{mc_version}-neoforge-{neo_label}"),
@@ -279,15 +278,12 @@ fn find_installed_neoforge_id(mc_version: &str, neo_label: &str) -> Result<Strin
         neo_label.to_string(),
     ];
     for id in &candidates {
-        if minecraft::version_dir(id)
-            .join(format!("{id}.json"))
-            .exists()
-        {
+        if paths.version_dir(id).join(format!("{id}.json")).exists() {
             return Ok(id.clone());
         }
     }
 
-    let versions_root = minecraft::base_dir().join("versions");
+    let versions_root = paths.versions_dir();
     if let Ok(entries) = fs::read_dir(&versions_root) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();

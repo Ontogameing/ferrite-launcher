@@ -29,11 +29,11 @@
 //!
 //! ## Storage and process model
 //!
-//! Launcher-managed content is rooted at the relative `minecraft/` directory.
-//! Version metadata and client jars live under `versions/<id>/`, Maven artifacts
+//! Launcher-managed content is rooted at [`AppPaths::storage_root`], resolved once at
+//! startup (never relative to the working directory) and passed into every function
+//! here. Version metadata and client jars live under `versions/<id>/`, Maven artifacts
 //! are shared under `libraries/`, content-addressed assets under `assets/`, and
-//! extracted native libraries under `natives/<id>/`. Because the root is
-//! relative, its absolute location depends on the launcher's working directory.
+//! extracted native libraries under `natives/<id>/`.
 //! Existing libraries and assets are treated as a download cache; version
 //! metadata and asset indexes are refreshed during installation.
 //!
@@ -49,10 +49,11 @@
 //! (see `crate::loaders::fabric`) and then calls `install_version` /
 //! `launch_version` / `is_version_installed` on those synthetic ids
 //! exactly as if they were another Mojang release. The handful of
-//! `pub(crate)` items below (`download_file`, `version_dir`,
-//! `libraries_dir`) exist only so that module can reuse this one's
-//! download/filesystem-layout logic instead of duplicating it.
+//! `pub(crate)` items below (`download_file`, `copy_natives`) exist only so
+//! that module can reuse this one's download logic instead of duplicating it;
+//! the filesystem layout itself comes from [`AppPaths`].
 
+use ferrite_launcher::core::paths::AppPaths;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -214,8 +215,8 @@ pub fn get_versions_with_snapshots(show_snapshots: bool) -> Result<Vec<String>> 
 /// reused by path; the manifest, metadata, client jar, and asset index are
 /// fetched again. Failures return immediately and may leave a partial install
 /// that a later call can resume.
-pub fn install_version(version: &str) -> Result<()> {
-    install_version_with_progress(version, |message| println!("{message}"))
+pub fn install_version(paths: &AppPaths, version: &str) -> Result<()> {
+    install_version_with_progress(paths, version, |message| println!("{message}"))
 }
 
 /// Installs a version synchronously, reporting metadata, client, libraries/native,
@@ -229,7 +230,11 @@ pub fn install_version(version: &str) -> Result<()> {
 /// clone it. No `Send`, `Sync`, or `'static` bound is required because this
 /// function neither stores the closure nor moves it to another thread. Per-file
 /// messages from download helpers still go to stdout.
-pub fn install_version_with_progress(version: &str, mut progress: impl FnMut(&str)) -> Result<()> {
+pub fn install_version_with_progress(
+    paths: &AppPaths,
+    version: &str,
+    mut progress: impl FnMut(&str),
+) -> Result<()> {
     let client = Client::new();
 
     progress("Fetching version manifest...");
@@ -243,7 +248,7 @@ pub fn install_version_with_progress(version: &str, mut progress: impl FnMut(&st
     progress(&format!("Fetching version metadata for {}...", entry.id));
     let (metadata, raw_json) = fetch_version_metadata(&client, &entry.url)?;
 
-    let v_dir = version_dir(&metadata.id);
+    let v_dir = paths.version_dir(&metadata.id);
     fs::create_dir_all(&v_dir)?;
     fs::write(v_dir.join(format!("{}.json", metadata.id)), &raw_json)?;
     progress(&format!("Saved version metadata for {}.", metadata.id));
@@ -260,8 +265,8 @@ pub fn install_version_with_progress(version: &str, mut progress: impl FnMut(&st
     download_libraries(
         &client,
         &metadata.libraries,
-        &libraries_dir(),
-        &natives_dir(&metadata.id),
+        &paths.libraries_dir(),
+        &paths.natives_dir(&metadata.id),
     )?;
 
     progress("Downloading assets (this can take a while the first time)...");
@@ -269,7 +274,7 @@ pub fn install_version_with_progress(version: &str, mut progress: impl FnMut(&st
         &client,
         &metadata.asset_index.url,
         &metadata.assets,
-        &assets_dir(),
+        &paths.assets_dir(),
     )?;
 
     progress(&format!(
@@ -286,36 +291,45 @@ pub fn install_version_with_progress(version: &str, mut progress: impl FnMut(&st
 /// if the `java` on PATH is older than the version Mojang requires.
 ///
 /// `version` doesn't have to be a real Mojang release id — anything
-/// under `minecraft/versions/<id>/<id>.json` with a vanilla-shaped
+/// under `<storage root>/versions/<id>/<id>.json` with a vanilla-shaped
 /// metadata file works, which is how `crate::loaders::fabric` piggybacks
 /// on this function for modded launches.
 ///
 /// Explicit offline compatibility wrapper: uses placeholder credentials for
 /// singleplayer, not online-mode servers. Account-aware callers should use
 /// `launch_authenticated` instead.
-pub fn launch_version(version: &str) -> Result<()> {
-    launch_version_in_directory(version, &base_dir())
+pub fn launch_version(paths: &AppPaths, version: &str) -> Result<()> {
+    launch_version_in_directory(paths, version, paths.storage_root())
 }
 
 /// Explicit offline compatibility wrapper for an installed vanilla or synthetic
 /// loader version in `game_dir`. Use `launch_authenticated` for account launches.
-/// Creates the directory if needed; relative paths are resolved against the
-/// launcher's working directory. The canonical path is used for both
+/// Creates the directory if needed (callers pass absolute paths derived from
+/// [`AppPaths`]). The canonical path is used for both
 /// `${game_directory}` (normally `--gameDir`) and the child's working directory.
 /// Assets, libraries, version files, and natives remain in shared storage.
 /// Authentication, Java checks, and the single-running-process limit are the
 /// same as in `launch_version`; this does not install or copy game content.
-pub fn launch_version_in_directory(version: &str, game_dir: &Path) -> Result<()> {
-    launch_with_auth(version, game_dir, offline_auth_placeholders(), true, None)
+pub fn launch_version_in_directory(paths: &AppPaths, version: &str, game_dir: &Path) -> Result<()> {
+    launch_with_auth(
+        paths,
+        version,
+        game_dir,
+        offline_auth_placeholders(),
+        true,
+        None,
+    )
 }
 
 /// Offline launch using an explicit maximum Java heap size.
 pub fn launch_version_in_directory_with_memory(
+    paths: &AppPaths,
     version: &str,
     game_dir: &Path,
     memory_mb: u32,
 ) -> Result<()> {
     launch_with_auth(
+        paths,
         version,
         game_dir,
         offline_auth_placeholders(),
@@ -329,6 +343,7 @@ pub fn launch_version_in_directory_with_memory(
 /// or offline fallback). Directory, Java, and process handling match the offline
 /// compatibility wrapper `launch_version_in_directory`.
 pub fn launch_authenticated(
+    paths: &AppPaths,
     version: &str,
     game_dir: &Path,
     account: &crate::auth::Account,
@@ -344,11 +359,12 @@ pub fn launch_authenticated(
         &account.xuid,
         "msa",
     );
-    launch_with_auth(version, game_dir, placeholders, false, None)
+    launch_with_auth(paths, version, game_dir, placeholders, false, None)
 }
 
 /// Authenticated launch using an explicit maximum Java heap size.
 pub fn launch_authenticated_with_memory(
+    paths: &AppPaths,
     version: &str,
     game_dir: &Path,
     account: &crate::auth::Account,
@@ -365,7 +381,14 @@ pub fn launch_authenticated_with_memory(
         &account.xuid,
         "msa",
     );
-    launch_with_auth(version, game_dir, placeholders, false, Some(memory_mb))
+    launch_with_auth(
+        paths,
+        version,
+        game_dir,
+        placeholders,
+        false,
+        Some(memory_mb),
+    )
 }
 
 // Launch preparation is deliberately centralized so authenticated and offline
@@ -375,6 +398,7 @@ pub fn launch_authenticated_with_memory(
 // spawned `Child` into the global process slot. Errors before `spawn` leave the
 // slot untouched; a successful spawn is never silently downgraded to offline.
 fn launch_with_auth(
+    paths: &AppPaths,
     version: &str,
     game_dir: &Path,
     mut placeholders: HashMap<String, String>,
@@ -384,11 +408,11 @@ fn launch_with_auth(
     if is_running() {
         return Err(FerriteError::AlreadyRunning);
     }
-    if !is_version_installed(version) {
+    if !is_version_installed(paths, version) {
         return Err(FerriteError::NotInstalled);
     }
 
-    let v_dir = version_dir(version);
+    let v_dir = paths.version_dir(version);
     let metadata_text = fs::read_to_string(v_dir.join(format!("{version}.json")))?;
     let metadata: VersionMetadata = serde_json::from_str(&metadata_text)?;
 
@@ -402,11 +426,11 @@ fn launch_with_auth(
         .unwrap_or(LEGACY_DEFAULT_JAVA_MAJOR);
     check_java_version(required_java)?;
 
-    let libs_dir = libraries_dir();
-    let natives = natives_dir(version);
+    let libs_dir = paths.libraries_dir();
+    let natives = paths.natives_dir(version);
     let client_jar = v_dir.join("client.jar");
 
-    let assets = assets_dir();
+    let assets = paths.assets_dir();
 
     // 26.2 JVM args point at natives_directory/{java,jna,lwjgl,netty}.
     // LWJGL and jtracy unpack their own .so files into those dirs at runtime.
@@ -571,8 +595,8 @@ pub fn kill() -> Result<()> {
 /// i.e. its metadata JSON and client jar are both present on disk.
 ///
 /// As with `launch_version`, `version` may be a synthetic mod-loader id.
-pub fn is_version_installed(version: &str) -> bool {
-    let v_dir = version_dir(version);
+pub fn is_version_installed(paths: &AppPaths, version: &str) -> bool {
+    let v_dir = paths.version_dir(version);
     v_dir.join(format!("{version}.json")).exists() && v_dir.join("client.jar").exists()
 }
 
@@ -584,9 +608,9 @@ pub fn is_version_installed(version: &str) -> bool {
 /// for the underlying vanilla version during `install_version`.
 /// Without this, `-Djava.library.path` points at a directory that was
 /// never created.
-pub(crate) fn copy_natives(from_version: &str, to_version: &str) -> Result<()> {
-    let src = natives_dir(from_version);
-    let dst = natives_dir(to_version);
+pub(crate) fn copy_natives(paths: &AppPaths, from_version: &str, to_version: &str) -> Result<()> {
+    let src = paths.natives_dir(from_version);
+    let dst = paths.natives_dir(to_version);
     fs::create_dir_all(&dst)?;
 
     if src.exists() {
@@ -617,33 +641,9 @@ fn copy_natives_tree(src: &Path, dst: &Path) -> Result<()> {
 // Filesystem layout
 // =====================================================================
 
-/// Returns the launcher-managed Minecraft root, relative to the current process
-/// working directory.
-///
-/// Forge and NeoForge installers receive this root so they write the same
-/// `versions/` and `libraries/` layout as the official launcher. This is not the
-/// platform's normal `.minecraft` directory and is not canonicalized here.
-pub(crate) fn base_dir() -> PathBuf {
-    PathBuf::from("minecraft")
-}
-/// Returns `minecraft/versions/<id>`, used for both Mojang and synthetic loader
-/// versions. The path is constructed only; the directory is not created.
-pub(crate) fn version_dir(id: &str) -> PathBuf {
-    base_dir().join("versions").join(id)
-}
-/// Returns the shared Maven-style library cache at `minecraft/libraries/`.
-/// Vanilla and all loaders intentionally reuse artifacts in this tree.
-pub(crate) fn libraries_dir() -> PathBuf {
-    base_dir().join("libraries")
-}
-fn assets_dir() -> PathBuf {
-    base_dir().join("assets")
-}
-/// Returns the per-version native extraction/work directory at
-/// `minecraft/natives/<id>`. The path is constructed only.
-pub(crate) fn natives_dir(id: &str) -> PathBuf {
-    base_dir().join("natives").join(id)
-}
+// The layout (`versions/<id>`, `libraries/`, `assets/`, `natives/<id>`) is owned by
+// `AppPaths`; Forge and NeoForge installers receive `AppPaths::storage_root()` so they
+// write the same layout as the official launcher.
 
 fn abs(path: &Path) -> Result<PathBuf> {
     Ok(fs::canonicalize(path)?)
@@ -1364,6 +1364,90 @@ mod tests {
             placeholders["auth_session"],
             "token:0:00000000-0000-0000-0000-000000000000"
         );
+    }
+
+    #[test]
+    fn launch_paths_with_spaces_stay_single_arguments() {
+        let base = std::env::temp_dir().join(format!(
+            "ferrite space test {}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let game_dir = base.join("Ferrite Launcher").join("data").join("minecraft");
+        let natives = "/x/Ferrite Launcher/natives";
+        let assets = "/x/Ferrite Launcher/assets";
+        let classpath = "/x/Ferrite Launcher/libraries/a.jar:/x/Ferrite Launcher/client.jar";
+        let placeholders = HashMap::from([
+            ("classpath".to_string(), classpath.to_string()),
+            ("natives_directory".to_string(), natives.to_string()),
+            ("game_assets".to_string(), assets.to_string()),
+            ("assets_root".to_string(), assets.to_string()),
+        ]);
+
+        // Modern metadata: templated arguments are substituted per element.
+        let command = game_command(
+            &metadata_with_game_dir_argument(),
+            placeholders.clone(),
+            &game_dir,
+            None,
+        )
+        .unwrap();
+        let canonical = fs::canonicalize(&game_dir).unwrap();
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "-cp",
+                classpath,
+                "example.Main",
+                "--gameDir",
+                canonical.to_string_lossy().as_ref()
+            ]
+        );
+
+        // Legacy metadata: `minecraftArguments` is split on whitespace *before*
+        // substitution, so values containing spaces stay one argument each.
+        let legacy: VersionMetadata = serde_json::from_str(
+            r#"{
+                "id": "legacy",
+                "type": "release",
+                "mainClass": "net.minecraft.client.Minecraft",
+                "assets": "legacy",
+                "assetIndex": { "url": "https://example.invalid/assets.json" },
+                "downloads": {
+                    "client": { "url": "https://example.invalid/client.jar", "size": 0 }
+                },
+                "libraries": [],
+                "minecraftArguments": "--gameDir ${game_directory} --assetsDir ${game_assets}"
+            }"#,
+        )
+        .unwrap();
+        let command = game_command(&legacy, placeholders, &game_dir, None).unwrap();
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                format!("-Djava.library.path={natives}").as_str(),
+                "-cp",
+                classpath,
+                "net.minecraft.client.Minecraft",
+                "--gameDir",
+                canonical.to_string_lossy().as_ref(),
+                "--assetsDir",
+                assets,
+            ]
+        );
+        assert_eq!(command.get_current_dir(), Some(canonical.as_path()));
+        fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

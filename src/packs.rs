@@ -34,6 +34,7 @@
 
 use crate::instances::InstanceProfile;
 use crate::loaders::ModLoader;
+use ferrite_launcher::core::paths::AppPaths;
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use sha2::{Digest, Sha512};
@@ -490,6 +491,7 @@ pub fn import(
 /// that lookup is the only fallback. Formats requiring a non-vanilla loader pin fail if
 /// neither source provides one. The output is never intentionally replaced.
 pub fn export(
+    paths: &AppPaths,
     profile: &InstanceProfile,
     output: impl AsRef<Path>,
     options: &ExportOptions,
@@ -510,10 +512,10 @@ pub fn export(
             .map(str::trim)
             .filter(|version| !version.is_empty())
             .map(str::to_owned)
-            .or_else(|| crate::loaders::installed_loader_version(&profile.version, loader)),
+            .or_else(|| crate::loaders::installed_loader_version(paths, &profile.version, loader)),
     };
     export_directory(
-        &profile.game_dir(),
+        &profile.game_dir(paths),
         output.as_ref(),
         options,
         &target,

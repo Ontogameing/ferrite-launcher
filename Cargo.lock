@@ -1262,6 +1262,7 @@ dependencies = [
  "egui",
  "hex",
  "image",
+ "libc",
  "reqwest",
  "rfd",
  "semver",
@@ -1269,7 +1270,9 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2",
+ "tempfile",
  "toml",
+ "windows-sys 0.61.2",
  "zip",
 ]
 

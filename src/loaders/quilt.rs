@@ -18,6 +18,7 @@
 //! dispatch reports Quilt as uninstalled.
 
 use crate::minecraft::{self, FerriteError, Result};
+use ferrite_launcher::core::paths::AppPaths;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::fs;
@@ -28,8 +29,8 @@ const META_BASE: &str = "https://meta.quiltmc.org/v3/versions/loader";
 /// Installs the latest stable Quilt loader for `mc_version`, on top of
 /// the vanilla install (installing that first if it isn't already
 /// present).
-pub fn install(mc_version: &str) -> Result<()> {
-    install_version(mc_version, None)
+pub fn install(paths: &AppPaths, mc_version: &str) -> Result<()> {
+    install_version(paths, mc_version, None)
 }
 
 /// Installs a requested Quilt version, or discovers the newest stable build.
@@ -39,8 +40,8 @@ pub fn install(mc_version: &str) -> Result<()> {
 /// newest: the last stable entry wins, falling back to the final entry. Any
 /// error aborts before the marker is written, while completed vanilla/cache work
 /// remains available for a retry.
-pub fn install_version(mc_version: &str, requested: Option<&str>) -> Result<()> {
-    minecraft::install_version(mc_version)?;
+pub fn install_version(paths: &AppPaths, mc_version: &str, requested: Option<&str>) -> Result<()> {
+    minecraft::install_version(paths, mc_version)?;
 
     let client = Client::new();
     let loader_version = match requested.map(str::trim).filter(|value| !value.is_empty()) {
@@ -52,14 +53,14 @@ pub fn install_version(mc_version: &str, requested: Option<&str>) -> Result<()> 
     println!("Fetching Quilt profile for loader {loader_version}...");
     let profile = fetch_profile(&client, mc_version, &loader_version)?;
 
-    let vanilla_dir = minecraft::version_dir(mc_version);
+    let vanilla_dir = paths.version_dir(mc_version);
     let vanilla_json: serde_json::Value = serde_json::from_str(&fs::read_to_string(
         vanilla_dir.join(format!("{mc_version}.json")),
     )?)?;
 
     let merged = merge_metadata(&composite_id, &vanilla_json, &profile);
 
-    let composite_dir = minecraft::version_dir(&composite_id);
+    let composite_dir = paths.version_dir(&composite_id);
     fs::create_dir_all(&composite_dir)?;
     fs::write(
         composite_dir.join(format!("{composite_id}.json")),
@@ -69,12 +70,12 @@ pub fn install_version(mc_version: &str, requested: Option<&str>) -> Result<()> 
         vanilla_dir.join("client.jar"),
         composite_dir.join("client.jar"),
     )?;
-    minecraft::copy_natives(mc_version, &composite_id)?;
+    minecraft::copy_natives(paths, mc_version, &composite_id)?;
 
     println!("Downloading Quilt loader libraries...");
-    download_quilt_libraries(&client, &profile)?;
+    download_quilt_libraries(paths, &client, &profile)?;
 
-    fs::write(marker_path(mc_version), &composite_id)?;
+    fs::write(marker_path(paths, mc_version), &composite_id)?;
     println!("Quilt {loader_version} installed for Minecraft {mc_version}.");
     Ok(())
 }
@@ -83,13 +84,13 @@ pub fn install_version(mc_version: &str, requested: Option<&str>) -> Result<()> 
 /// currently recorded for `mc_version`. Errors with
 /// `FerriteError::LoaderNotInstalled` if Quilt hasn't been installed
 /// for it yet.
-pub fn installed_composite_id(mc_version: &str) -> Result<String> {
-    fs::read_to_string(marker_path(mc_version))
+pub fn installed_composite_id(paths: &AppPaths, mc_version: &str) -> Result<String> {
+    fs::read_to_string(marker_path(paths, mc_version))
         .map_err(|_| FerriteError::LoaderNotInstalled(mc_version.to_string()))
 }
 
-fn marker_path(mc_version: &str) -> PathBuf {
-    minecraft::version_dir(mc_version).join("quilt-loader.txt")
+fn marker_path(paths: &AppPaths, mc_version: &str) -> PathBuf {
+    paths.version_dir(mc_version).join("quilt-loader.txt")
 }
 
 fn composite_id(mc_version: &str, loader_version: &str) -> String {
@@ -259,8 +260,12 @@ fn maven_coordinate_to_path(coordinate: &str) -> Option<String> {
 ///
 /// No library array is a successful no-op. Malformed entries are skipped,
 /// existing paths are trusted, and the first download/filesystem error aborts.
-fn download_quilt_libraries(client: &Client, profile: &serde_json::Value) -> Result<()> {
-    let libs_dir = minecraft::libraries_dir();
+fn download_quilt_libraries(
+    paths: &AppPaths,
+    client: &Client,
+    profile: &serde_json::Value,
+) -> Result<()> {
+    let libs_dir = paths.libraries_dir();
     fs::create_dir_all(&libs_dir)?;
 
     let Some(libraries) = profile["libraries"].as_array() else {

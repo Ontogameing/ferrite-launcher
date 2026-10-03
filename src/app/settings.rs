@@ -6,11 +6,12 @@
 
 use super::{ACCENT, BACKGROUND, CARD, Ferrite, MUTED, Page, SIDEBAR, page_heading};
 use crate::background::BackgroundStatus;
-use crate::config::{
-    BackgroundFit, BackgroundSettings, BackgroundSource, Config, HorizontalAlignment, ThemePalette,
+use crate::config::Config;
+use crate::discord::DiscordPresence;
+use crate::ui_settings::{
+    BackgroundFit, BackgroundSettings, BackgroundSource, HorizontalAlignment, ThemePalette,
     ThemePreset, VerticalAlignment,
 };
-use crate::discord::DiscordPresence;
 use crate::updates::UpdateCheck;
 use eframe::egui::{self, Color32, RichText};
 use std::path::PathBuf;
@@ -95,7 +96,7 @@ impl Ferrite {
         egui::Frame::new()
             .fill(self.card_color())
             .stroke(egui::Stroke::new(1.0, self.accent_color()))
-            .corner_radius(self.config.appearance.corner_radius)
+            .corner_radius(self.ui_settings.appearance.corner_radius)
             .inner_margin(12.0)
             .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
@@ -145,8 +146,14 @@ impl Ferrite {
     }
 
     /// Persists typed settings and refreshes the advanced editor only after success.
+    ///
+    /// Core settings go to `config.toml` and appearance/layout to `ui.toml`; both are
+    /// written atomically. `ui.toml` is written first so a successful core save can
+    /// safely drop any legacy UI tables from `config.toml`.
     pub(super) fn save_config_change(&mut self, success_message: &str) {
-        match crate::config::save(&self.config) {
+        let result = crate::ui_settings::save(&self.paths, &self.ui_settings)
+            .and_then(|()| crate::config::save(&self.paths, &self.config));
+        match result {
             Ok(()) => {
                 self.running_text = success_message.to_owned();
                 self.config_status = Some(success_message.to_owned());
@@ -163,7 +170,6 @@ impl Ferrite {
     /// Replaces all live settings after a validated load/apply and reconciles dependents.
     pub(super) fn replace_config(&mut self, config: Config, raw_toml: String, message: &str) {
         self.config = config;
-        self.accent_edit = self.config.appearance.accent.clone();
         self.raw_config_toml = raw_toml;
         self.sync_discord_presence();
         self.running_text = message.to_owned();
@@ -172,11 +178,15 @@ impl Ferrite {
 
     /// Reloads typed and raw representations together, leaving current state on failure.
     pub(super) fn reload_config(&mut self) {
-        match crate::config::load() {
+        match crate::config::load(&self.paths) {
             Ok(config) => {
-                let raw = crate::config::read_toml()
+                let raw = crate::config::read_toml(&self.paths)
                     .or_else(|_| crate::config::to_toml(&config))
                     .unwrap_or_default();
+                if let Ok(settings) = crate::ui_settings::load(&self.paths) {
+                    self.ui_settings = settings;
+                    self.accent_edit = self.ui_settings.appearance.accent.clone();
+                }
                 self.replace_config(config, raw, "Reloaded configuration from disk.");
             }
             Err(error) => {
@@ -187,7 +197,7 @@ impl Ferrite {
 
     /// Validates and saves the editor buffer before replacing live configuration.
     pub(super) fn apply_raw_config(&mut self) {
-        match crate::config::save_toml(&self.raw_config_toml) {
+        match crate::config::save_toml(&self.paths, &self.raw_config_toml) {
             Ok(config) => {
                 let raw = crate::config::to_toml(&config).unwrap_or_default();
                 self.replace_config(config, raw, "Applied and saved configuration TOML.");
@@ -199,8 +209,8 @@ impl Ferrite {
     }
 
     pub(super) fn is_light_theme(&self) -> bool {
-        match self.config.appearance.theme_config.preset {
-            ThemePreset::Legacy => self.config.appearance.theme == "light",
+        match self.ui_settings.appearance.theme_config.preset {
+            ThemePreset::Legacy => self.ui_settings.appearance.theme == "light",
             ThemePreset::Dark => false,
             ThemePreset::Light => true,
             ThemePreset::Custom => {
@@ -214,19 +224,26 @@ impl Ferrite {
     }
 
     pub(super) fn accent_color(&self) -> Color32 {
-        let value = match self.config.appearance.theme_config.preset {
-            ThemePreset::Custom => &self.config.appearance.theme_config.custom_palette.accent,
+        let value = match self.ui_settings.appearance.theme_config.preset {
+            ThemePreset::Custom => {
+                &self
+                    .ui_settings
+                    .appearance
+                    .theme_config
+                    .custom_palette
+                    .accent
+            }
             ThemePreset::Legacy | ThemePreset::Dark | ThemePreset::Light => {
-                &self.config.appearance.accent
+                &self.ui_settings.appearance.accent
             }
         };
         parse_hex_color(value).unwrap_or(ACCENT)
     }
 
     pub(super) fn background_color(&self) -> Color32 {
-        match self.config.appearance.theme_config.preset {
+        match self.ui_settings.appearance.theme_config.preset {
             ThemePreset::Legacy => {
-                if self.config.appearance.theme == "light" {
+                if self.ui_settings.appearance.theme == "light" {
                     Color32::from_rgb(242, 244, 248)
                 } else {
                     BACKGROUND
@@ -236,7 +253,7 @@ impl Ferrite {
             ThemePreset::Light => Color32::from_rgb(242, 244, 248),
             ThemePreset::Custom => parse_hex_color(
                 &self
-                    .config
+                    .ui_settings
                     .appearance
                     .theme_config
                     .custom_palette
@@ -247,9 +264,9 @@ impl Ferrite {
     }
 
     pub(super) fn sidebar_color(&self) -> Color32 {
-        match self.config.appearance.theme_config.preset {
+        match self.ui_settings.appearance.theme_config.preset {
             ThemePreset::Legacy => {
-                if self.config.appearance.theme == "light" {
+                if self.ui_settings.appearance.theme == "light" {
                     Color32::from_rgb(226, 230, 237)
                 } else {
                     SIDEBAR
@@ -257,17 +274,22 @@ impl Ferrite {
             }
             ThemePreset::Dark => SIDEBAR,
             ThemePreset::Light => Color32::from_rgb(226, 230, 237),
-            ThemePreset::Custom => {
-                parse_hex_color(&self.config.appearance.theme_config.custom_palette.sidebar)
-                    .unwrap_or(SIDEBAR)
-            }
+            ThemePreset::Custom => parse_hex_color(
+                &self
+                    .ui_settings
+                    .appearance
+                    .theme_config
+                    .custom_palette
+                    .sidebar,
+            )
+            .unwrap_or(SIDEBAR),
         }
     }
 
     pub(super) fn card_color(&self) -> Color32 {
-        match self.config.appearance.theme_config.preset {
+        match self.ui_settings.appearance.theme_config.preset {
             ThemePreset::Legacy => {
-                if self.config.appearance.theme == "light" {
+                if self.ui_settings.appearance.theme == "light" {
                     Color32::WHITE
                 } else {
                     CARD
@@ -276,16 +298,16 @@ impl Ferrite {
             ThemePreset::Dark => CARD,
             ThemePreset::Light => Color32::WHITE,
             ThemePreset::Custom => {
-                parse_hex_color(&self.config.appearance.theme_config.custom_palette.card)
+                parse_hex_color(&self.ui_settings.appearance.theme_config.custom_palette.card)
                     .unwrap_or(CARD)
             }
         }
     }
 
     pub(super) fn text_color(&self) -> Color32 {
-        match self.config.appearance.theme_config.preset {
+        match self.ui_settings.appearance.theme_config.preset {
             ThemePreset::Legacy => {
-                if self.config.appearance.theme == "light" {
+                if self.ui_settings.appearance.theme == "light" {
                     Color32::BLACK
                 } else {
                     Color32::WHITE
@@ -294,25 +316,30 @@ impl Ferrite {
             ThemePreset::Dark => Color32::WHITE,
             ThemePreset::Light => Color32::BLACK,
             ThemePreset::Custom => {
-                parse_hex_color(&self.config.appearance.theme_config.custom_palette.text)
+                parse_hex_color(&self.ui_settings.appearance.theme_config.custom_palette.text)
                     .unwrap_or(Color32::WHITE)
             }
         }
     }
 
     pub(super) fn muted_color(&self) -> Color32 {
-        match self.config.appearance.theme_config.preset {
-            ThemePreset::Custom => {
-                parse_hex_color(&self.config.appearance.theme_config.custom_palette.muted)
-                    .unwrap_or(MUTED)
-            }
+        match self.ui_settings.appearance.theme_config.preset {
+            ThemePreset::Custom => parse_hex_color(
+                &self
+                    .ui_settings
+                    .appearance
+                    .theme_config
+                    .custom_palette
+                    .muted,
+            )
+            .unwrap_or(MUTED),
             ThemePreset::Legacy | ThemePreset::Dark | ThemePreset::Light => MUTED,
         }
     }
 
     /// Resolves the global or current-page background selected by appearance settings.
     pub(super) fn active_background_settings(&self) -> &BackgroundSettings {
-        let backgrounds = &self.config.appearance.background;
+        let backgrounds = &self.ui_settings.appearance.background;
         if !backgrounds.use_per_page {
             return &backgrounds.global;
         }
@@ -429,38 +456,38 @@ impl Ferrite {
             "Appearance" => {
                 ui.heading("Appearance");
                 let mut changed = false;
-                let previous_theme = self.config.appearance.theme_config.preset;
+                let previous_theme = self.ui_settings.appearance.theme_config.preset;
                 egui::ComboBox::from_label("Theme")
-                    .selected_text(theme_preset_label(self.config.appearance.theme_config.preset))
+                    .selected_text(theme_preset_label(self.ui_settings.appearance.theme_config.preset))
                     .show_ui(ui, |ui| {
                         ui.selectable_value(
-                            &mut self.config.appearance.theme_config.preset,
+                            &mut self.ui_settings.appearance.theme_config.preset,
                             ThemePreset::Legacy,
                             "Classic / existing settings",
                         );
                         ui.selectable_value(
-                            &mut self.config.appearance.theme_config.preset,
+                            &mut self.ui_settings.appearance.theme_config.preset,
                             ThemePreset::Dark,
                             "Ferrite Dark",
                         );
                         ui.selectable_value(
-                            &mut self.config.appearance.theme_config.preset,
+                            &mut self.ui_settings.appearance.theme_config.preset,
                             ThemePreset::Light,
                             "Ferrite Light",
                         );
                         ui.selectable_value(
-                            &mut self.config.appearance.theme_config.preset,
+                            &mut self.ui_settings.appearance.theme_config.preset,
                             ThemePreset::Custom,
                             "Custom palette",
                         );
                     });
-                if previous_theme != self.config.appearance.theme_config.preset {
+                if previous_theme != self.ui_settings.appearance.theme_config.preset {
                     if !matches!(
-                        self.config.appearance.theme_config.preset,
+                        self.ui_settings.appearance.theme_config.preset,
                         ThemePreset::Legacy | ThemePreset::Custom
                     ) {
-                        self.config.appearance.theme = if matches!(
-                            self.config.appearance.theme_config.preset,
+                        self.ui_settings.appearance.theme = if matches!(
+                            self.ui_settings.appearance.theme_config.preset,
                             ThemePreset::Light
                         ) {
                             "light".to_owned()
@@ -472,41 +499,41 @@ impl Ferrite {
                 }
                 changed |= ui
                     .add(
-                        egui::Slider::new(&mut self.config.appearance.font_scale, 0.5..=2.0)
+                        egui::Slider::new(&mut self.ui_settings.appearance.font_scale, 0.5..=2.0)
                             .step_by(0.05)
                             .text("Font scale"),
                     )
                     .changed();
                 changed |= ui
                     .add(
-                        egui::Slider::new(&mut self.config.appearance.corner_radius, 0..=32)
+                        egui::Slider::new(&mut self.ui_settings.appearance.corner_radius, 0..=32)
                             .text("Corner radius"),
                     )
                     .changed();
 
                 if matches!(
-                    self.config.appearance.theme_config.preset,
+                    self.ui_settings.appearance.theme_config.preset,
                     ThemePreset::Custom
                 ) {
                     ui.label("Custom theme palette");
                     changed |= theme_palette_ui(
                         ui,
-                        &mut self.config.appearance.theme_config.custom_palette,
+                        &mut self.ui_settings.appearance.theme_config.custom_palette,
                     );
                 } else {
                     ui.label("Accent color");
                     ui.horizontal(|ui| {
                         let mut color = self.accent_color();
                         if ui.color_edit_button_srgba(&mut color).changed() {
-                            self.config.appearance.accent = color_to_hex(color);
-                            self.accent_edit = self.config.appearance.accent.clone();
+                            self.ui_settings.appearance.accent = color_to_hex(color);
+                            self.accent_edit = self.ui_settings.appearance.accent.clone();
                             changed = true;
                         }
                         ui.text_edit_singleline(&mut self.accent_edit);
                         if ui.button("Apply color").clicked() {
                             if let Some(color) = parse_hex_color(self.accent_edit.trim()) {
-                                self.config.appearance.accent = color_to_hex(color);
-                                self.accent_edit = self.config.appearance.accent.clone();
+                                self.ui_settings.appearance.accent = color_to_hex(color);
+                                self.accent_edit = self.ui_settings.appearance.accent.clone();
                                 changed = true;
                             } else {
                                 self.config_status =
@@ -521,18 +548,18 @@ impl Ferrite {
 
                 changed |= ui
                     .checkbox(
-                        &mut self.config.appearance.background.use_per_page,
+                        &mut self.ui_settings.appearance.background.use_per_page,
                         "Use different backgrounds for each page",
                     )
                     .changed();
 
-                if self.config.appearance.background.use_per_page {
+                if self.ui_settings.appearance.background.use_per_page {
                     if ui.button("Copy global background to every page").clicked() {
-                        let global = self.config.appearance.background.global.clone();
-                        self.config.appearance.background.play = global.clone();
-                        self.config.appearance.background.instances = global.clone();
-                        self.config.appearance.background.mods = global.clone();
-                        self.config.appearance.background.settings = global;
+                        let global = self.ui_settings.appearance.background.global.clone();
+                        self.ui_settings.appearance.background.play = global.clone();
+                        self.ui_settings.appearance.background.instances = global.clone();
+                        self.ui_settings.appearance.background.mods = global.clone();
+                        self.ui_settings.appearance.background.settings = global;
                         changed = true;
                     }
                     egui::ComboBox::from_label("Background to edit")
@@ -555,7 +582,7 @@ impl Ferrite {
 
                 let target = self.background_edit_target.clone();
                 let background_changed = {
-                    let backgrounds = &mut self.config.appearance.background;
+                    let backgrounds = &mut self.ui_settings.appearance.background;
                     let settings = match target.as_str() {
                         "Play" => &mut backgrounds.play,
                         "Instances" => &mut backgrounds.instances,
@@ -568,7 +595,7 @@ impl Ferrite {
                 changed |= background_changed;
 
                 let editing_visible_background =
-                    !self.config.appearance.background.use_per_page || target == "Settings";
+                    !self.ui_settings.appearance.background.use_per_page || target == "Settings";
                 if !editing_visible_background {
                     ui.label(RichText::new(format!(
                         "Open the {target} page to preview this background."
@@ -610,7 +637,7 @@ impl Ferrite {
                 ui.heading("Advanced configuration");
                 ui.horizontal(|ui| {
                     if ui.button("Open Config Folder").clicked() {
-                        self.config_status = Some(match crate::config::open_config_folder() {
+                        self.config_status = Some(match crate::config::open_config_folder(&self.paths) {
                             Ok(()) => "Opened the config folder.".to_owned(),
                             Err(error) => format!("Could not open config folder: {error}"),
                         });
@@ -619,13 +646,15 @@ impl Ferrite {
                         self.reload_config();
                     }
                 });
-                if let Ok(path) = crate::config::config_path() {
-                    ui.label(
-                        RichText::new(path.display().to_string())
-                            .small()
-                            .color(MUTED),
-                    );
-                }
+                ui.label(
+                    RichText::new(
+                        crate::config::config_path(&self.paths)
+                            .display()
+                            .to_string(),
+                    )
+                    .small()
+                    .color(MUTED),
+                );
                 ui.label("Raw TOML is only parsed and saved when Apply / Save is pressed.");
                 ui.add(
                     egui::TextEdit::multiline(&mut self.raw_config_toml)

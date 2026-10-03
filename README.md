@@ -24,7 +24,7 @@ Most Minecraft launchers did not fit how I play. I did not want to fork Prism â€
 
 **Active** (wired into the running UI / config):
 
-- `config` appearance + `LayoutConfig`
+- `ui_settings` appearance + `LayoutConfig` (stored in `ui.toml`)
 - `app/layout.rs`
 - Settings Appearance / Layout
 - `background.rs`
@@ -41,6 +41,38 @@ Most Minecraft launchers did not fit how I play. I did not want to fork Prism â€
 Grab a binary from [Releases](https://github.com/Ontogameing/ferrite-launcher/releases) for Linux, Windows, or macOS.
 
 Early development: expect bugs.
+
+## Where Ferrite stores data
+
+Ferrite resolves its directories once at startup from the per-user platform locations
+(never from the current working directory).
+
+**Linux** (XDG environment variables are honored):
+
+- Config (`config.toml`, `ui.toml`): `~/.config/ferritelauncher/`
+- Data (`minecraft/` with instances, versions, libraries, assets; migration state): `~/.local/share/ferritelauncher/`
+- Cache (downloads, temp files): `~/.cache/ferritelauncher/`
+
+**Windows**:
+
+- Config: `%APPDATA%\Ferrite\Ferrite Launcher\config\` (roaming)
+- Data: `%LOCALAPPDATA%\Ferrite\Ferrite Launcher\data\` (local, so game files stay out of roaming profiles)
+- Cache: `%LOCALAPPDATA%\Ferrite\Ferrite Launcher\cache\`
+
+**macOS**: config and data are the **same folder**,
+`~/Library/Application Support/io.Ferrite.Ferrite-Launcher/`, which holds
+`config.toml`, `ui.toml`, `minecraft/`, `migration-state.json`, and (only while a move
+is in progress) `.migration-staging/`. The cache is
+`~/Library/Caches/io.Ferrite.Ferrite-Launcher/`.
+
+Older builds kept data in a `minecraft` folder relative to wherever the launcher was
+started. On first launch Ferrite looks for that folder next to the executable and in
+the current directory, checks there is enough free space, copies it into the data
+directory (verifying the copy), and leaves the old folder untouched. If two different
+old folders are found you are asked which one to move. The move can be paused (or the
+window closed) and resumes on the next launch; if it can't finish, "Use old data this
+time" opens Ferrite with the old folder and offers the move again next time. Ferrite
+never deletes the old folder; remove it yourself once everything works.
 
 ## Building From Source
 
