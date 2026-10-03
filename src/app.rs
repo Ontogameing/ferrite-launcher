@@ -7,6 +7,7 @@
 //! to UI/persistent state, and requests periodic repainting while work is outstanding.
 
 mod auth;
+mod dialogs;
 mod instances;
 mod layout;
 mod mods;
@@ -288,7 +289,7 @@ struct Ferrite {
     /// Which instance is owned by which background operation (delete, ...).
     activity: ferrite_launcher::core::activity::ActivityTracker,
     /// The open delete dialog, if any.
-    remove_dialog: Option<remove::RemoveDialog>,
+    remove_dialog: Option<remove::DeleteDialog>,
     /// The trash/delete worker; its presence also defers closing the window.
     remove_task: Option<remove::RemoveTask>,
     /// The window was asked to close while a removal was running.
@@ -558,6 +559,7 @@ impl eframe::App for Ferrite {
         if self.instance_creation_task.is_some()
             || self.pack_task.is_some()
             || self.remove_task.is_some()
+            || self.remove_dialog_busy()
             || self.mod_task.is_some()
             || self.auth.task.is_some()
             || self.update_task.is_some()
