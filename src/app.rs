@@ -13,6 +13,7 @@ mod edit;
 mod instances;
 mod layout;
 mod mods;
+mod packs_ui;
 mod remove;
 mod settings;
 mod startup;
@@ -132,7 +133,8 @@ enum InstanceCreationEvent {
 enum PackTaskEvent {
     Progress(String),
     Imported(Result<Box<PackImportOutcome>, String>),
-    Exported(Result<String, String>),
+    /// The written file, or (plain-words reason, raw error).
+    Exported(Result<std::path::PathBuf, (String, String)>),
 }
 
 /// Imported files awaiting the UI thread's final profile-list commit.
@@ -258,9 +260,12 @@ struct Ferrite {
     pack_version: String,
     pack_loader_version: String,
     pack_include_worlds: bool,
-    pack_include_optional: bool,
     pack_task: Option<Receiver<PackTaskEvent>>,
     pack_status: Option<String>,
+    /// Which step the Import window shows (choose, reading, preview, ...).
+    import_step: packs_ui::ImportStep,
+    /// The last export's result, shown in the Export window.
+    export_result: Option<packs_ui::ExportResult>,
     /// Release versions fetched from Mojang.
     versions: Vec<String>,
     /// Profiles loaded from and saved to the persistent instance store.
@@ -451,9 +456,10 @@ impl Ferrite {
             pack_version: String::from("1.0.0"),
             pack_loader_version: String::new(),
             pack_include_worlds: true,
-            pack_include_optional: false,
             pack_task: None,
             pack_status: None,
+            import_step: Default::default(),
+            export_result: None,
             versions,
             instances,
             skipped_instances,
@@ -493,6 +499,7 @@ impl eframe::App for Ferrite {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_instance_creation();
         self.poll_pack_task();
+        self.poll_import_preview();
         self.poll_remove_task();
         self.poll_duplicates();
         self.poll_edit_task();
@@ -588,6 +595,7 @@ impl eframe::App for Ferrite {
             || self.remove_dialog_busy()
             || self.duplicate_busy()
             || self.edit_busy()
+            || self.import_reading()
             || self.mod_task.is_some()
             || self.auth.task.is_some()
             || self.update_task.is_some()
@@ -656,9 +664,10 @@ mod tests {
             pack_version: "1.0.0".into(),
             pack_loader_version: String::new(),
             pack_include_worlds: true,
-            pack_include_optional: false,
             pack_task: None,
             pack_status: None,
+            import_step: Default::default(),
+            export_result: None,
             versions: Vec::new(),
             instances: Vec::new(),
             skipped_instances: Vec::new(),
@@ -898,11 +907,18 @@ mod tests {
         assert_eq!(app.pack_status.as_deref(), Some("Validating archive"));
         assert!(app.pack_busy());
         sender
-            .send(PackTaskEvent::Exported(Err("disk full".into())))
+            .send(PackTaskEvent::Exported(Err((
+                "There isn't enough space on that drive.".into(),
+                "disk full".into(),
+            ))))
             .unwrap();
         app.poll_pack_task();
         assert!(!app.pack_busy());
-        assert!(app.running_text.contains("disk full"));
+        assert!(app.running_text.contains("enough space"));
+        assert!(matches!(
+            app.export_result,
+            Some(packs_ui::ExportResult::Failed { ref error, .. }) if error == "disk full"
+        ));
     }
 
     #[test]

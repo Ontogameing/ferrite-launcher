@@ -313,11 +313,8 @@ impl Ferrite {
             WidgetAction::StopGame => self.stop_game(),
             WidgetAction::CreateInstance => self.create_instance_open = true,
             WidgetAction::ImportPack => {
-                if !self.pack_busy() {
-                    self.pack_path.clear();
-                    self.pack_name.clear();
-                    self.pack_status = None;
-                    self.import_pack_open = true;
+                if self.create_import_lock().is_none() {
+                    self.open_import_window();
                 }
             }
             WidgetAction::OpenAccount => self.auth.open = true,
