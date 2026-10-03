@@ -604,6 +604,8 @@ pub struct PackPreview {
     pub info: PackInfo,
     /// Regular files stored in the archive (including metadata files).
     pub archive_files: usize,
+    /// Declared uncompressed size of those files (downloads not included).
+    pub archive_bytes: u64,
     /// Mods: `.jar` files in the pack's game `mods/` folder plus listed mod downloads
     /// that will be installed by default.
     pub mod_count: usize,
@@ -641,6 +643,7 @@ pub fn preview(path: impl AsRef<Path>, curseforge_api_key: Option<&str>) -> Resu
     };
     let files = catalog.entries.iter().filter(|entry| !entry.is_dir);
     let archive_files = files.clone().count();
+    let archive_bytes = files.clone().map(|entry| entry.size).sum();
     let in_game_dir = |name: &str, folder: &str| {
         roots
             .iter()
@@ -708,6 +711,7 @@ pub fn preview(path: impl AsRef<Path>, curseforge_api_key: Option<&str>) -> Resu
     Ok(PackPreview {
         info,
         archive_files,
+        archive_bytes,
         mod_count,
         has_worlds,
         optional_files,
@@ -2361,6 +2365,7 @@ mod tests {
         let preview = super::preview(&modrinth, None).unwrap();
         assert_eq!(preview.info.format, PackFormat::Modrinth);
         assert_eq!(preview.archive_files, 4);
+        assert_eq!(preview.archive_bytes, index.len() as u64 + 7);
         assert_eq!(preview.mod_count, 2); // a.jar + local.jar
         assert_eq!(preview.optional_files, 1);
         assert!(!preview.has_worlds);

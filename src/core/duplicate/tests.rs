@@ -466,3 +466,22 @@ fn staging_names_match_the_sweep_pattern() {
     assert!(name.ends_with(".tmp"));
     assert_ne!(name, staging_dir_name(&dir("my-pack")));
 }
+
+#[test]
+fn preflight_space_uses_the_same_margin() {
+    let f = fixture();
+    assert!(preflight_space(&f.paths, 1024).is_ok());
+    assert!(matches!(
+        space_check(Path::new("/vol"), 1000, 1049),
+        Err(DuplicateError::NotEnoughSpace {
+            needed: 1050,
+            available: 1049,
+            ..
+        })
+    ));
+    assert!(space_check(Path::new("/vol"), 1000, 1050).is_ok());
+    assert!(matches!(
+        preflight_space(&f.paths, u64::MAX / 2),
+        Err(DuplicateError::NotEnoughSpace { .. })
+    ));
+}

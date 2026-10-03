@@ -486,16 +486,36 @@ fn check_free_space(
     scan: &TreeScan,
     hooks: &Hooks<'_>,
 ) -> Result<(), DuplicateError> {
-    let needed = with_margin(scan.total_bytes);
     let available = match hooks.available_space {
         Some(query) => query(),
         None => fsutil::available_space(instances_dir).map_err(InstanceError::from)?,
     };
+    space_check(instances_dir, scan.total_bytes, available)
+}
+
+/// The same free-space rule [`copy_duplicate`] applies, for the setup dialog: given the
+/// source size (e.g. from [`crate::core::scan::scan_instance`]), returns
+/// [`DuplicateError::NotEnoughSpace`] when the instances folder's volume can't hold a
+/// copy plus a 5% margin. Run it off the UI thread with the scan.
+pub fn preflight_space(paths: &AppPaths, source_bytes: u64) -> Result<(), DuplicateError> {
+    let instances_dir = paths.instances_dir();
+    // The instances folder may not exist yet; its parent is on the same volume.
+    let probe = if instances_dir.exists() {
+        instances_dir.clone()
+    } else {
+        paths.storage_root().to_path_buf()
+    };
+    let available = fsutil::available_space(&probe).map_err(InstanceError::from)?;
+    space_check(&instances_dir, source_bytes, available)
+}
+
+fn space_check(volume: &Path, source_bytes: u64, available: u64) -> Result<(), DuplicateError> {
+    let needed = with_margin(source_bytes);
     if needed > available {
         return Err(DuplicateError::NotEnoughSpace {
             needed,
             available,
-            volume: instances_dir.to_path_buf(),
+            volume: volume.to_path_buf(),
         });
     }
     Ok(())
