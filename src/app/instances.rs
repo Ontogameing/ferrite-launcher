@@ -13,7 +13,7 @@ use crate::loaders::ModLoader;
 use crate::packs::{ExportOptions, ImportOptions, PackFormat, PackTarget};
 use eframe::egui::{self, Color32, RichText};
 use ferrite_launcher::core::activity::{
-    GlobalBusy, InstanceAction, InstanceStatus, disabled_reason,
+    BusyOperation, GlobalBusy, InstanceAction, InstanceStatus, disabled_reason,
 };
 use std::path::PathBuf;
 use std::sync::mpsc::{self, TryRecvError};
@@ -95,28 +95,9 @@ impl Ferrite {
                     ));
                     // A failed install removes the folder this call created.
                     crate::instances::create_instance_files(&paths, &profile, || {
-                        let _ = sender.send(InstanceCreationEvent::Stage(
-                            InstanceCreationStage::DownloadingMinecraft,
-                        ));
-                        crate::minecraft::install_version_with_progress(
-                            &paths,
-                            &profile.version,
-                            |message| {
-                                let _ = sender
-                                    .send(InstanceCreationEvent::DownloadProgress(message.into()));
-                            },
-                        )
-                        .map_err(|error| format!("Failed to download Minecraft: {error}"))?;
-                        if loader != ModLoader::Vanilla {
-                            let _ = sender.send(InstanceCreationEvent::Stage(
-                                InstanceCreationStage::InstallingLoader,
-                            ));
-                            // Loader backends repeat the vanilla install, reusing cached downloads.
-                            crate::loaders::install(&paths, &profile.version, loader).map_err(
-                                |error| format!("Failed to install {}: {error}", loader.label()),
-                            )?;
-                        }
-                        Ok(())
+                        install_game_files(&paths, &profile.version, loader, &|event| {
+                            let _ = sender.send(event);
+                        })
                     })
                     .map_err(|error| match error {
                         crate::instances::InstanceError::Install(detail) => detail,
@@ -635,29 +616,43 @@ impl Ferrite {
         }
     }
 
+    /// Why Create and Import are unavailable right now, if they are.
+    pub(super) fn create_import_lock(&self) -> Option<String> {
+        if self.pack_busy() {
+            return Some("Wait for the import or export to finish.".into());
+        }
+        if let Some(task) = &self.edit_task
+            && task.installing().is_some()
+        {
+            return Some("Wait for Ferrite to finish updating the instance.".into());
+        }
+        None
+    }
+
     /// Draws profile cards and executes at most one deferred card action afterward.
     pub(super) fn instances_page(&mut self, ui: &mut egui::Ui) {
         let muted = self.muted_color();
         page_heading(ui, "Instances", "Manage your Minecraft profiles.");
         ui.add_space(8.0);
+        let lock = self.create_import_lock();
         ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    !self.pack_busy(),
-                    egui::Button::new("＋ Create instance").fill(self.accent_color()),
-                )
-                .clicked()
-            {
+            let create = ui.add_enabled(
+                lock.is_none(),
+                egui::Button::new(RichText::new("＋ Create instance").color(Color32::WHITE))
+                    .fill(self.accent_color()),
+            );
+            if create.clicked() {
                 self.create_instance_open = true;
             }
-            if ui
-                .add_enabled(!self.pack_busy(), egui::Button::new("Import pack"))
-                .clicked()
-            {
-                self.pack_path.clear();
-                self.pack_name.clear();
-                self.pack_status = None;
-                self.import_pack_open = true;
+            if let Some(reason) = &lock {
+                create.on_disabled_hover_text(reason);
+            }
+            let import = ui.add_enabled(lock.is_none(), egui::Button::new("Import pack"));
+            if import.clicked() {
+                self.open_import_window();
+            }
+            if let Some(reason) = &lock {
+                import.on_disabled_hover_text(reason);
             }
         });
         ui.add_space(20.0);
@@ -672,130 +667,182 @@ impl Ferrite {
         }
 
         // Defer mutations until iteration releases its immutable borrow of `instances`.
-        let mut launch = false;
-        let mut remove = None;
-        let mut export = false;
-        let mut open_folder = None;
-        let statuses: Vec<InstanceStatus> = self
+        let mut action = None;
+        let cards: Vec<CardInfo> = self
             .instances
             .iter()
-            .map(|instance| self.instance_status(instance))
+            .map(|instance| {
+                let status = self.instance_status(instance);
+                let chip = self.instance_chip(instance, &status);
+                CardInfo {
+                    status,
+                    chip,
+                    folder: instance.game_dir(&self.paths),
+                }
+            })
             .collect();
-        let mut mods = None;
         let mod_idle =
             self.mod_task.is_none() && self.pending_uninstall.is_none() && !self.pack_busy();
+        let scroll_to = self.scroll_to_instance.take();
+        let light = self.ui_settings.appearance.theme == "light";
+        let accent = self.accent_color();
+        let card_color = self.card_color();
+        let corner_radius = self.ui_settings.appearance.corner_radius;
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (index, instance) in self.instances.iter().enumerate() {
                 let selected = self.selected_instance == Some(index);
-                egui::Frame::new()
-                    .fill(if selected {
-                        if self.ui_settings.appearance.theme == "light" {
-                            Color32::from_rgb(255, 240, 232)
-                        } else {
-                            Color32::from_rgb(43, 39, 44)
-                        }
-                    } else {
-                        self.card_color()
-                    })
-                    .stroke(egui::Stroke::new(
-                        if selected { 1.5 } else { 1.0 },
-                        if selected {
-                            self.accent_color()
-                        } else {
-                            Color32::from_rgb(50, 55, 64)
-                        },
-                    ))
-                    .corner_radius(self.ui_settings.appearance.corner_radius)
-                    .inner_margin(18.0)
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        // Metadata and actions use separate rows so long names do
-                        // not push buttons beyond a narrow viewport.
-                        if ui
-                            .selectable_label(
-                                selected,
-                                RichText::new(&instance.name).size(20.0).strong(),
-                            )
-                            .clicked()
-                        {
-                            self.selected_instance = Some(index);
-                        }
-                        ui.label(
-                            RichText::new(format!(
-                                "Minecraft {}  •  {}",
-                                instance.version, instance.loader
+                let info = &cards[index];
+                let card = ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .id_salt(("instance-card", instance.directory().as_str()))
+                        .sense(egui::Sense::click()),
+                    |ui| {
+                        egui::Frame::new()
+                            .fill(match (selected, light) {
+                                (true, true) => Color32::from_rgb(255, 240, 232),
+                                (true, false) => Color32::from_rgb(43, 39, 44),
+                                _ => card_color,
+                            })
+                            .stroke(egui::Stroke::new(
+                                if selected { 1.5 } else { 1.0 },
+                                if selected {
+                                    accent
+                                } else {
+                                    Color32::from_rgb(50, 55, 64)
+                                },
                             ))
-                            .color(muted),
-                        );
-                        let status = statuses[index];
-                        let reason = |action| disabled_reason(action, &instance.name, &status);
-                        // Draws one action button, disabled with its reason when needed.
-                        let button = |ui: &mut egui::Ui, label: &str, action, extra: bool| {
-                            let reason = reason(action);
-                            let response =
-                                ui.add_enabled(extra && reason.is_none(), egui::Button::new(label));
-                            let clicked = response.clicked();
-                            if let Some(reason) = reason {
-                                response.on_disabled_hover_text(reason);
-                            }
-                            clicked
-                        };
-                        ui.horizontal(|ui| {
-                            if button(ui, "Play", InstanceAction::Play, mod_idle) {
-                                self.selected_instance = Some(index);
-                                launch = true;
-                            }
-                            if button(ui, "Mods", InstanceAction::Mods, mod_idle) {
-                                mods = Some(instance.clone());
-                            }
-                            if button(ui, "Open folder", InstanceAction::OpenFolder, true) {
-                                open_folder = Some(instance.game_dir(&self.paths));
-                            }
-                            if button(ui, "Export", InstanceAction::Export, true) {
-                                self.selected_instance = Some(index);
-                                export = true;
-                            }
-                            let delete_action = if status.folder_missing {
-                                InstanceAction::RemoveFromList
-                            } else {
-                                InstanceAction::Delete
-                            };
-                            if button(ui, "Remove", delete_action, true) {
-                                self.selected_instance = Some(index);
-                                remove = Some(instance.directory().clone());
-                            }
-                        });
-                    });
+                            .corner_radius(corner_radius)
+                            .inner_margin(18.0)
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                instance_card(ui, index, instance, info, mod_idle, accent, muted)
+                            })
+                            .inner
+                    },
+                );
+                if let Some(card_action) = card.inner {
+                    action = Some(card_action);
+                }
+                let response = card.response;
+                if response.clicked() {
+                    action = Some(CardAction::Select(index));
+                }
+                response.context_menu(|ui| {
+                    if let Some(menu_action) = card_menu(ui, index, instance, info) {
+                        action = Some(menu_action);
+                    }
+                });
+                if scroll_to.as_ref() == Some(instance.directory()) {
+                    response.scroll_to_me(Some(egui::Align::Center));
+                }
                 ui.add_space(10.0);
             }
         });
-        if let Some(target) = mods {
-            self.set_mod_target(target);
-            self.show_installed = true;
-            self.current_page = Page::Mods;
-            self.local_mod_task(None);
+        if let Some(action) = action {
+            self.run_card_action(action);
         }
-        if launch {
-            self.launch_selected();
-        } else if export {
-            if let Some(name) = self
-                .selected_instance()
-                .map(|instance| instance.name.clone())
-            {
-                self.pack_name = name;
+    }
+
+    /// The status chip for a card (spec §2.3), if any.
+    fn instance_chip(&self, instance: &InstanceProfile, status: &InstanceStatus) -> Option<Chip> {
+        use ferrite_launcher::core::activity::InstanceActivity;
+        match status.activity {
+            InstanceActivity::Busy(BusyOperation::Deleting) => Some(Chip::Busy {
+                text: format!("Moving to {}…", super::dialogs::trash_word()),
+                reopen: None,
+            }),
+            InstanceActivity::Busy(BusyOperation::Updating) => Some(Chip::Busy {
+                text: "Updating…".into(),
+                reopen: Some(Reopen::Update),
+            }),
+            InstanceActivity::Busy(BusyOperation::Duplicating) => Some(Chip::Busy {
+                text: self
+                    .duplicate_job_for(instance.directory())
+                    .and_then(super::duplicate::DuplicateJob::progress)
+                    .map(|progress| super::duplicate::chip_text(&progress))
+                    .unwrap_or_else(|| "Copying…".into()),
+                reopen: Some(Reopen::Duplicate(instance.directory().clone())),
+            }),
+            InstanceActivity::Running => Some(Chip::Running),
+            InstanceActivity::Idle if status.folder_missing => Some(Chip::FolderMissing),
+            InstanceActivity::Idle => None,
+        }
+    }
+
+    /// Carries out one card or menu action after the cards were drawn.
+    fn run_card_action(&mut self, action: CardAction) {
+        match action {
+            CardAction::Select(index) => self.selected_instance = Some(index),
+            CardAction::Play(index) => {
+                self.selected_instance = Some(index);
+                self.launch_selected();
             }
-            self.pack_format = PackFormat::Ferrite;
-            self.pack_include_worlds = true;
-            self.pack_loader_version.clear();
-            self.pack_status = None;
-            self.export_pack_open = true;
-        } else if let Some(directory) = remove {
-            self.open_remove_dialog(directory);
-        } else if let Some(folder) = open_folder
-            && let Err(error) = crate::config::open_folder(&folder)
-        {
-            self.running_text = format!("Couldn't open {}: {error}", folder.display());
+            CardAction::Mods(index) => {
+                if let Some(target) = self.instances.get(index).cloned() {
+                    self.set_mod_target(target);
+                    self.show_installed = true;
+                    self.current_page = Page::Mods;
+                    self.local_mod_task(None);
+                }
+            }
+            CardAction::OpenFolder(folder) => {
+                if let Some(message) = super::dialogs::open_folder(&folder) {
+                    self.running_text = message;
+                }
+            }
+            CardAction::Edit(index) => {
+                self.selected_instance = Some(index);
+                if let Some(directory) = self.instances.get(index).map(|p| p.directory().clone()) {
+                    self.open_edit_dialog(&directory);
+                }
+            }
+            CardAction::Duplicate(index) => {
+                self.selected_instance = Some(index);
+                if let Some(directory) = self.instances.get(index).map(|p| p.directory().clone()) {
+                    self.open_duplicate_dialog(&directory);
+                }
+            }
+            CardAction::Export(index) => {
+                self.selected_instance = Some(index);
+                self.open_export_window();
+            }
+            CardAction::Delete(index) => {
+                self.selected_instance = Some(index);
+                if let Some(directory) = self.instances.get(index).map(|p| p.directory().clone()) {
+                    self.open_remove_dialog(directory);
+                }
+            }
+            CardAction::Reopen(Reopen::Update) => self.show_edit_window(),
+            CardAction::Reopen(Reopen::Duplicate(directory)) => {
+                self.show_duplicate_window(&directory)
+            }
         }
+    }
+
+    /// Opens the Export window for the selected instance (spec §6).
+    pub(super) fn open_export_window(&mut self) {
+        let Some(profile) = self.selected_instance().cloned() else {
+            return;
+        };
+        self.pack_name = profile.name.clone();
+        self.pack_format = PackFormat::Ferrite;
+        self.pack_include_worlds = true;
+        self.pack_loader_version = ModLoader::from_label(&profile.loader)
+            .filter(|loader| *loader != ModLoader::Vanilla)
+            .and_then(|loader| {
+                crate::loaders::installed_loader_version(&self.paths, &profile.version, loader)
+            })
+            .unwrap_or_default();
+        self.pack_status = None;
+        self.export_pack_open = true;
+    }
+
+    /// Opens the Import window on its first step.
+    pub(super) fn open_import_window(&mut self) {
+        self.pack_path.clear();
+        self.pack_name.clear();
+        self.pack_status = None;
+        self.import_pack_open = true;
     }
 
     /// Activity, folder presence, and global locks for one card (cheap: one mutex poll
@@ -1024,6 +1071,261 @@ impl Ferrite {
             self.create_instance();
         }
     }
+}
+
+/// Per-card state computed before drawing.
+struct CardInfo {
+    status: InstanceStatus,
+    chip: Option<Chip>,
+    folder: PathBuf,
+}
+
+/// Which task window a chip reopens.
+#[derive(Clone)]
+enum Reopen {
+    Update,
+    Duplicate(crate::instances::InstanceDirName),
+}
+
+/// The status chip next to a card's name (spec §2.3).
+enum Chip {
+    FolderMissing,
+    Running,
+    Busy {
+        text: String,
+        reopen: Option<Reopen>,
+    },
+}
+
+/// What the user did on a card.
+enum CardAction {
+    Select(usize),
+    Play(usize),
+    Mods(usize),
+    OpenFolder(PathBuf),
+    Edit(usize),
+    Duplicate(usize),
+    Export(usize),
+    Delete(usize),
+    Reopen(Reopen),
+}
+
+/// One action button, disabled with its reason when needed.
+fn card_button(
+    ui: &mut egui::Ui,
+    button: egui::Button,
+    reason: Option<String>,
+    extra_enabled: bool,
+) -> bool {
+    let response = ui.add_enabled(extra_enabled && reason.is_none(), button);
+    let clicked = response.clicked();
+    if let Some(reason) = reason {
+        response.on_disabled_hover_text(reason);
+    }
+    clicked
+}
+
+/// The card body: name row with chip and Quilt badge, the version line, and the
+/// Play / Mods / ⋯ row (spec §2.1).
+fn instance_card(
+    ui: &mut egui::Ui,
+    index: usize,
+    instance: &InstanceProfile,
+    info: &CardInfo,
+    mod_idle: bool,
+    accent: Color32,
+    muted: Color32,
+) -> Option<CardAction> {
+    let mut action = None;
+    let reason = |action| disabled_reason(action, &instance.name, &info.status);
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::Label::new(RichText::new(&instance.name).size(20.0).strong()).selectable(false),
+        );
+        if let Some(chip) = &info.chip
+            && let Some(reopen) = chip_ui(ui, chip, muted)
+        {
+            action = Some(CardAction::Reopen(reopen));
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        super::dialogs::loader_text(
+            ui,
+            &instance.loader,
+            RichText::new(format!(
+                "Minecraft {}  •  {}",
+                instance.version, instance.loader
+            ))
+            .color(muted),
+            muted,
+        );
+    });
+    ui.horizontal(|ui| {
+        let play = egui::Button::new(RichText::new("Play").color(Color32::WHITE)).fill(accent);
+        if card_button(ui, play, reason(InstanceAction::Play), mod_idle) {
+            action = Some(CardAction::Play(index));
+        }
+        if card_button(
+            ui,
+            egui::Button::new("Mods"),
+            reason(InstanceAction::Mods),
+            mod_idle,
+        ) {
+            action = Some(CardAction::Mods(index));
+        }
+        let menu = ui.menu_button("⋯", |ui| card_menu(ui, index, instance, info));
+        if let Some(Some(menu_action)) = menu.inner {
+            action = Some(menu_action);
+        }
+        menu.response.on_hover_text("More actions");
+    });
+    action
+}
+
+/// Draws a chip; returns the window to reopen when it was clicked.
+fn chip_ui(ui: &mut egui::Ui, chip: &Chip, muted: Color32) -> Option<Reopen> {
+    let frame = egui::Frame::new()
+        .stroke(egui::Stroke::new(1.0, muted.gamma_multiply(0.6)))
+        .corner_radius(8.0)
+        .inner_margin(egui::Margin::symmetric(6, 2));
+    let small =
+        |text: &str| egui::Label::new(RichText::new(text).small().color(muted)).selectable(false);
+    match chip {
+        Chip::FolderMissing => {
+            frame
+                .show(ui, |ui| ui.add(small("Folder missing")))
+                .response
+                .on_hover_text(
+                    "Ferrite can't find this instance's folder. It may have been moved or deleted.",
+                );
+            None
+        }
+        Chip::Running => {
+            frame.show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                    ui.painter()
+                        .circle_filled(rect.center(), 4.0, super::dialogs::RUNNING_GREEN);
+                    ui.add(small("Running"));
+                });
+            });
+            None
+        }
+        Chip::Busy { text, reopen } => {
+            let response = frame
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui.add(egui::Spinner::new().size(10.0));
+                        ui.add(small(text));
+                    });
+                })
+                .response;
+            let response = if reopen.is_some() {
+                response
+                    .interact(egui::Sense::click())
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text("Show progress")
+            } else {
+                response
+            };
+            if response.clicked() {
+                reopen.clone()
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// The card menu (⋯ button and right-click, spec §2.2). Disabled items stay visible
+/// with their reason.
+fn card_menu(
+    ui: &mut egui::Ui,
+    index: usize,
+    instance: &InstanceProfile,
+    info: &CardInfo,
+) -> Option<CardAction> {
+    let status = &info.status;
+    let reason = |action| disabled_reason(action, &instance.name, status);
+    let mut action = None;
+    let mut item = |ui: &mut egui::Ui, text: RichText, why: Option<String>, chosen: CardAction| {
+        let response = ui.add_enabled(why.is_none(), egui::Button::new(text));
+        if response.clicked() {
+            action = Some(chosen);
+            ui.close();
+        }
+        if let Some(why) = why {
+            response.on_disabled_hover_text(why);
+        }
+    };
+    item(
+        ui,
+        RichText::new("Open folder"),
+        reason(InstanceAction::OpenFolder),
+        CardAction::OpenFolder(info.folder.clone()),
+    );
+    item(
+        ui,
+        RichText::new("Edit…"),
+        reason(InstanceAction::Rename),
+        CardAction::Edit(index),
+    );
+    item(
+        ui,
+        RichText::new("Duplicate…"),
+        reason(InstanceAction::Duplicate),
+        CardAction::Duplicate(index),
+    );
+    item(
+        ui,
+        RichText::new("Export…"),
+        reason(InstanceAction::Export),
+        CardAction::Export(index),
+    );
+    ui.separator();
+    let delete_action = if status.folder_missing {
+        InstanceAction::RemoveFromList
+    } else {
+        InstanceAction::Delete
+    };
+    item(
+        ui,
+        RichText::new("Delete…").color(super::dialogs::DANGER),
+        reason(delete_action),
+        CardAction::Delete(index),
+    );
+    action
+}
+
+/// Installs the shared Minecraft files for `version` and, unless Vanilla, the loader:
+/// the same steps Create runs, reused by Edit's "Save and install". Never touches an
+/// instance folder. Progress goes to `events` as creation stages and messages.
+pub(super) fn install_game_files(
+    paths: &ferrite_launcher::core::paths::AppPaths,
+    version: &str,
+    loader: ModLoader,
+    events: &dyn Fn(InstanceCreationEvent),
+) -> Result<(), String> {
+    events(InstanceCreationEvent::Stage(
+        InstanceCreationStage::DownloadingMinecraft,
+    ));
+    crate::minecraft::install_version_with_progress(paths, version, |message| {
+        events(InstanceCreationEvent::DownloadProgress(message.into()));
+    })
+    .map_err(|error| format!("Failed to download Minecraft: {error}"))?;
+    if loader != ModLoader::Vanilla {
+        events(InstanceCreationEvent::Stage(
+            InstanceCreationStage::InstallingLoader,
+        ));
+        // Loader backends repeat the vanilla install, reusing cached downloads.
+        crate::loaders::install(paths, version, loader)
+            .map_err(|error| format!("Failed to install {}: {error}", loader.label()))?;
+    }
+    Ok(())
 }
 
 /// The "Mod loader" ComboBox used by Create and generic Import. Quilt reads

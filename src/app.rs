@@ -8,6 +8,8 @@
 
 mod auth;
 mod dialogs;
+mod duplicate;
+mod edit;
 mod instances;
 mod layout;
 mod mods;
@@ -294,6 +296,18 @@ struct Ferrite {
     remove_task: Option<remove::RemoveTask>,
     /// The window was asked to close while a removal was running.
     close_after_remove: bool,
+    /// The open Duplicate setup modal, if any.
+    duplicate_setup: Option<duplicate::DuplicateSetup>,
+    /// Running and finished-but-still-shown duplicates.
+    duplicate_jobs: Vec<duplicate::DuplicateJob>,
+    /// Scroll this instance's card into view on the next Instances frame.
+    scroll_to_instance: Option<crate::instances::InstanceDirName>,
+    /// Source of window ids for task windows.
+    next_job_id: u64,
+    /// The open Edit modal, if any.
+    edit_dialog: Option<edit::EditDialog>,
+    /// The single version/loader update (installing, or failed and still shown).
+    edit_task: Option<edit::EditTask>,
 }
 
 /// Removes stale import/duplicate temp folders from `instances/` in the background.
@@ -459,6 +473,12 @@ impl Ferrite {
             remove_dialog: None,
             remove_task: None,
             close_after_remove: false,
+            duplicate_setup: None,
+            duplicate_jobs: Vec::new(),
+            scroll_to_instance: None,
+            next_job_id: 0,
+            edit_dialog: None,
+            edit_task: None,
         };
         if app.config.launcher.check_for_updates {
             app.start_update_check(false);
@@ -474,6 +494,8 @@ impl eframe::App for Ferrite {
         self.poll_instance_creation();
         self.poll_pack_task();
         self.poll_remove_task();
+        self.poll_duplicates();
+        self.poll_edit_task();
         self.intercept_close_while_removing(ui.ctx());
         self.poll_mod_task();
         self.poll_auth();
@@ -555,11 +577,17 @@ impl eframe::App for Ferrite {
         self.export_pack_window(ui.ctx());
         self.uninstall_window(ui.ctx());
         self.remove_window(ui.ctx());
+        self.duplicate_setup_window(ui.ctx());
+        self.duplicate_windows(ui.ctx());
+        self.edit_window(ui.ctx());
+        self.edit_task_window(ui.ctx());
         // Channels do not wake egui directly, so poll promptly while workers can send.
         if self.instance_creation_task.is_some()
             || self.pack_task.is_some()
             || self.remove_task.is_some()
             || self.remove_dialog_busy()
+            || self.duplicate_busy()
+            || self.edit_busy()
             || self.mod_task.is_some()
             || self.auth.task.is_some()
             || self.update_task.is_some()
@@ -650,6 +678,12 @@ mod tests {
             remove_dialog: None,
             remove_task: None,
             close_after_remove: false,
+            duplicate_setup: None,
+            duplicate_jobs: Vec::new(),
+            scroll_to_instance: None,
+            next_job_id: 0,
+            edit_dialog: None,
+            edit_task: None,
         }
     }
 

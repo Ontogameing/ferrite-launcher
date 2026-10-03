@@ -3,7 +3,7 @@
 //! the size/worlds wording.
 
 use super::startup::{group_thousands, plural};
-use crate::instances::InstanceProfile;
+use crate::instances::{InstanceProfile, NameError};
 use eframe::egui::{self, Color32, RichText};
 use ferrite_launcher::core::migration::format_size;
 use ferrite_launcher::core::paths::AppPaths;
@@ -85,6 +85,33 @@ pub(super) fn path_fact(
     clicked
 }
 
+/// Hover text of the Quilt badge (spec §8).
+const QUILT_HOVER: &str =
+    "Quilt support in Ferrite is experimental. Some versions or mods may not install or launch.";
+
+/// Writes `loader` (a stored label like "Quilt") followed by the "Experimental" badge
+/// when it is Quilt (spec §8). The one helper every loader display uses.
+pub(super) fn loader_text(ui: &mut egui::Ui, loader: &str, text: RichText, color: Color32) {
+    ui.label(text);
+    quilt_badge(ui, loader, color);
+}
+
+/// Just the badge (after a "Quilt" already written), or nothing for other loaders.
+pub(super) fn quilt_badge(ui: &mut egui::Ui, loader: &str, color: Color32) {
+    if loader != "Quilt" {
+        return;
+    }
+    egui::Frame::new()
+        .stroke(egui::Stroke::new(1.0, color))
+        .corner_radius(4.0)
+        .inner_margin(egui::Margin::symmetric(4, 1))
+        .show(ui, |ui| {
+            ui.label(RichText::new("Experimental").small().color(color));
+        })
+        .response
+        .on_hover_text(QUILT_HOVER);
+}
+
 /// Opens `folder` in the file manager; returns a status message on failure.
 pub(super) fn open_folder(folder: &Path) -> Option<String> {
     crate::config::open_folder(folder)
@@ -117,6 +144,46 @@ pub(super) fn escape_pressed(ui: &egui::Ui) -> bool {
 /// Enter was pressed this frame (used for non-destructive primary actions only).
 pub(super) fn enter_pressed(ui: &egui::Ui) -> bool {
     ui.input(|input| input.key_pressed(egui::Key::Enter))
+}
+
+/// The live message under a name field (spec §4.1).
+pub(super) fn name_error_text(error: &NameError) -> String {
+    match error {
+        NameError::Empty => "Enter a name.".into(),
+        NameError::Taken(existing) => format!("Another instance is already called “{existing}”."),
+        NameError::ControlCharacter => "Names can't contain tabs or line breaks.".into(),
+    }
+}
+
+/// A single-line name field. With `select_all`, it takes focus and selects its text
+/// (first frame of a dialog). Shows `error` underneath in the warning color.
+pub(super) fn name_field(
+    ui: &mut egui::Ui,
+    id: &str,
+    name: &mut String,
+    error: Option<&str>,
+    select_all: bool,
+) -> egui::Response {
+    let mut output = egui::TextEdit::singleline(name)
+        .id_salt(id)
+        .desired_width(f32::INFINITY)
+        .show(ui);
+    if select_all {
+        output.response.response.request_focus();
+        let end = egui::text::CCursor::new(name.chars().count());
+        output
+            .state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(0),
+                end,
+            )));
+        output.state.store(ui.ctx(), output.response.response.id);
+    }
+    if let Some(error) = error {
+        ui.label(RichText::new(error).color(ui.visuals().warn_fg_color));
+    }
+    output.response.response
 }
 
 /// A background [`scan::scan_instance`] for one dialog.
@@ -249,6 +316,15 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(size_line(&scan), "4.2 GiB · 12,345 files");
+    }
+
+    #[test]
+    fn name_errors_read_as_the_spec_says() {
+        assert_eq!(name_error_text(&NameError::Empty), "Enter a name.");
+        assert_eq!(
+            name_error_text(&NameError::Taken("Foo".into())),
+            "Another instance is already called “Foo”."
+        );
     }
 
     #[test]

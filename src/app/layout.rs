@@ -243,7 +243,15 @@ impl Ferrite {
             if let Some(instance) = self.selected_instance() {
                 summary_row(ui, "Profile", &instance.name);
                 summary_row(ui, "Minecraft", &instance.version);
-                summary_row(ui, "Loader", &instance.loader);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Loader").color(MUTED));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        super::dialogs::quilt_badge(ui, &instance.loader, MUTED);
+                        ui.add(
+                            egui::Label::new(RichText::new(&instance.loader).strong()).truncate(),
+                        );
+                    });
+                });
                 summary_row(
                     ui,
                     "Memory",
