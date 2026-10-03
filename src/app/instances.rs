@@ -519,6 +519,8 @@ impl Ferrite {
         let mut open = self.create_instance_open;
         let mut create_requested = false;
         egui::Window::new("Create instance")
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(context.content_rect().center())
             .open(&mut open)
             .collapsible(false)
             .resizable(false)

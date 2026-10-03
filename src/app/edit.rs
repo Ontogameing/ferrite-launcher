@@ -564,6 +564,8 @@ impl Ferrite {
         let mut open = true;
         let mut action = None;
         egui::Window::new(format!("Updating {}", task.name))
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(context.content_rect().center())
             .id(egui::Id::new("edit-update"))
             .open(&mut open)
             .collapsible(false)

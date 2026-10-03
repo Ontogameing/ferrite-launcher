@@ -449,6 +449,8 @@ impl Ferrite {
             ImportStep::Installing(_) | ImportStep::Reading { .. }
         );
         egui::Window::new("Import pack")
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(context.content_rect().center())
             .id(egui::Id::new("import-pack"))
             .open(&mut open)
             .collapsible(false)
@@ -748,6 +750,8 @@ impl Ferrite {
         let mut open = true;
         let mut action = None;
         egui::Window::new(format!("Export {}", profile.name))
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(context.content_rect().center())
             .id(egui::Id::new("export-pack"))
             .open(&mut open)
             .collapsible(false)

@@ -499,6 +499,8 @@ impl Ferrite {
             let mut open = true;
             let mut close = false;
             egui::Window::new(title)
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(context.content_rect().center())
                 .id(egui::Id::new(("duplicate-job", job.id)))
                 .open(&mut open)
                 .collapsible(false)
