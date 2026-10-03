@@ -87,8 +87,10 @@ impl std::error::Error for PathsError {}
 pub enum StorageMode {
     /// Per-user OS directories from `ProjectDirs` (or test-supplied roots).
     Standard,
-    /// The user explicitly rolled back to a pre-Stage-1 `minecraft/` directory after
-    /// a migration; the storage root points at that old directory.
+    /// The storage root points at a pre-Stage-1 `minecraft/` directory: either the
+    /// user rolled back after a migration, or chose "use old data this time" for one
+    /// session. The instance manifest is written in the v0 format here so older
+    /// Ferrite builds can still read the folder.
     LegacyRollback,
 }
 

@@ -18,7 +18,7 @@ pub use crate::core::manifest::{InstanceDirName, InstanceProfile, SkippedEntry};
 
 use crate::core::fsutil;
 use crate::core::manifest::{self, ManifestError};
-use crate::core::paths::AppPaths;
+use crate::core::paths::{AppPaths, StorageMode};
 use std::fmt;
 use std::fs;
 use std::io;
@@ -117,7 +117,10 @@ pub fn load_from(path: &Path) -> Result<LoadedInstances, InstanceError> {
     })
 }
 
-/// Saves all profiles (plus preserved skipped entries) as the current schema.
+/// Saves all profiles (plus preserved skipped entries).
+///
+/// In the standard data dir this writes the current versioned schema; when the
+/// storage root is a legacy `minecraft` folder it writes the plain v0 array.
 pub fn save(
     paths: &AppPaths,
     profiles: &[InstanceProfile],
@@ -125,7 +128,12 @@ pub fn save(
 ) -> Result<(), InstanceError> {
     let path = paths.instances_manifest();
     guard_existing_manifest(&path)?;
-    let text = manifest::serialize_manifest(profiles, preserved)?;
+    // The new data dir uses the versioned format. A legacy `minecraft` folder keeps
+    // the bare-array v0 format so older Ferrite builds can still read it.
+    let text = match paths.mode() {
+        StorageMode::Standard => manifest::serialize_manifest(profiles, preserved)?,
+        StorageMode::LegacyRollback => manifest::serialize_manifest_v0(profiles, preserved)?,
+    };
     fsutil::write_atomic(&path, text.as_bytes())?;
     Ok(())
 }
@@ -255,6 +263,63 @@ mod tests {
         let reloaded = load(&paths).unwrap();
         assert_eq!(reloaded.source_version, Some(1));
         assert_eq!(reloaded.profiles, loaded.profiles);
+    }
+
+    #[test]
+    fn legacy_storage_root_is_saved_as_v0_including_invalid_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_root = dir.path().join("old").join("minecraft");
+        fs::create_dir_all(&legacy_root).unwrap();
+        let invalid = r#"{"name":"Evil","version":"1","loader":"Vanilla","directory":"../escape"}"#;
+        fs::write(
+            legacy_root.join("instances.json"),
+            format!(
+                r#"[{{"name":"A","version":"1.21.1","loader":"Vanilla","directory":"a"}},{invalid}]"#
+            ),
+        )
+        .unwrap();
+        let paths = paths_in(&dir.path().join("ferrite"))
+            .with_legacy_storage_root(legacy_root.clone())
+            .unwrap();
+
+        let mut loaded = load(&paths).unwrap();
+        assert_eq!(loaded.skipped.len(), 1);
+        loaded.profiles.push(InstanceProfile::new(
+            "New".into(),
+            "1.20.1".into(),
+            "Fabric".into(),
+            &loaded.profiles,
+        ));
+        save(&paths, &loaded.profiles, &loaded.skipped).unwrap();
+
+        let text = fs::read_to_string(legacy_root.join("instances.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let array = value
+            .as_array()
+            .expect("legacy folder must keep a bare v0 array");
+        assert_eq!(array.len(), 3);
+        assert!(!text.contains("schema_version"));
+        assert_eq!(array[1]["name"], "New");
+        assert_eq!(
+            array[2],
+            serde_json::from_str::<serde_json::Value>(invalid).unwrap(),
+            "invalid entries are written back unchanged"
+        );
+        // Every valid entry has exactly the fields older builds expect.
+        for entry in &array[..2] {
+            let mut keys: Vec<_> = entry.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            assert_eq!(keys, ["directory", "loader", "name", "version"]);
+        }
+        let reloaded = load(&paths).unwrap();
+        assert_eq!(reloaded.source_version, Some(0));
+        assert_eq!(reloaded.profiles.len(), 2);
+        assert_eq!(reloaded.skipped.len(), 1);
+
+        // The standard data dir still gets v1.
+        let standard = paths_in(&dir.path().join("ferrite"));
+        save(&standard, &reloaded.profiles, &reloaded.skipped).unwrap();
+        assert_eq!(load(&standard).unwrap().source_version, Some(1));
     }
 
     #[test]

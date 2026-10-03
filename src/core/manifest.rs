@@ -541,6 +541,25 @@ pub fn serialize_manifest(
     Ok(text)
 }
 
+/// Serializes the legacy version-0 format: a plain JSON array of instance objects,
+/// with preserved (skipped/invalid) entries appended verbatim.
+///
+/// Only used when the storage root is a pre-Stage-1 `minecraft` folder (rollback or
+/// "use old data this time"), so older Ferrite builds can still read that folder.
+pub fn serialize_manifest_v0(
+    instances: &[InstanceProfile],
+    preserved: &[SkippedEntry],
+) -> Result<String, serde_json::Error> {
+    let mut entries = Vec::with_capacity(instances.len() + preserved.len());
+    for profile in instances {
+        entries.push(serde_json::to_value(profile)?);
+    }
+    entries.extend(preserved.iter().map(|entry| entry.raw.clone()));
+    let mut text = serde_json::to_string_pretty(&Value::Array(entries))?;
+    text.push('\n');
+    Ok(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
