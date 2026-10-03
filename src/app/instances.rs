@@ -481,6 +481,7 @@ impl Ferrite {
                 crate::loaders::installed_loader_version(&self.paths, &profile.version, loader)
             })
             .unwrap_or_default();
+        self.export_loader_prefilled = !self.pack_loader_version.is_empty();
         self.pack_status = None;
         self.export_pack_open = true;
     }

@@ -182,6 +182,19 @@ pub(super) fn sanitize_file_name(name: &str) -> String {
     }
 }
 
+/// Help under the loader-version field (spec §6.4). `prefilled` is recorded when the
+/// window opens (Ferrite filled the field) and cleared once the user edits it.
+pub(super) fn loader_version_help(loader: &str, prefilled: bool) -> String {
+    if prefilled {
+        format!(
+            "These pack formats record the exact {loader} version. Ferrite filled in the one \
+             this instance uses."
+        )
+    } else {
+        format!("These pack formats record the exact {loader} version.")
+    }
+}
+
 /// Whether `format` records the exact loader version (spec §6.4).
 fn needs_loader_version(format: PackFormat, loader: &str) -> bool {
     loader != "Vanilla"
@@ -835,20 +848,14 @@ impl Ferrite {
                         ui.label(format!("{} version", profile.loader));
                         quilt_badge(ui, &profile.loader, muted_color);
                     });
-                    ui.text_edit_singleline(&mut self.pack_loader_version);
-                    // Only claim a prefill when there was one (unknown stays empty).
-                    let help = if self.pack_loader_version.trim().is_empty() {
-                        format!(
-                            "These pack formats record the exact {} version.",
-                            profile.loader
-                        )
-                    } else {
-                        format!(
-                            "These pack formats record the exact {} version. Ferrite filled \
-                             in the one this instance uses.",
-                            profile.loader
-                        )
-                    };
+                    if ui
+                        .text_edit_singleline(&mut self.pack_loader_version)
+                        .changed()
+                    {
+                        // The user's own value: no longer "the one this instance uses".
+                        self.export_loader_prefilled = false;
+                    }
+                    let help = loader_version_help(&profile.loader, self.export_loader_prefilled);
                     muted(ui, help, muted_color);
                 }
                 ui.checkbox(&mut self.pack_include_worlds, "Include worlds");
@@ -1160,6 +1167,19 @@ mod tests {
         assert!(export_block(PackFormat::Modrinth, "Vanilla", "").is_none());
         assert!(export_block(PackFormat::Ferrite, "Fabric", "").is_none());
         assert!(export_block(PackFormat::Lunar, "Vanilla", "").is_some());
+    }
+
+    #[test]
+    fn loader_help_mentions_the_prefill_only_when_there_was_one() {
+        assert_eq!(
+            loader_version_help("Fabric", true),
+            "These pack formats record the exact Fabric version. Ferrite filled in the one \
+             this instance uses."
+        );
+        assert_eq!(
+            loader_version_help("Fabric", false),
+            "These pack formats record the exact Fabric version."
+        );
     }
 
     #[test]

@@ -371,9 +371,9 @@ impl Ferrite {
                 }
             }
             WidgetAction::ExportPack => {
-                if !self.pack_busy() && self.selected_instance().is_some() {
-                    self.pack_status = None;
-                    self.export_pack_open = true;
+                if !self.pack_busy() {
+                    // Same entry point as the card menu, so the prefill flag is set.
+                    self.open_export_window();
                 }
             }
             WidgetAction::OpenAccount => self.auth.open = true,

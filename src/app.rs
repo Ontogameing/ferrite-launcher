@@ -266,6 +266,8 @@ struct Ferrite {
     import_step: packs_ui::ImportStep,
     /// The last export's result, shown in the Export window.
     export_result: Option<packs_ui::ExportResult>,
+    /// Ferrite prefilled the Export loader-version field (cleared when the user edits it).
+    export_loader_prefilled: bool,
     /// Release versions fetched from Mojang.
     versions: Vec<String>,
     /// Profiles loaded from and saved to the persistent instance store.
@@ -460,6 +462,7 @@ impl Ferrite {
             pack_status: None,
             import_step: Default::default(),
             export_result: None,
+            export_loader_prefilled: false,
             versions,
             instances,
             skipped_instances,
@@ -668,6 +671,7 @@ mod tests {
             pack_status: None,
             import_step: Default::default(),
             export_result: None,
+            export_loader_prefilled: false,
             versions: Vec::new(),
             instances: Vec::new(),
             skipped_instances: Vec::new(),
