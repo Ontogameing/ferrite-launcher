@@ -5,6 +5,7 @@
 //! frontend calls into this module and renders its plain data types.
 
 pub mod activity;
+pub mod edit;
 pub mod fsutil;
 pub mod instances;
 pub mod manifest;
