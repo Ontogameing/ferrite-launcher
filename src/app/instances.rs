@@ -47,7 +47,7 @@ impl Ferrite {
             self.running_text = "An instance name is required.".to_owned();
             return;
         }
-        if self.instances.iter().any(|instance| instance.name == name) {
+        if crate::instances::name_taken(&self.instances, name, None) {
             self.running_text = format!("An instance named '{name}' already exists.");
             return;
         }
@@ -65,12 +65,22 @@ impl Ferrite {
             return;
         }
 
-        let profile = InstanceProfile::new(
-            name.to_owned(),
-            self.selected_version.clone(),
-            self.selected_loader.clone(),
+        // The folder is allocated case-insensitively against loaded profiles, skipped
+        // manifest entries, and folders already on disk; it is never adopted.
+        let profile = match crate::instances::new_instance_profile(
+            &self.paths,
+            name,
+            &self.selected_version,
+            &self.selected_loader,
             &self.instances,
-        );
+            &self.skipped_instances,
+        ) {
+            Ok(profile) => profile,
+            Err(error) => {
+                self.running_text = format!("Cannot create instance: {error}");
+                return;
+            }
+        };
         let paths = self.paths.clone();
         let (sender, receiver) = mpsc::channel();
         let worker = std::thread::Builder::new()
@@ -80,29 +90,35 @@ impl Ferrite {
                     let _ = sender.send(InstanceCreationEvent::Stage(
                         InstanceCreationStage::Preparing,
                     ));
-                    crate::instances::create_game_dir(&paths, &profile)
-                        .map_err(|error| format!("Failed to create instance directory: {error}"))?;
-                    let _ = sender.send(InstanceCreationEvent::Stage(
-                        InstanceCreationStage::DownloadingMinecraft,
-                    ));
-                    crate::minecraft::install_version_with_progress(
-                        &paths,
-                        &profile.version,
-                        |message| {
-                            let _ = sender
-                                .send(InstanceCreationEvent::DownloadProgress(message.into()));
-                        },
-                    )
-                    .map_err(|error| format!("Failed to download Minecraft: {error}"))?;
-                    if loader != ModLoader::Vanilla {
+                    // A failed install removes the folder this call created.
+                    crate::instances::create_instance_files(&paths, &profile, || {
                         let _ = sender.send(InstanceCreationEvent::Stage(
-                            InstanceCreationStage::InstallingLoader,
+                            InstanceCreationStage::DownloadingMinecraft,
                         ));
-                        // Loader backends repeat the vanilla install, reusing cached downloads.
-                        crate::loaders::install(&paths, &profile.version, loader).map_err(
-                            |error| format!("Failed to install {}: {error}", loader.label()),
-                        )?;
-                    }
+                        crate::minecraft::install_version_with_progress(
+                            &paths,
+                            &profile.version,
+                            |message| {
+                                let _ = sender
+                                    .send(InstanceCreationEvent::DownloadProgress(message.into()));
+                            },
+                        )
+                        .map_err(|error| format!("Failed to download Minecraft: {error}"))?;
+                        if loader != ModLoader::Vanilla {
+                            let _ = sender.send(InstanceCreationEvent::Stage(
+                                InstanceCreationStage::InstallingLoader,
+                            ));
+                            // Loader backends repeat the vanilla install, reusing cached downloads.
+                            crate::loaders::install(&paths, &profile.version, loader).map_err(
+                                |error| format!("Failed to install {}: {error}", loader.label()),
+                            )?;
+                        }
+                        Ok(())
+                    })
+                    .map_err(|error| match error {
+                        crate::instances::InstanceError::Install(detail) => detail,
+                        other => format!("Failed to create instance directory: {other}"),
+                    })?;
                     let _ = sender.send(InstanceCreationEvent::Stage(
                         InstanceCreationStage::Finalizing,
                     ));
@@ -143,19 +159,23 @@ impl Ferrite {
                     match result {
                         Ok(profile) => {
                             let name = profile.name.clone();
-                            self.instances.push(profile);
-                            if let Err(error) = crate::instances::save(
+                            // On failure the profile is not kept and its new folder is
+                            // removed, so memory, manifest, and disk stay consistent.
+                            let index = match crate::instances::commit_new_instance(
                                 &self.paths,
-                                &self.instances,
+                                &mut self.instances,
                                 &self.skipped_instances,
+                                profile,
                             ) {
-                                self.instances.pop();
-                                self.instance_creation_failed(format!(
-                                    "Failed to save instance: {error}"
-                                ));
-                                return;
-                            }
-                            self.selected_instance = Some(self.instances.len() - 1);
+                                Ok(index) => index,
+                                Err(error) => {
+                                    self.instance_creation_failed(format!(
+                                        "Failed to save instance: {error}"
+                                    ));
+                                    return;
+                                }
+                            };
+                            self.selected_instance = Some(index);
                             self.running_text = format!("Created instance '{name}'.");
                             self.instance_creation_status = None;
                             self.instance_name.clear();
@@ -222,6 +242,7 @@ impl Ferrite {
         let requested_name = self.pack_name.trim().to_owned();
         // The snapshot makes naming deterministic without sharing the live profile list.
         let existing = self.instances.clone();
+        let skipped = self.skipped_instances.clone();
         let include_optional = self.pack_include_optional;
         let curseforge_api_key = std::env::var("FERRITE_CURSEFORGE_API_KEY").ok();
         let paths = self.paths.clone();
@@ -241,35 +262,19 @@ impl Ferrite {
                     if base_name.is_empty() {
                         return Err("The imported instance needs a name.".into());
                     }
-                    let mut name = base_name.clone();
-                    let mut suffix = 2;
-                    loop {
-                        let candidate = InstanceProfile::new(
-                            name.clone(),
-                            target.minecraft_version.clone(),
-                            target.loader.label().to_owned(),
-                            &existing,
-                        );
-                        if !existing.iter().any(|profile| profile.name == name)
-                            && !candidate.game_dir(&paths).exists()
-                        {
-                            break;
-                        }
-                        name = format!("{base_name} ({suffix})");
-                        suffix += 1;
-                    }
-                    let profile = InstanceProfile::new(
-                        name,
-                        target.minecraft_version.clone(),
-                        target.loader.label().to_owned(),
+                    // Names are unique case-insensitively; the folder is allocated
+                    // separately (skipped entries and folders on disk are never reused).
+                    let name = crate::instances::suggest_name(&existing, &base_name);
+                    let profile = crate::instances::new_instance_profile(
+                        &paths,
+                        &name,
+                        &target.minecraft_version,
+                        target.loader.label(),
                         &existing,
-                    );
-                    let parent = profile
-                        .game_dir(&paths)
-                        .parent()
-                        .expect("instance game directory has a parent")
-                        .to_owned();
-                    std::fs::create_dir_all(parent)
+                        &skipped,
+                    )
+                    .map_err(|error| format!("Cannot create instance: {error}"))?;
+                    std::fs::create_dir_all(paths.instances_dir())
                         .map_err(|error| format!("Failed to prepare instance storage: {error}"))?;
                     let options = ImportOptions {
                         generic_target: Some(target.clone()),

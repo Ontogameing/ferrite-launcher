@@ -238,6 +238,21 @@ pub fn directory_slug(name: &str) -> String {
     }
 }
 
+/// Comparison key for folder names: Unicode-lowercased with trailing dots and spaces
+/// removed, because Windows and macOS folders are case-insensitive and Windows ignores
+/// trailing dots/spaces (`Foo.` and `foo` are the same folder there).
+///
+/// This does not apply Unicode normalization (NFC/NFD); generated slugs are ASCII, so
+/// only hand-edited legacy names could differ in normalization alone.
+pub fn directory_key(name: &str) -> String {
+    name.trim_end_matches(['.', ' ']).to_lowercase()
+}
+
+/// Comparison key for display names: trimmed and Unicode-lowercased.
+pub fn name_key(name: &str) -> String {
+    name.trim().to_lowercase()
+}
+
 // =====================================================================
 // Profiles
 // =====================================================================
@@ -260,20 +275,34 @@ impl InstanceProfile {
     /// Creates metadata for a new profile without writing it to disk.
     ///
     /// The directory is derived from the name and receives a numeric suffix if that
-    /// directory is already used by `existing`.
+    /// directory is already used by `existing` (compared case-insensitively).
+    ///
+    /// This only considers `existing`; launcher code that creates real folders should
+    /// use `core::instances::new_instance_profile`, which also checks skipped manifest
+    /// entries and folders already on disk.
     pub fn new(name: String, version: String, loader: String, existing: &[Self]) -> Self {
         let base = directory_slug(&name);
         let mut directory = base.clone();
         let mut suffix = 2;
         while existing
             .iter()
-            .any(|profile| profile.directory.as_str() == directory)
+            .any(|profile| directory_key(profile.directory.as_str()) == directory_key(&directory))
         {
             directory = format!("{base}-{suffix}");
             suffix += 1;
         }
         let directory = InstanceDirName::parse(directory)
             .expect("slugs with numeric suffixes are always valid directory names");
+        Self::with_directory(name, version, loader, directory)
+    }
+
+    /// Creates metadata for a profile stored in an already chosen, validated folder.
+    pub fn with_directory(
+        name: String,
+        version: String,
+        loader: String,
+        directory: InstanceDirName,
+    ) -> Self {
         Self {
             name,
             version,
@@ -378,6 +407,14 @@ pub struct SkippedEntry {
     pub reason: SkipReason,
     /// The original JSON value, written back unchanged on save.
     pub raw: Value,
+}
+
+impl SkippedEntry {
+    /// The raw `directory` string of this entry, if it has one (it may be unsafe or
+    /// shared with another entry; never join it onto a path without validation).
+    pub fn raw_directory(&self) -> Option<&str> {
+        self.raw.get("directory").and_then(Value::as_str)
+    }
 }
 
 impl fmt::Display for SkippedEntry {
