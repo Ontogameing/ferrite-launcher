@@ -15,13 +15,14 @@ mod view;
 
 use crate::auth::Account;
 use crate::background::BackgroundRenderer;
-use crate::config::{BackgroundSource, Config};
+use crate::config::Config;
 use crate::discord::DiscordPresence;
 use crate::icons::IconCache;
 use crate::instance_mods::InstalledMod;
 use crate::instances::{InstanceProfile, SkippedEntry};
 use crate::modrinth::{ProjectDetails, SearchFilters, SearchResponse};
 use crate::packs::PackFormat;
+use crate::ui_settings::{BackgroundSource, UiSettings};
 use crate::updates::{UpdateCheck, UpdateInfo};
 use eframe::egui::{self, Color32};
 use ferrite_launcher::core::paths::AppPaths;
@@ -198,6 +199,8 @@ struct Ferrite {
     paths: AppPaths,
     /// Persistent non-secret launcher preferences.
     config: Config,
+    /// Frontend-owned appearance and layout preferences persisted in `ui.toml`.
+    ui_settings: UiSettings,
     /// Advanced editor state is separate so keystrokes never mutate live settings.
     raw_config_toml: String,
     config_status: Option<String>,
@@ -282,6 +285,9 @@ impl Ferrite {
     /// Loads startup state, performs the initial version lookup, and optionally starts
     /// update checking. Recoverable config/instance failures become visible UI status.
     fn new(paths: AppPaths) -> Self {
+        // Migrate frontend settings out of config.toml before anything can rewrite it.
+        let loaded_ui = crate::ui_settings::load_or_migrate(&paths);
+        let ui_settings = loaded_ui.settings;
         let loaded_config = crate::config::load_or_create(&paths);
         let (config, config_warning) = match loaded_config {
             Ok(loaded) => (loaded.config, loaded.warning),
@@ -300,7 +306,7 @@ impl Ferrite {
         let raw_config_toml = crate::config::read_toml(&paths)
             .or_else(|_| crate::config::to_toml(&config))
             .unwrap_or_default();
-        let accent_edit = config.appearance.accent.clone();
+        let accent_edit = ui_settings.appearance.accent.clone();
 
         let versions =
             match crate::minecraft::get_versions_with_snapshots(config.launcher.show_snapshots) {
@@ -345,11 +351,21 @@ impl Ferrite {
         if let Some(warning) = config_warning {
             running_text = warning;
         }
+        if loaded_ui.migrated_from_legacy {
+            running_text = format!(
+                "Moved appearance and layout settings to {}.",
+                paths.ui_settings_file().display()
+            );
+        }
+        if let Some(warning) = loaded_ui.warning {
+            running_text = warning;
+        }
         let selected_instance = (!instances.is_empty()).then_some(0);
 
         let mut app = Self {
             paths,
             config,
+            ui_settings,
             raw_config_toml,
             config_status: None,
             accent_edit,
@@ -423,7 +439,7 @@ impl eframe::App for Ferrite {
         self.poll_auth();
         self.poll_update_check();
         ui.ctx()
-            .set_zoom_factor(self.config.appearance.font_scale.clamp(0.5, 2.0));
+            .set_zoom_factor(self.ui_settings.appearance.font_scale.clamp(0.5, 2.0));
         let mut visuals = if self.is_light_theme() {
             egui::Visuals::light()
         } else {
@@ -440,7 +456,7 @@ impl eframe::App for Ferrite {
         let background_settings = self.active_background_settings().clone();
         let background_enabled = !matches!(background_settings.source, BackgroundSource::None);
         let background_scope = self
-            .config
+            .ui_settings
             .appearance
             .background
             .use_per_page
@@ -535,6 +551,7 @@ mod tests {
         Ferrite {
             paths: test_paths(),
             config: Config::default(),
+            ui_settings: UiSettings::default(),
             raw_config_toml: crate::config::to_toml(&Config::default()).unwrap(),
             config_status: None,
             accent_edit: "#ff6600".into(),
@@ -590,12 +607,12 @@ mod tests {
     #[test]
     fn background_selection_uses_global_or_current_page() {
         let mut app = app();
-        app.config.appearance.background.global.opacity = 0.25;
-        app.config.appearance.background.play.opacity = 0.5;
-        app.config.appearance.background.mods.opacity = 0.75;
+        app.ui_settings.appearance.background.global.opacity = 0.25;
+        app.ui_settings.appearance.background.play.opacity = 0.5;
+        app.ui_settings.appearance.background.mods.opacity = 0.75;
 
         assert_eq!(app.active_background_settings().opacity, 0.25);
-        app.config.appearance.background.use_per_page = true;
+        app.ui_settings.appearance.background.use_per_page = true;
         assert_eq!(app.active_background_settings().opacity, 0.75);
         app.current_page = Page::Play;
         assert_eq!(app.active_background_settings().opacity, 0.5);

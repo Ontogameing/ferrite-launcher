@@ -8,7 +8,7 @@
 //! [`BackgroundRenderer::paint`]. [`BackgroundSource::None`] disables both the image and
 //! overlay, preserving the launcher's existing solid background.
 
-use crate::config::{
+use crate::ui_settings::{
     BackgroundFit, BackgroundSettings, BackgroundSource, HorizontalAlignment, VerticalAlignment,
 };
 use eframe::egui;

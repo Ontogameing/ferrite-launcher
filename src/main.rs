@@ -14,6 +14,7 @@ mod loaders;
 mod minecraft;
 mod modrinth;
 mod packs;
+mod ui_settings;
 mod updates;
 
 // Core storage modules live in the `ferrite_launcher` library so they stay free of

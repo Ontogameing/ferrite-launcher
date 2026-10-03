@@ -19,7 +19,7 @@ impl Ferrite {
         };
         egui::Frame::new()
             .fill(self.sidebar_color())
-            .corner_radius(self.config.appearance.corner_radius)
+            .corner_radius(self.ui_settings.appearance.corner_radius)
             .inner_margin(egui::Margin::symmetric(18, 12))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -61,7 +61,7 @@ impl Ferrite {
         let mut open_account = false;
 
         egui::Frame::new()
-            .fill(if self.config.appearance.theme == "light" {
+            .fill(if self.ui_settings.appearance.theme == "light" {
                 Color32::from_rgb(222, 228, 239)
             } else {
                 Color32::from_rgb(13, 18, 25)
@@ -70,7 +70,7 @@ impl Ferrite {
                 1.0,
                 self.accent_color().gamma_multiply(0.35),
             ))
-            .corner_radius(self.config.appearance.corner_radius)
+            .corner_radius(self.ui_settings.appearance.corner_radius)
             .inner_margin(0.0)
             .show(ui, |ui| {
                 let hero_height = ui.available_height().clamp(210.0, 300.0) * 0.82;
@@ -182,7 +182,7 @@ impl Ferrite {
                 |ui| {
                     egui::Frame::new()
                         .fill(self.card_color())
-                        .corner_radius(self.config.appearance.corner_radius)
+                        .corner_radius(self.ui_settings.appearance.corner_radius)
                         .inner_margin(18.0)
                         .show(ui, |ui| {
                             ui.set_min_size(egui::vec2(
@@ -224,7 +224,7 @@ impl Ferrite {
                 |ui| {
                     egui::Frame::new()
                         .fill(self.card_color())
-                        .corner_radius(self.config.appearance.corner_radius)
+                        .corner_radius(self.ui_settings.appearance.corner_radius)
                         .inner_margin(18.0)
                         .show(ui, |ui| {
                             ui.set_min_size(egui::vec2(

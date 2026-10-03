@@ -6,7 +6,7 @@
 //! [`Ferrite`] during an immediate-mode frame.
 
 use super::{Ferrite, MUTED, Page};
-use crate::config::{
+use crate::ui_settings::{
     GridConfig, LayoutConfig, LayoutPage, MAX_LAYOUT_ROWS, MAX_WIDGET_LABEL_LENGTH,
     MAX_WIDGET_PLACEMENTS, MAX_WIDGET_TEXT_LENGTH, PageLayout, Widget, WidgetAction,
     WidgetPlacement,
@@ -111,12 +111,12 @@ const ACTIONS: &[(WidgetAction, &str)] = &[
 impl Ferrite {
     /// Whether the opt-in custom shell should replace the fixed shell for this frame.
     pub(super) fn custom_layout_enabled(&self) -> bool {
-        self.config.layout.enabled
+        self.ui_settings.layout.enabled
     }
 
     /// Renders the current page's configured widgets at explicit grid coordinates.
     pub(super) fn render_layout(&mut self, ui: &mut egui::Ui) {
-        let grid = self.config.layout.grid.clone();
+        let grid = self.ui_settings.layout.grid.clone();
         // Widgets such as PageBody and TopBar mutate `self`; never retain a config borrow here.
         let placements = self.current_page_layout().placements.clone();
         let rows = placements
@@ -163,10 +163,10 @@ impl Ferrite {
 
     fn current_page_layout(&self) -> &PageLayout {
         match self.current_page {
-            Page::Play => &self.config.layout.play,
-            Page::Instances => &self.config.layout.instances,
-            Page::Mods => &self.config.layout.mods,
-            Page::Settings => &self.config.layout.settings,
+            Page::Play => &self.ui_settings.layout.play,
+            Page::Instances => &self.ui_settings.layout.instances,
+            Page::Mods => &self.ui_settings.layout.mods,
+            Page::Settings => &self.ui_settings.layout.settings,
         }
     }
 
@@ -329,7 +329,7 @@ impl Ferrite {
 
     /// Edits a detached layout snapshot and commits/persists it after egui releases borrows.
     pub(super) fn layout_settings_ui(&mut self, ui: &mut egui::Ui) {
-        let mut layout = self.config.layout.clone();
+        let mut layout = self.ui_settings.layout.clone();
         let mut changed = false;
         changed |= ui
             .checkbox(&mut layout.enabled, "Enable custom widget layout")
@@ -525,7 +525,7 @@ impl Ferrite {
         });
 
         if changed {
-            self.config.layout = layout;
+            self.ui_settings.layout = layout;
             self.save_config_change("Saved custom layout settings.");
         }
     }
@@ -539,7 +539,7 @@ fn summary_frame(
 ) {
     egui::Frame::new()
         .fill(app.card_color())
-        .corner_radius(app.config.appearance.corner_radius)
+        .corner_radius(app.ui_settings.appearance.corner_radius)
         .inner_margin(12.0)
         .show(ui, |ui| {
             ui.set_min_size(ui.available_size());

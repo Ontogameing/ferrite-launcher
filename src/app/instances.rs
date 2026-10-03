@@ -655,7 +655,7 @@ impl Ferrite {
                 let selected = self.selected_instance == Some(index);
                 egui::Frame::new()
                     .fill(if selected {
-                        if self.config.appearance.theme == "light" {
+                        if self.ui_settings.appearance.theme == "light" {
                             Color32::from_rgb(255, 240, 232)
                         } else {
                             Color32::from_rgb(43, 39, 44)
@@ -671,7 +671,7 @@ impl Ferrite {
                             Color32::from_rgb(50, 55, 64)
                         },
                     ))
-                    .corner_radius(self.config.appearance.corner_radius)
+                    .corner_radius(self.ui_settings.appearance.corner_radius)
                     .inner_margin(18.0)
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
