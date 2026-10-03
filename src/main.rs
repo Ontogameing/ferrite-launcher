@@ -10,12 +10,15 @@ mod config;
 mod discord;
 mod icons;
 mod instance_mods;
-mod instances;
 mod loaders;
 mod minecraft;
 mod modrinth;
 mod packs;
 mod updates;
+
+// Core storage modules live in the `ferrite_launcher` library so they stay free of
+// egui/eframe. Re-importing them here keeps `crate::instances::...` paths working.
+use ferrite_launcher::core::instances;
 
 /// Starts the native UI and returns any window/event-loop initialization error.
 fn main() -> eframe::Result {

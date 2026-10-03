@@ -175,19 +175,16 @@ fn parse_filename(filename: &str) -> Result<(&str, bool), String> {
 
 /// Resolves `game_dir/mods` while rejecting traversal and non-directory ancestors.
 ///
-/// Relative paths are anchored to the current working directory so every component
+/// Game directories must be absolute (they come from `AppPaths`); relative paths are
+/// rejected rather than resolved against the working directory, so every component
 /// can be inspected from a concrete root. `symlink_metadata` deliberately observes
 /// links themselves instead of following them. The first missing component means the
 /// mods directory is absent; callers decide whether absence is empty or an error.
 fn mods_directory(game_dir: &Path) -> Result<Option<PathBuf>, String> {
-    let path = if game_dir.is_absolute() {
-        game_dir.to_owned()
-    } else {
-        std::env::current_dir()
-            .map_err(|e| format!("Current directory: {e}"))?
-            .join(game_dir)
+    if !game_dir.is_absolute() {
+        return Err("Game directory must be an absolute path".into());
     }
-    .join("mods");
+    let path = game_dir.join("mods");
     // Validate the whole lexical path before an early return on a missing component.
     if path.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err("Game directory must not contain parent traversal".into());

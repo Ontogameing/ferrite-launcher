@@ -62,7 +62,7 @@ impl Ferrite {
     pub(super) fn target_exists(&self, target: &InstanceProfile) -> bool {
         self.instances
             .iter()
-            .any(|profile| profile.game_dir() == target.game_dir())
+            .any(|profile| profile.directory() == target.directory())
     }
 
     /// Downloads a mod and dependencies into an immutable, explicitly chosen target.
@@ -84,6 +84,7 @@ impl Ferrite {
             return;
         }
         self.installed_mods = None;
+        let game_dir = target.game_dir(&self.paths);
         self.start_mod_task(move || {
             let result = if crate::minecraft::is_running() {
                 Err("Stop Minecraft before installing mods.".into())
@@ -92,7 +93,7 @@ impl Ferrite {
                     &project_id,
                     &target.version,
                     &target.loader.to_ascii_lowercase(),
-                    target.game_dir(),
+                    &game_dir,
                 )
                 .map(|paths| paths.len())
             };
@@ -100,7 +101,7 @@ impl Ferrite {
                 Ok(count) => format!("Installed {title} ({count} files) into '{}'.", target.name),
                 Err(error) => format!("Install into '{}' failed: {error}", target.name),
             };
-            let result = crate::instance_mods::list(target.game_dir());
+            let result = crate::instance_mods::list(&game_dir);
             ModTaskResult::Local {
                 target,
                 message,
@@ -122,18 +123,16 @@ impl Ferrite {
             return;
         }
         self.installed_mods = None;
+        let game_dir = target.game_dir(&self.paths);
         self.start_mod_task(move || {
             let operation = if crate::minecraft::is_running() {
                 Err("Stop Minecraft before managing mods.".into())
             } else {
                 match action {
                     Some((filename, Some(enabled))) => {
-                        crate::instance_mods::set_enabled(target.game_dir(), &filename, enabled)
-                            .map(|_| ())
+                        crate::instance_mods::set_enabled(&game_dir, &filename, enabled).map(|_| ())
                     }
-                    Some((filename, None)) => {
-                        crate::instance_mods::uninstall(target.game_dir(), &filename)
-                    }
+                    Some((filename, None)) => crate::instance_mods::uninstall(&game_dir, &filename),
                     None => Ok(()),
                 }
             };
@@ -141,7 +140,7 @@ impl Ferrite {
                 Ok(()) => format!("Refreshed mods for '{}'.", target.name),
                 Err(error) => format!("Mods for '{}': {error}", target.name),
             };
-            let result = crate::instance_mods::list(target.game_dir());
+            let result = crate::instance_mods::list(&game_dir);
             ModTaskResult::Local {
                 target,
                 message,
@@ -196,7 +195,7 @@ impl Ferrite {
                     && self
                         .mod_target
                         .as_ref()
-                        .is_some_and(|current| current.game_dir() == target.game_dir())
+                        .is_some_and(|current| current.directory() == target.directory())
                 {
                     match result {
                         Ok(mods) => self.installed_mods = Some(mods),

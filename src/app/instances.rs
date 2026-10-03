@@ -71,6 +71,7 @@ impl Ferrite {
             self.selected_loader.clone(),
             &self.instances,
         );
+        let paths = self.paths.clone();
         let (sender, receiver) = mpsc::channel();
         let worker = std::thread::Builder::new()
             .name("instance-creation".to_owned())
@@ -79,24 +80,28 @@ impl Ferrite {
                     let _ = sender.send(InstanceCreationEvent::Stage(
                         InstanceCreationStage::Preparing,
                     ));
-                    crate::instances::create_game_dir(&profile)
+                    crate::instances::create_game_dir(&paths, &profile)
                         .map_err(|error| format!("Failed to create instance directory: {error}"))?;
                     let _ = sender.send(InstanceCreationEvent::Stage(
                         InstanceCreationStage::DownloadingMinecraft,
                     ));
-                    crate::minecraft::install_version_with_progress(&profile.version, |message| {
-                        let _ =
-                            sender.send(InstanceCreationEvent::DownloadProgress(message.into()));
-                    })
+                    crate::minecraft::install_version_with_progress(
+                        &paths,
+                        &profile.version,
+                        |message| {
+                            let _ = sender
+                                .send(InstanceCreationEvent::DownloadProgress(message.into()));
+                        },
+                    )
                     .map_err(|error| format!("Failed to download Minecraft: {error}"))?;
                     if loader != ModLoader::Vanilla {
                         let _ = sender.send(InstanceCreationEvent::Stage(
                             InstanceCreationStage::InstallingLoader,
                         ));
                         // Loader backends repeat the vanilla install, reusing cached downloads.
-                        crate::loaders::install(&profile.version, loader).map_err(|error| {
-                            format!("Failed to install {}: {error}", loader.label())
-                        })?;
+                        crate::loaders::install(&paths, &profile.version, loader).map_err(
+                            |error| format!("Failed to install {}: {error}", loader.label()),
+                        )?;
                     }
                     let _ = sender.send(InstanceCreationEvent::Stage(
                         InstanceCreationStage::Finalizing,
@@ -139,7 +144,11 @@ impl Ferrite {
                         Ok(profile) => {
                             let name = profile.name.clone();
                             self.instances.push(profile);
-                            if let Err(error) = crate::instances::save(&self.instances) {
+                            if let Err(error) = crate::instances::save(
+                                &self.paths,
+                                &self.instances,
+                                &self.skipped_instances,
+                            ) {
                                 self.instances.pop();
                                 self.instance_creation_failed(format!(
                                     "Failed to save instance: {error}"
@@ -215,6 +224,7 @@ impl Ferrite {
         let existing = self.instances.clone();
         let include_optional = self.pack_include_optional;
         let curseforge_api_key = std::env::var("FERRITE_CURSEFORGE_API_KEY").ok();
+        let paths = self.paths.clone();
         let (sender, receiver) = mpsc::channel();
         let event_sender = sender.clone();
         let worker = std::thread::Builder::new()
@@ -241,7 +251,7 @@ impl Ferrite {
                             &existing,
                         );
                         if !existing.iter().any(|profile| profile.name == name)
-                            && !candidate.game_dir().exists()
+                            && !candidate.game_dir(&paths).exists()
                         {
                             break;
                         }
@@ -255,7 +265,7 @@ impl Ferrite {
                         &existing,
                     );
                     let parent = profile
-                        .game_dir()
+                        .game_dir(&paths)
                         .parent()
                         .expect("instance game directory has a parent")
                         .to_owned();
@@ -267,12 +277,12 @@ impl Ferrite {
                         curseforge_api_key,
                         ..ImportOptions::default()
                     };
-                    let report = crate::packs::import(&source, profile.game_dir(), &options, |step| {
+                    let report = crate::packs::import(&source, profile.game_dir(&paths), &options, |step| {
                         let _ = event_sender.send(PackTaskEvent::Progress(step.to_owned()));
                     })
                     .map_err(|error| error.to_string())?;
                     if report.info.target.as_ref() != Some(&target) {
-                        let _ = crate::instances::delete_game_dir(&profile);
+                        let _ = crate::instances::delete_game_dir(&paths, &profile);
                         return Err("The pack changed while it was being imported; no instance was kept.".into());
                     }
 
@@ -281,6 +291,7 @@ impl Ferrite {
                             "Installing Minecraft files...".into(),
                         ));
                         crate::minecraft::install_version_with_progress(
+                            &paths,
                             &target.minecraft_version,
                             |message| {
                                 let _ = event_sender
@@ -294,6 +305,7 @@ impl Ferrite {
                                 target.loader.label()
                             )));
                             crate::loaders::install_version(
+                                &paths,
                                 &target.minecraft_version,
                                 target.loader,
                                 target.loader_version.as_deref(),
@@ -303,6 +315,7 @@ impl Ferrite {
                             })?;
                             if let Some(requested) = target.loader_version.as_deref() {
                                 let installed = crate::loaders::installed_loader_version(
+                                    &paths,
                                     &target.minecraft_version,
                                     target.loader,
                                 );
@@ -318,10 +331,11 @@ impl Ferrite {
                         Ok(())
                     })();
                     if let Err(error) = install {
-                        let _ = crate::instances::delete_game_dir(&profile);
+                        let _ = crate::instances::delete_game_dir(&paths, &profile);
                         return Err(error);
                     }
                     Ok(PackImportOutcome {
+                        paths: paths.clone(),
                         profile,
                         files: report.files_written,
                         bytes: report.bytes_written,
@@ -329,7 +343,7 @@ impl Ferrite {
                         committed: false,
                     })
                 })();
-                let _ = sender.send(PackTaskEvent::Imported(result));
+                let _ = sender.send(PackTaskEvent::Imported(result.map(Box::new)));
             });
         match worker {
             Ok(_) => {
@@ -376,12 +390,13 @@ impl Ferrite {
                 .then(|| self.pack_loader_version.trim().to_owned()),
             include_worlds: self.pack_include_worlds,
         };
+        let paths = self.paths.clone();
         let (sender, receiver) = mpsc::channel();
         let event_sender = sender.clone();
         let worker = std::thread::Builder::new()
             .name("pack-export".to_owned())
             .spawn(move || {
-                let result = crate::packs::export(&profile, &output, &options, |step| {
+                let result = crate::packs::export(&paths, &profile, &output, &options, |step| {
                     let _ = event_sender.send(PackTaskEvent::Progress(step.to_owned()));
                 })
                 .map(|()| output_display)
@@ -414,7 +429,11 @@ impl Ferrite {
                         Ok(mut outcome) => {
                             let name = outcome.profile.name.clone();
                             self.instances.push(outcome.profile.clone());
-                            if let Err(error) = crate::instances::save(&self.instances) {
+                            if let Err(error) = crate::instances::save(
+                                &self.paths,
+                                &self.instances,
+                                &self.skipped_instances,
+                            ) {
                                 self.instances.pop();
                                 self.pack_status = Some(format!(
                                     "Imported files but could not save the instance: {error}"
@@ -506,7 +525,7 @@ impl Ferrite {
         let name = instance.name.clone();
         let version = instance.version.clone();
         let loader_name = instance.loader.clone();
-        let game_dir = instance.game_dir();
+        let game_dir = instance.game_dir(&self.paths);
 
         let Some(loader) = ModLoader::from_label(&loader_name) else {
             self.running_text = format!("Unknown mod loader: {loader_name}");
@@ -515,9 +534,16 @@ impl Ferrite {
 
         let memory_mb = self.config.minecraft.default_memory_mb;
         let result = if self.auth.offline_mode {
-            crate::loaders::launch_in_directory_with_memory(&version, loader, &game_dir, memory_mb)
+            crate::loaders::launch_in_directory_with_memory(
+                &self.paths,
+                &version,
+                loader,
+                &game_dir,
+                memory_mb,
+            )
         } else {
             crate::loaders::launch_authenticated_with_memory(
+                &self.paths,
                 &version,
                 loader,
                 &game_dir,
@@ -553,7 +579,9 @@ impl Ferrite {
 
         // Persist logical removal first; restore memory if the index write cannot commit.
         let removed = self.instances.remove(index);
-        if let Err(error) = crate::instances::save(&self.instances) {
+        if let Err(error) =
+            crate::instances::save(&self.paths, &self.instances, &self.skipped_instances)
+        {
             self.instances.insert(index, removed);
             self.running_text = format!("Failed to remove instance: {error}");
             return;
@@ -562,7 +590,7 @@ impl Ferrite {
         if self
             .mod_target
             .as_ref()
-            .is_some_and(|target| target.game_dir() == removed.game_dir())
+            .is_some_and(|target| target.directory() == removed.directory())
         {
             self.mod_target = None;
             self.installed_mods = None;
@@ -573,7 +601,7 @@ impl Ferrite {
             .map(|_| index)
             .or_else(|| index.checked_sub(1));
         let name = removed.name.clone();
-        self.running_text = match crate::instances::delete_game_dir(&removed) {
+        self.running_text = match crate::instances::delete_game_dir(&self.paths, &removed) {
             Ok(()) => format!("Removed instance '{name}'."),
             Err(error) => format!("Removed '{name}', but could not delete its files: {error}"),
         };

@@ -146,7 +146,7 @@ impl Ferrite {
 
     /// Persists typed settings and refreshes the advanced editor only after success.
     pub(super) fn save_config_change(&mut self, success_message: &str) {
-        match crate::config::save(&self.config) {
+        match crate::config::save(&self.paths, &self.config) {
             Ok(()) => {
                 self.running_text = success_message.to_owned();
                 self.config_status = Some(success_message.to_owned());
@@ -172,9 +172,9 @@ impl Ferrite {
 
     /// Reloads typed and raw representations together, leaving current state on failure.
     pub(super) fn reload_config(&mut self) {
-        match crate::config::load() {
+        match crate::config::load(&self.paths) {
             Ok(config) => {
-                let raw = crate::config::read_toml()
+                let raw = crate::config::read_toml(&self.paths)
                     .or_else(|_| crate::config::to_toml(&config))
                     .unwrap_or_default();
                 self.replace_config(config, raw, "Reloaded configuration from disk.");
@@ -187,7 +187,7 @@ impl Ferrite {
 
     /// Validates and saves the editor buffer before replacing live configuration.
     pub(super) fn apply_raw_config(&mut self) {
-        match crate::config::save_toml(&self.raw_config_toml) {
+        match crate::config::save_toml(&self.paths, &self.raw_config_toml) {
             Ok(config) => {
                 let raw = crate::config::to_toml(&config).unwrap_or_default();
                 self.replace_config(config, raw, "Applied and saved configuration TOML.");
@@ -610,7 +610,7 @@ impl Ferrite {
                 ui.heading("Advanced configuration");
                 ui.horizontal(|ui| {
                     if ui.button("Open Config Folder").clicked() {
-                        self.config_status = Some(match crate::config::open_config_folder() {
+                        self.config_status = Some(match crate::config::open_config_folder(&self.paths) {
                             Ok(()) => "Opened the config folder.".to_owned(),
                             Err(error) => format!("Could not open config folder: {error}"),
                         });
@@ -619,13 +619,15 @@ impl Ferrite {
                         self.reload_config();
                     }
                 });
-                if let Ok(path) = crate::config::config_path() {
-                    ui.label(
-                        RichText::new(path.display().to_string())
-                            .small()
-                            .color(MUTED),
-                    );
-                }
+                ui.label(
+                    RichText::new(
+                        crate::config::config_path(&self.paths)
+                            .display()
+                            .to_string(),
+                    )
+                    .small()
+                    .color(MUTED),
+                );
                 ui.label("Raw TOML is only parsed and saved when Apply / Save is pressed.");
                 ui.add(
                     egui::TextEdit::multiline(&mut self.raw_config_toml)

@@ -36,6 +36,7 @@
 //! partial files there, but without a marker dispatch treats Forge as uninstalled.
 
 use crate::minecraft::{self, FerriteError, Result};
+use ferrite_launcher::core::paths::AppPaths;
 use reqwest::blocking::Client;
 use std::fs;
 use std::io::{Read, Write};
@@ -46,8 +47,8 @@ use zip::{ZipArchive, ZipWriter};
 const FORGE_MAVEN: &str = "https://maven.minecraftforge.net";
 
 /// Installs the latest available Forge build for `mc_version`.
-pub fn install(mc_version: &str) -> Result<()> {
-    install_version(mc_version, None)
+pub fn install(paths: &AppPaths, mc_version: &str) -> Result<()> {
+    install_version(paths, mc_version, None)
 }
 
 /// Installs a requested Forge version, or the latest Maven-listed build.
@@ -59,8 +60,8 @@ pub fn install(mc_version: &str) -> Result<()> {
 /// A legacy `:universal` suffix on a pinned version is accepted and removed.
 /// Errors abort immediately; installer deletion is best-effort and only attempted
 /// after the installer returns successfully from [`run_installer`].
-pub fn install_version(mc_version: &str, requested: Option<&str>) -> Result<()> {
-    minecraft::install_version(mc_version)?;
+pub fn install_version(paths: &AppPaths, mc_version: &str, requested: Option<&str>) -> Result<()> {
+    minecraft::install_version(paths, mc_version)?;
 
     let client = Client::new();
     let forge_version = match requested.map(str::trim).filter(|value| !value.is_empty()) {
@@ -76,7 +77,7 @@ pub fn install_version(mc_version: &str, requested: Option<&str>) -> Result<()> 
     // The official installer looks for `versions/<mc>/<mc>.jar`. Our
     // vanilla install writes `client.jar` instead, so give it a copy
     // under the name it expects.
-    let vanilla_dir = minecraft::version_dir(mc_version);
+    let vanilla_dir = paths.version_dir(mc_version);
     let vanilla_client = vanilla_dir.join("client.jar");
     let vanilla_named = vanilla_dir.join(format!("{mc_version}.jar"));
     if !vanilla_named.exists() {
@@ -86,7 +87,9 @@ pub fn install_version(mc_version: &str, requested: Option<&str>) -> Result<()> 
     let coord = format!("{mc_version}-{forge_version}");
     let installer_url =
         format!("{FORGE_MAVEN}/net/minecraftforge/forge/{coord}/forge-{coord}-installer.jar");
-    let installer_path = minecraft::base_dir().join(format!("forge-{coord}-installer.jar"));
+    let installer_path = paths
+        .downloads_dir()
+        .join(format!("forge-{coord}-installer.jar"));
     if let Some(parent) = installer_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -95,16 +98,16 @@ pub fn install_version(mc_version: &str, requested: Option<&str>) -> Result<()> 
 
     // The installer refuses to run unless a vanilla-style
     // launcher_profiles.json already exists in the target directory.
-    ensure_launcher_profiles(&minecraft::base_dir())?;
+    ensure_launcher_profiles(paths.storage_root())?;
 
     println!("Running Forge installer (this can take a while)...");
-    run_installer(&installer_path, &minecraft::base_dir())?;
+    run_installer(&installer_path, paths.storage_root())?;
     let _ = fs::remove_file(&installer_path);
 
-    let composite_id = find_installed_forge_id(mc_version, &forge_version)?;
+    let composite_id = find_installed_forge_id(paths, mc_version, &forge_version)?;
     println!("Forge installer created version id `{composite_id}`");
 
-    let composite_dir = minecraft::version_dir(&composite_id);
+    let composite_dir = paths.version_dir(&composite_id);
     let json_path = composite_dir.join(format!("{composite_id}.json"));
     let forge_json: serde_json::Value = serde_json::from_str(&fs::read_to_string(&json_path)?)?;
 
@@ -116,22 +119,22 @@ pub fn install_version(mc_version: &str, requested: Option<&str>) -> Result<()> 
     fs::write(&json_path, serde_json::to_string_pretty(&merged)?)?;
 
     ensure_client_jar(&composite_dir, &composite_id, &vanilla_client)?;
-    minecraft::copy_natives(mc_version, &composite_id)?;
+    minecraft::copy_natives(paths, mc_version, &composite_id)?;
 
-    fs::write(marker_path(mc_version), &composite_id)?;
+    fs::write(marker_path(paths, mc_version), &composite_id)?;
     println!("Forge {forge_version} installed for Minecraft {mc_version}.");
     Ok(())
 }
 
 /// The synthetic version id of the merged vanilla+Forge install currently
 /// recorded for `mc_version`.
-pub fn installed_composite_id(mc_version: &str) -> Result<String> {
-    fs::read_to_string(marker_path(mc_version))
+pub fn installed_composite_id(paths: &AppPaths, mc_version: &str) -> Result<String> {
+    fs::read_to_string(marker_path(paths, mc_version))
         .map_err(|_| FerriteError::LoaderNotInstalled(mc_version.to_string()))
 }
 
-fn marker_path(mc_version: &str) -> PathBuf {
-    minecraft::version_dir(mc_version).join("forge-loader.txt")
+fn marker_path(paths: &AppPaths, mc_version: &str) -> PathBuf {
+    paths.version_dir(mc_version).join("forge-loader.txt")
 }
 
 // ---------------------------------------------------------------------
@@ -323,17 +326,19 @@ fn is_jar_signature(name: &str) -> bool {
 /// requested build and either the parent Minecraft id or an id containing it.
 /// Unreadable directories/files are skipped; exhausting the search is reported
 /// as `InstallerFailed` because Java had already claimed installation success.
-fn find_installed_forge_id(mc_version: &str, forge_version: &str) -> Result<String> {
+fn find_installed_forge_id(
+    paths: &AppPaths,
+    mc_version: &str,
+    forge_version: &str,
+) -> Result<String> {
     let candidates = [
         format!("{mc_version}-forge-{forge_version}"),
         format!("{mc_version}-Forge{forge_version}"),
         format!("{mc_version}-forge-{mc_version}-{forge_version}"),
     ];
     for id in &candidates {
-        if minecraft::is_version_installed(id)
-            || minecraft::version_dir(id)
-                .join(format!("{id}.json"))
-                .exists()
+        if minecraft::is_version_installed(paths, id)
+            || paths.version_dir(id).join(format!("{id}.json")).exists()
         {
             return Ok(id.clone());
         }
@@ -341,7 +346,7 @@ fn find_installed_forge_id(mc_version: &str, forge_version: &str) -> Result<Stri
 
     // Last resort: any versions/* directory whose JSON mentions this
     // Forge build and inherits this Minecraft version.
-    let versions_root = minecraft::base_dir().join("versions");
+    let versions_root = paths.versions_dir();
     if let Ok(entries) = fs::read_dir(&versions_root) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();

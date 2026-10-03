@@ -19,11 +19,12 @@ use crate::config::{BackgroundSource, Config};
 use crate::discord::DiscordPresence;
 use crate::icons::IconCache;
 use crate::instance_mods::InstalledMod;
-use crate::instances::InstanceProfile;
+use crate::instances::{InstanceProfile, SkippedEntry};
 use crate::modrinth::{ProjectDetails, SearchFilters, SearchResponse};
 use crate::packs::PackFormat;
 use crate::updates::{UpdateCheck, UpdateInfo};
 use eframe::egui::{self, Color32};
+use ferrite_launcher::core::paths::AppPaths;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
@@ -42,7 +43,16 @@ const ACCENT: Color32 = Color32::from_rgb(220, 55, 65);
 const MUTED: Color32 = Color32::from_rgb(150, 155, 165);
 
 /// Starts Ferrite Launcher in eframe's native window.
+///
+/// Storage locations are resolved exactly once here and passed down.
 pub fn run() -> eframe::Result {
+    let paths = match AppPaths::resolve() {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("Ferrite cannot determine where to store its data: {error}");
+            std::process::exit(1);
+        }
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1_200.0, 800.0])
@@ -53,7 +63,7 @@ pub fn run() -> eframe::Result {
     eframe::run_native(
         "Ferrite Launcher",
         options,
-        Box::new(|_cc| Ok(Box::new(Ferrite::default()))),
+        Box::new(|_cc| Ok(Box::new(Ferrite::new(paths)))),
     )
 }
 
@@ -114,7 +124,7 @@ enum InstanceCreationEvent {
 /// [`Ferrite::instances`] and its on-disk index are committed together.
 enum PackTaskEvent {
     Progress(String),
-    Imported(Result<PackImportOutcome, String>),
+    Imported(Result<Box<PackImportOutcome>, String>),
     Exported(Result<String, String>),
 }
 
@@ -123,6 +133,8 @@ enum PackTaskEvent {
 /// The pack subsystem has already published the files at the profile's final game
 /// directory. `committed` tracks whether the separate instance-index save succeeded.
 struct PackImportOutcome {
+    /// Storage locations used to roll back the published files.
+    paths: AppPaths,
     profile: InstanceProfile,
     files: u64,
     bytes: u64,
@@ -134,7 +146,7 @@ impl Drop for PackImportOutcome {
     /// Removes published files unless the UI persisted and accepted the profile metadata.
     fn drop(&mut self) {
         if !self.committed {
-            let _ = crate::instances::delete_game_dir(&self.profile);
+            let _ = crate::instances::delete_game_dir(&self.paths, &self.profile);
         }
     }
 }
@@ -182,6 +194,8 @@ struct AccountSession {
 /// also the busy lock for that subsystem, preventing overlapping operations without
 /// sharing mutable application state across threads.
 struct Ferrite {
+    /// Every storage location, resolved once at startup.
+    paths: AppPaths,
     /// Persistent non-secret launcher preferences.
     config: Config,
     /// Advanced editor state is separate so keystrokes never mutate live settings.
@@ -239,6 +253,9 @@ struct Ferrite {
     versions: Vec<String>,
     /// Profiles loaded from and saved to the persistent instance store.
     instances: Vec<InstanceProfile>,
+    /// Manifest entries that failed validation; reported, never loaded, and written
+    /// back unchanged on save so no data is silently dropped.
+    skipped_instances: Vec<SkippedEntry>,
     /// Index into [`Self::instances`] for the active profile.
     selected_instance: Option<usize>,
     /// Explicit mod target, independent of Play selection and creation completion.
@@ -261,11 +278,11 @@ struct Ferrite {
     discord: Option<DiscordPresence>,
 }
 
-impl Default for Ferrite {
+impl Ferrite {
     /// Loads startup state, performs the initial version lookup, and optionally starts
     /// update checking. Recoverable config/instance failures become visible UI status.
-    fn default() -> Self {
-        let loaded_config = crate::config::load_or_create();
+    fn new(paths: AppPaths) -> Self {
+        let loaded_config = crate::config::load_or_create(&paths);
         let (config, config_warning) = match loaded_config {
             Ok(loaded) => (loaded.config, loaded.warning),
             Err(error) => (
@@ -280,7 +297,7 @@ impl Default for Ferrite {
         } else {
             None
         };
-        let raw_config_toml = crate::config::read_toml()
+        let raw_config_toml = crate::config::read_toml(&paths)
             .or_else(|_| crate::config::to_toml(&config))
             .unwrap_or_default();
         let accent_edit = config.appearance.accent.clone();
@@ -294,9 +311,33 @@ impl Default for Ferrite {
                 }
             };
 
-        let (instances, mut running_text) = match crate::instances::load() {
-            Ok(instances) => (instances, String::from("Game not running.")),
+        let (instances, skipped_instances, mut running_text) = match crate::instances::load(&paths)
+        {
+            Ok(loaded) if loaded.skipped.is_empty() => (
+                loaded.profiles,
+                Vec::new(),
+                String::from("Game not running."),
+            ),
+            Ok(loaded) => {
+                let message = format!(
+                    "Skipped {} invalid instance entr{} (kept on disk, not loaded): {}",
+                    loaded.skipped.len(),
+                    if loaded.skipped.len() == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    },
+                    loaded
+                        .skipped
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                );
+                (loaded.profiles, loaded.skipped, message)
+            }
             Err(error) => (
+                Vec::new(),
                 Vec::new(),
                 format!("Failed to load saved instances: {error}"),
             ),
@@ -307,6 +348,7 @@ impl Default for Ferrite {
         let selected_instance = (!instances.is_empty()).then_some(0);
 
         let mut app = Self {
+            paths,
             config,
             raw_config_toml,
             config_status: None,
@@ -350,6 +392,7 @@ impl Default for Ferrite {
             pack_status: None,
             versions,
             instances,
+            skipped_instances,
             selected_instance,
             mod_target: None,
             mod_filters: SearchFilters::default(),
@@ -477,8 +520,20 @@ mod tests {
     use super::*;
 
     /// Avoids the startup network request while testing UI state transitions.
+    /// Paths under a never-created temp directory; tests must not touch real user dirs.
+    fn test_paths() -> AppPaths {
+        let root = std::env::temp_dir().join(format!("ferrite-app-tests-{}", std::process::id()));
+        AppPaths::from_base_dirs(ferrite_launcher::core::paths::BaseDirs {
+            config: root.join("config"),
+            data_local: root.join("data"),
+            cache: root.join("cache"),
+        })
+        .unwrap()
+    }
+
     fn app() -> Ferrite {
         Ferrite {
+            paths: test_paths(),
             config: Config::default(),
             raw_config_toml: crate::config::to_toml(&Config::default()).unwrap(),
             config_status: None,
@@ -516,6 +571,7 @@ mod tests {
             pack_status: None,
             versions: Vec::new(),
             instances: Vec::new(),
+            skipped_instances: Vec::new(),
             selected_instance: None,
             mod_target: None,
             mod_filters: SearchFilters::default(),

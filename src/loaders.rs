@@ -43,6 +43,7 @@ mod neoforge;
 mod quilt;
 
 use crate::minecraft::{self, Result};
+use ferrite_launcher::core::paths::AppPaths;
 use std::path::Path;
 
 /// Loader implementation to install, inspect, or launch.
@@ -97,13 +98,13 @@ impl ModLoader {
 /// exactly `minecraft::install_version`; other loaders install the
 /// vanilla version first (if it isn't already) and then layer their own
 /// libraries/main-class on top of it.
-pub fn install(mc_version: &str, loader: ModLoader) -> Result<()> {
+pub fn install(paths: &AppPaths, mc_version: &str, loader: ModLoader) -> Result<()> {
     match loader {
-        ModLoader::Vanilla => minecraft::install_version(mc_version),
-        ModLoader::Fabric => fabric::install(mc_version),
-        ModLoader::Forge => forge::install(mc_version),
-        ModLoader::NeoForge => neoforge::install(mc_version),
-        ModLoader::Quilt => quilt::install(mc_version),
+        ModLoader::Vanilla => minecraft::install_version(paths, mc_version),
+        ModLoader::Fabric => fabric::install(paths, mc_version),
+        ModLoader::Forge => forge::install(paths, mc_version),
+        ModLoader::NeoForge => neoforge::install(paths, mc_version),
+        ModLoader::Quilt => quilt::install(paths, mc_version),
     }
 }
 
@@ -113,19 +114,20 @@ pub fn install(mc_version: &str, loader: ModLoader) -> Result<()> {
 /// preferred current build. Vanilla ignores a supplied loader version because
 /// Mojang's version id already identifies the complete install.
 pub fn install_version(
+    paths: &AppPaths,
     mc_version: &str,
     loader: ModLoader,
     loader_version: Option<&str>,
 ) -> Result<()> {
     let Some(loader_version) = loader_version else {
-        return install(mc_version, loader);
+        return install(paths, mc_version, loader);
     };
     match loader {
-        ModLoader::Vanilla => minecraft::install_version(mc_version),
-        ModLoader::Fabric => fabric::install_version(mc_version, Some(loader_version)),
-        ModLoader::Forge => forge::install_version(mc_version, Some(loader_version)),
-        ModLoader::NeoForge => neoforge::install_version(mc_version, Some(loader_version)),
-        ModLoader::Quilt => quilt::install_version(mc_version, Some(loader_version)),
+        ModLoader::Vanilla => minecraft::install_version(paths, mc_version),
+        ModLoader::Fabric => fabric::install_version(paths, mc_version, Some(loader_version)),
+        ModLoader::Forge => forge::install_version(paths, mc_version, Some(loader_version)),
+        ModLoader::NeoForge => neoforge::install_version(paths, mc_version, Some(loader_version)),
+        ModLoader::Quilt => quilt::install_version(paths, mc_version, Some(loader_version)),
     }
 }
 
@@ -133,34 +135,41 @@ pub fn install_version(
 /// Account-aware callers should use `launch_authenticated`.
 /// Launches `mc_version` under the given loader using the shared Minecraft
 /// directory as the game's directory, preserving the original behavior.
-pub fn launch(mc_version: &str, loader: ModLoader) -> Result<()> {
-    launch_in_directory(mc_version, loader, &minecraft::base_dir())
+pub fn launch(paths: &AppPaths, mc_version: &str, loader: ModLoader) -> Result<()> {
+    launch_in_directory(paths, mc_version, loader, paths.storage_root())
 }
 
 /// Explicit offline compatibility wrapper; use `launch_authenticated` for accounts.
 /// Launches `mc_version` under the given loader with per-instance saves,
 /// configuration, mods, and logs rooted at `game_dir`. Installed versions,
 /// libraries, assets, and natives continue to come from shared storage.
-pub fn launch_in_directory(mc_version: &str, loader: ModLoader, game_dir: &Path) -> Result<()> {
-    let version = prepare_launch_version(mc_version, loader)?;
-    minecraft::launch_version_in_directory(&version, game_dir)
+pub fn launch_in_directory(
+    paths: &AppPaths,
+    mc_version: &str,
+    loader: ModLoader,
+    game_dir: &Path,
+) -> Result<()> {
+    let version = prepare_launch_version(paths, mc_version, loader)?;
+    minecraft::launch_version_in_directory(paths, &version, game_dir)
 }
 
 /// Offline launch with the configured maximum Java heap size.
 pub fn launch_in_directory_with_memory(
+    paths: &AppPaths,
     mc_version: &str,
     loader: ModLoader,
     game_dir: &Path,
     memory_mb: u32,
 ) -> Result<()> {
-    let version = prepare_launch_version(mc_version, loader)?;
-    minecraft::launch_version_in_directory_with_memory(&version, game_dir, memory_mb)
+    let version = prepare_launch_version(paths, mc_version, loader)?;
+    minecraft::launch_version_in_directory_with_memory(paths, &version, game_dir, memory_mb)
 }
 
 /// Launches with an authenticated Microsoft account and per-instance game data.
 /// Expired sessions fail before loader preparation; there is no offline fallback.
 /// Installed versions, libraries, assets, and natives remain in shared storage.
 pub fn launch_authenticated(
+    paths: &AppPaths,
     mc_version: &str,
     loader: ModLoader,
     game_dir: &Path,
@@ -169,12 +178,13 @@ pub fn launch_authenticated(
     if account.is_expired() {
         return Err(minecraft::FerriteError::AuthenticationExpired);
     }
-    let version = prepare_launch_version(mc_version, loader)?;
-    minecraft::launch_authenticated(&version, game_dir, account)
+    let version = prepare_launch_version(paths, mc_version, loader)?;
+    minecraft::launch_authenticated(paths, &version, game_dir, account)
 }
 
 /// Authenticated launch with the configured maximum Java heap size.
 pub fn launch_authenticated_with_memory(
+    paths: &AppPaths,
     mc_version: &str,
     loader: ModLoader,
     game_dir: &Path,
@@ -184,23 +194,23 @@ pub fn launch_authenticated_with_memory(
     if account.is_expired() {
         return Err(minecraft::FerriteError::AuthenticationExpired);
     }
-    let version = prepare_launch_version(mc_version, loader)?;
-    minecraft::launch_authenticated_with_memory(&version, game_dir, account, memory_mb)
+    let version = prepare_launch_version(paths, mc_version, loader)?;
+    minecraft::launch_authenticated_with_memory(paths, &version, game_dir, account, memory_mb)
 }
 
 /// Resolves a UI-level `(Minecraft, loader)` choice to the installed version id
 /// understood by `minecraft.rs`. Loader lookup errors propagate to launch; after
 /// lookup, vanilla natives are recopied into the synthetic native directory to
 /// repair missing workdirs before every launch.
-fn prepare_launch_version(mc_version: &str, loader: ModLoader) -> Result<String> {
+fn prepare_launch_version(paths: &AppPaths, mc_version: &str, loader: ModLoader) -> Result<String> {
     let composite_id = match loader {
         ModLoader::Vanilla => return Ok(mc_version.to_string()),
-        ModLoader::Fabric => fabric::installed_composite_id(mc_version)?,
-        ModLoader::Forge => forge::installed_composite_id(mc_version)?,
-        ModLoader::NeoForge => neoforge::installed_composite_id(mc_version)?,
-        ModLoader::Quilt => quilt::installed_composite_id(mc_version)?,
+        ModLoader::Fabric => fabric::installed_composite_id(paths, mc_version)?,
+        ModLoader::Forge => forge::installed_composite_id(paths, mc_version)?,
+        ModLoader::NeoForge => neoforge::installed_composite_id(paths, mc_version)?,
+        ModLoader::Quilt => quilt::installed_composite_id(paths, mc_version)?,
     };
-    minecraft::copy_natives(mc_version, &composite_id)?;
+    minecraft::copy_natives(paths, mc_version, &composite_id)?;
     Ok(composite_id)
 }
 
@@ -209,20 +219,20 @@ fn prepare_launch_version(mc_version: &str, loader: ModLoader) -> Result<String>
 /// For loaders, a missing/unreadable marker and any loader-id lookup error are
 /// deliberately collapsed to `false`; this status probe never performs network
 /// I/O and cannot distinguish a partial install from no install.
-pub fn is_installed(mc_version: &str, loader: ModLoader) -> bool {
+pub fn is_installed(paths: &AppPaths, mc_version: &str, loader: ModLoader) -> bool {
     match loader {
-        ModLoader::Vanilla => minecraft::is_version_installed(mc_version),
-        ModLoader::Fabric => fabric::installed_composite_id(mc_version)
-            .map(|id| minecraft::is_version_installed(&id))
+        ModLoader::Vanilla => minecraft::is_version_installed(paths, mc_version),
+        ModLoader::Fabric => fabric::installed_composite_id(paths, mc_version)
+            .map(|id| minecraft::is_version_installed(paths, &id))
             .unwrap_or(false),
-        ModLoader::Forge => forge::installed_composite_id(mc_version)
-            .map(|id| minecraft::is_version_installed(&id))
+        ModLoader::Forge => forge::installed_composite_id(paths, mc_version)
+            .map(|id| minecraft::is_version_installed(paths, &id))
             .unwrap_or(false),
-        ModLoader::NeoForge => neoforge::installed_composite_id(mc_version)
-            .map(|id| minecraft::is_version_installed(&id))
+        ModLoader::NeoForge => neoforge::installed_composite_id(paths, mc_version)
+            .map(|id| minecraft::is_version_installed(paths, &id))
             .unwrap_or(false),
-        ModLoader::Quilt => quilt::installed_composite_id(mc_version)
-            .map(|id| minecraft::is_version_installed(&id))
+        ModLoader::Quilt => quilt::installed_composite_id(paths, mc_version)
+            .map(|id| minecraft::is_version_installed(paths, &id))
             .unwrap_or(false),
     }
 }
@@ -232,16 +242,22 @@ pub fn is_installed(mc_version: &str, loader: ModLoader) -> bool {
 /// This is used for portable pack manifests and never performs a network request.
 /// Missing markers/files, malformed JSON, absent coordinates, and vanilla all
 /// return `None`; this best-effort query intentionally does not expose errors.
-pub fn installed_loader_version(mc_version: &str, loader: ModLoader) -> Option<String> {
+pub fn installed_loader_version(
+    paths: &AppPaths,
+    mc_version: &str,
+    loader: ModLoader,
+) -> Option<String> {
     let composite_id = match loader {
         ModLoader::Vanilla => return None,
-        ModLoader::Fabric => fabric::installed_composite_id(mc_version).ok()?,
-        ModLoader::Forge => forge::installed_composite_id(mc_version).ok()?,
-        ModLoader::NeoForge => neoforge::installed_composite_id(mc_version).ok()?,
-        ModLoader::Quilt => quilt::installed_composite_id(mc_version).ok()?,
+        ModLoader::Fabric => fabric::installed_composite_id(paths, mc_version).ok()?,
+        ModLoader::Forge => forge::installed_composite_id(paths, mc_version).ok()?,
+        ModLoader::NeoForge => neoforge::installed_composite_id(paths, mc_version).ok()?,
+        ModLoader::Quilt => quilt::installed_composite_id(paths, mc_version).ok()?,
     };
     let metadata = std::fs::read_to_string(
-        minecraft::version_dir(&composite_id).join(format!("{composite_id}.json")),
+        paths
+            .version_dir(&composite_id)
+            .join(format!("{composite_id}.json")),
     )
     .ok()?;
     let metadata: serde_json::Value = serde_json::from_str(&metadata).ok()?;

@@ -1,31 +1,27 @@
 //! Persistent, non-secret launcher preferences.
 //!
-//! [`config_path`] uses [`directories::ProjectDirs`] to select the platform-specific
-//! per-user configuration directory and appends `config.toml`. The entire [`Config`]
+//! [`config_path`] is [`AppPaths::config_file`]: `config.toml` in the platform-specific
+//! per-user configuration directory resolved once at startup. The entire [`Config`]
 //! is serialized as human-readable TOML; missing tables and fields inherit defaults
 //! through Serde's `default` handling, while known values are semantically validated.
 //!
 //! [`load`] is strict. Startup code can instead use [`load_or_create`], which creates
 //! a default file when none exists and recovers from syntactically malformed or
 //! type-invalid TOML by returning defaults plus a warning. Files that parse but fail
-//! semantic validation, filesystem failures, and unavailable platform directories are
-//! still returned as errors so callers can decide whether an in-memory fallback is safe.
+//! semantic validation and filesystem failures are still returned as errors so callers can decide whether an in-memory fallback is safe.
+//! Locating the directory itself can no longer fail here; that happens once when
+//! [`AppPaths`] is resolved.
 //!
 //! This module stores preferences only. Credentials and access tokens do not belong in
 //! [`Config`] or in raw TOML supplied to [`save_toml`].
 
-use directories::ProjectDirs;
+use ferrite_launcher::core::paths::AppPaths;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::process::Command;
-
-const QUALIFIER: &str = "io";
-const ORGANIZATION: &str = "Ferrite";
-const APPLICATION: &str = "Ferrite Launcher";
-const FILE_NAME: &str = "config.toml";
 
 /// Complete on-disk configuration.
 ///
@@ -706,7 +702,6 @@ impl Default for MinecraftConfig {
 /// never intentionally places configuration contents in an error.
 #[derive(Debug)]
 pub enum ConfigError {
-    ConfigDirectoryUnavailable,
     Io(io::Error),
     Deserialize(toml::de::Error),
     Serialize(toml::ser::Error),
@@ -717,12 +712,6 @@ pub enum ConfigError {
 impl fmt::Display for ConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ConfigDirectoryUnavailable => {
-                write!(
-                    formatter,
-                    "the operating system configuration directory is unavailable"
-                )
-            }
             Self::Io(error) => write!(formatter, "configuration filesystem error: {error}"),
             Self::Deserialize(error) => write!(formatter, "invalid configuration TOML: {error}"),
             Self::Serialize(error) => {
@@ -770,16 +759,16 @@ pub struct ConfigLoad {
 ///
 /// Unlike [`load_or_create`], a missing or malformed file is returned as an error and
 /// no filesystem state is changed.
-pub fn load() -> Result<Config, ConfigError> {
-    parse_toml(&read_toml()?)
+pub fn load(paths: &AppPaths) -> Result<Config, ConfigError> {
+    parse_toml(&read_toml(paths)?)
 }
 
 /// Reads the config file as UTF-8 text without parsing or validating it.
 ///
 /// This performs filesystem I/O only and is useful for displaying the exact source
 /// in an advanced editor.
-pub fn read_toml() -> Result<String, ConfigError> {
-    Ok(fs::read_to_string(config_path()?)?)
+pub fn read_toml(paths: &AppPaths) -> Result<String, ConfigError> {
+    Ok(fs::read_to_string(config_path(paths))?)
 }
 
 /// Parses and validates TOML, applying defaults for missing sections and fields.
@@ -803,9 +792,9 @@ pub fn to_toml(config: &Config) -> Result<String, ConfigError> {
 /// Parsing and validation happen before any write, so those failures leave the
 /// existing file untouched. Successful output is formatted by [`to_toml`] rather
 /// than preserving the input's comments or whitespace.
-pub fn save_toml(input: &str) -> Result<Config, ConfigError> {
+pub fn save_toml(paths: &AppPaths, input: &str) -> Result<Config, ConfigError> {
     let config = parse_toml(input)?;
-    save(&config)?;
+    save(paths, &config)?;
     Ok(config)
 }
 
@@ -815,9 +804,9 @@ pub fn save_toml(input: &str) -> Result<Config, ConfigError> {
 /// return defaults with a warning and preserve the bad file for inspection. Semantic
 /// validation and I/O failures remain errors. Creating a missing file also creates
 /// its parent directory and can therefore fail.
-pub fn load_or_create() -> Result<ConfigLoad, ConfigError> {
-    let path = config_path()?;
-    match read_toml() {
+pub fn load_or_create(paths: &AppPaths) -> Result<ConfigLoad, ConfigError> {
+    let path = config_path(paths);
+    match read_toml(paths) {
         Ok(input) => match parse_toml(&input) {
             Ok(config) => Ok(ConfigLoad {
                 config,
@@ -834,7 +823,7 @@ pub fn load_or_create() -> Result<ConfigLoad, ConfigError> {
         },
         Err(ConfigError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
             let config = Config::default();
-            save(&config)?;
+            save(paths, &config)?;
             Ok(ConfigLoad {
                 config,
                 warning: None,
@@ -846,32 +835,13 @@ pub fn load_or_create() -> Result<ConfigLoad, ConfigError> {
 
 /// Saves the complete configuration as human-readable TOML.
 ///
-/// The parent directory is created as needed. Data is first written to a sibling
-/// temporary file, then renamed into place to avoid exposing a partially written
-/// TOML file. If the first rename fails while a destination exists, the implementation
-/// removes that destination and retries on every platform. That fallback is not atomic:
-/// a second rename failure can leave no active configuration file.
+/// The parent directory is created as needed. Data is written atomically (unique
+/// sibling temporary file, fsync, rename), so a failed write leaves the previous file.
 ///
 /// This function serializes the supplied value but does not call semantic validation.
-pub fn save(config: &Config) -> Result<(), ConfigError> {
-    let path = config_path()?;
-    let parent = path
-        .parent()
-        .expect("the configuration file always has a parent");
-    fs::create_dir_all(parent)?;
-    let temporary = path.with_extension("toml.tmp");
-    fs::write(&temporary, to_toml(config)?)?;
-
-    // Prefer replacement by rename. The remove-and-retry fallback handles platforms
-    // that reject replacing an existing file, but sacrifices atomic replacement.
-    if let Err(error) = fs::rename(&temporary, &path) {
-        if path.exists() {
-            fs::remove_file(&path)?;
-            fs::rename(&temporary, &path)?;
-        } else {
-            return Err(error.into());
-        }
-    }
+pub fn save(paths: &AppPaths, config: &Config) -> Result<(), ConfigError> {
+    let text = to_toml(config)?;
+    ferrite_launcher::core::write_atomic(&config_path(paths), text.as_bytes())?;
     Ok(())
 }
 
@@ -880,11 +850,8 @@ pub fn save(config: &Config) -> Result<(), ConfigError> {
 /// Creates the directory first, then spawns the platform file browser (`explorer`,
 /// `open`, or `xdg-open`). Success means the process was launched; it does not wait
 /// for the browser or prove that a window became visible.
-pub fn open_config_folder() -> Result<(), ConfigError> {
-    let path = config_path()?;
-    let folder = path
-        .parent()
-        .expect("the configuration file always has a parent");
+pub fn open_config_folder(paths: &AppPaths) -> Result<(), ConfigError> {
+    let folder = paths.config_dir();
     fs::create_dir_all(folder)?;
 
     #[cfg(target_os = "windows")]
@@ -905,15 +872,12 @@ pub fn open_config_folder() -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// Returns the platform-specific path to Ferrite's `config.toml`.
+/// Returns the path to Ferrite's `config.toml` ([`AppPaths::config_file`]).
 ///
 /// This is a pure path lookup: it neither creates the directory nor checks that the
-/// file exists. It fails on platforms where a user configuration directory cannot
-/// be determined.
-pub fn config_path() -> Result<PathBuf, ConfigError> {
-    let directories = ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
-        .ok_or(ConfigError::ConfigDirectoryUnavailable)?;
-    Ok(directories.config_dir().join(FILE_NAME))
+/// file exists.
+pub fn config_path(paths: &AppPaths) -> PathBuf {
+    paths.config_file()
 }
 
 #[cfg(test)]

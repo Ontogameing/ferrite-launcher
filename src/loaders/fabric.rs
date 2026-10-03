@@ -36,6 +36,7 @@
 //! marker commits the composite id.
 
 use crate::minecraft::{self, FerriteError, Result};
+use ferrite_launcher::core::paths::AppPaths;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::fs;
@@ -46,8 +47,8 @@ const META_BASE: &str = "https://meta.fabricmc.net/v2/versions/loader";
 /// Installs the latest stable Fabric loader for `mc_version`, on top of
 /// the vanilla install (installing that first if it isn't already
 /// present).
-pub fn install(mc_version: &str) -> Result<()> {
-    install_version(mc_version, None)
+pub fn install(paths: &AppPaths, mc_version: &str) -> Result<()> {
+    install_version(paths, mc_version, None)
 }
 
 /// Installs a requested Fabric version, or discovers a stable build when omitted.
@@ -57,8 +58,8 @@ pub fn install(mc_version: &str) -> Result<()> {
 /// entry wins, falling back to the first published entry if none is marked
 /// stable. Network, metadata, and filesystem errors abort without writing the
 /// marker, although the preceding vanilla install and partial cache remain.
-pub fn install_version(mc_version: &str, requested: Option<&str>) -> Result<()> {
-    minecraft::install_version(mc_version)?;
+pub fn install_version(paths: &AppPaths, mc_version: &str, requested: Option<&str>) -> Result<()> {
+    minecraft::install_version(paths, mc_version)?;
 
     let client = Client::new();
     let loader_version = match requested.map(str::trim).filter(|value| !value.is_empty()) {
@@ -70,14 +71,14 @@ pub fn install_version(mc_version: &str, requested: Option<&str>) -> Result<()> 
     println!("Fetching Fabric profile for loader {loader_version}...");
     let profile = fetch_profile(&client, mc_version, &loader_version)?;
 
-    let vanilla_dir = minecraft::version_dir(mc_version);
+    let vanilla_dir = paths.version_dir(mc_version);
     let vanilla_json: serde_json::Value = serde_json::from_str(&fs::read_to_string(
         vanilla_dir.join(format!("{mc_version}.json")),
     )?)?;
 
     let merged = merge_metadata(&composite_id, &vanilla_json, &profile);
 
-    let composite_dir = minecraft::version_dir(&composite_id);
+    let composite_dir = paths.version_dir(&composite_id);
     fs::create_dir_all(&composite_dir)?;
     fs::write(
         composite_dir.join(format!("{composite_id}.json")),
@@ -87,12 +88,12 @@ pub fn install_version(mc_version: &str, requested: Option<&str>) -> Result<()> 
         vanilla_dir.join("client.jar"),
         composite_dir.join("client.jar"),
     )?;
-    minecraft::copy_natives(mc_version, &composite_id)?;
+    minecraft::copy_natives(paths, mc_version, &composite_id)?;
 
     println!("Downloading Fabric loader libraries...");
-    download_fabric_libraries(&client, &profile)?;
+    download_fabric_libraries(paths, &client, &profile)?;
 
-    fs::write(marker_path(mc_version), &composite_id)?;
+    fs::write(marker_path(paths, mc_version), &composite_id)?;
     println!("Fabric {loader_version} installed for Minecraft {mc_version}.");
     Ok(())
 }
@@ -101,8 +102,8 @@ pub fn install_version(mc_version: &str, requested: Option<&str>) -> Result<()> 
 /// currently recorded for `mc_version`. Errors with
 /// `FerriteError::LoaderNotInstalled` if Fabric hasn't been installed
 /// for it yet.
-pub fn installed_composite_id(mc_version: &str) -> Result<String> {
-    fs::read_to_string(marker_path(mc_version))
+pub fn installed_composite_id(paths: &AppPaths, mc_version: &str) -> Result<String> {
+    fs::read_to_string(marker_path(paths, mc_version))
         .map_err(|_| FerriteError::LoaderNotInstalled(mc_version.to_string()))
 }
 
@@ -110,8 +111,8 @@ pub fn installed_composite_id(mc_version: &str) -> Result<String> {
 /// given vanilla version, so `launch`/`is_installed` don't need to
 /// re-query Fabric's meta API (and stay correct even if a newer loader
 /// build gets published between install and launch).
-fn marker_path(mc_version: &str) -> PathBuf {
-    minecraft::version_dir(mc_version).join("fabric-loader.txt")
+fn marker_path(paths: &AppPaths, mc_version: &str) -> PathBuf {
+    paths.version_dir(mc_version).join("fabric-loader.txt")
 }
 
 fn composite_id(mc_version: &str, loader_version: &str) -> String {
@@ -267,8 +268,12 @@ fn maven_coordinate_to_path(coordinate: &str) -> Option<String> {
 /// A missing library array is a valid no-op. Entries without a usable name, URL,
 /// or coordinate are skipped. Existing destination paths are trusted without a
 /// size/hash check; the first HTTP or filesystem failure aborts the loop.
-fn download_fabric_libraries(client: &Client, profile: &serde_json::Value) -> Result<()> {
-    let libs_dir = minecraft::libraries_dir();
+fn download_fabric_libraries(
+    paths: &AppPaths,
+    client: &Client,
+    profile: &serde_json::Value,
+) -> Result<()> {
+    let libs_dir = paths.libraries_dir();
     fs::create_dir_all(&libs_dir)?;
 
     let Some(libraries) = profile["libraries"].as_array() else {
