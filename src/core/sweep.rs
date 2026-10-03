@@ -11,12 +11,16 @@
 //! * nothing in it (the folder, its subfolders, or files, checked without following
 //!   links) was modified within `min_age`,
 //! * on Unix, the process `<pid>` is not running (it could be another Ferrite window
-//!   still working; a reused pid just postpones the clean-up).
+//!   still working; a reused pid just postpones the clean-up),
+//! * no manifest entry (profile or preserved skipped entry) names that folder,
+//!   compared case-insensitively; an unreadable manifest skips the sweep entirely.
 //!
 //! It only logs; there is no UI.
 
 use crate::core::fsutil;
+use crate::core::instances::{self, InstanceProfile, SkippedEntry, directory_key};
 use crate::core::paths::AppPaths;
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -55,8 +59,32 @@ pub fn parse_temp_name(name: &str) -> Option<u32> {
 
 /// Removes stale Ferrite temp folders directly inside the instances folder (see the
 /// module docs). A missing instances folder is not an error.
+///
+/// Folders named by the manifest (any loaded profile or preserved skipped entry,
+/// compared case-insensitively like folders) are never touched. If the manifest can't
+/// be read, nothing is swept.
 pub fn sweep_stale_temp_dirs(paths: &AppPaths, min_age: Duration) -> io::Result<SweepReport> {
-    sweep_with(paths, min_age, SystemTime::now(), &process_alive)
+    let loaded = instances::load(paths).map_err(|error| {
+        io::Error::other(format!(
+            "instance list unreadable, skipping the temp sweep: {error}"
+        ))
+    })?;
+    let claimed = claimed_keys(&loaded.profiles, &loaded.skipped);
+    sweep_with(paths, min_age, SystemTime::now(), &process_alive, &claimed)
+}
+
+/// Folder keys used by manifest entries.
+fn claimed_keys(profiles: &[InstanceProfile], skipped: &[SkippedEntry]) -> HashSet<String> {
+    profiles
+        .iter()
+        .map(|profile| directory_key(profile.directory().as_str()))
+        .chain(
+            skipped
+                .iter()
+                .filter_map(SkippedEntry::raw_directory)
+                .map(directory_key),
+        )
+        .collect()
 }
 
 fn sweep_with(
@@ -64,6 +92,7 @@ fn sweep_with(
     min_age: Duration,
     now: SystemTime,
     alive: &dyn Fn(u32) -> bool,
+    claimed: &HashSet<String>,
 ) -> io::Result<SweepReport> {
     let root = paths.instances_dir();
     let mut report = SweepReport::default();
@@ -80,6 +109,10 @@ fn sweep_with(
         let Some(pid) = parse_temp_name(&name) else {
             continue;
         };
+        if claimed.contains(&directory_key(&name)) {
+            eprintln!("Ferrite: {name} looks like a temp folder but an instance uses it; kept");
+            continue;
+        }
         let path = root.join(&name);
         let Ok(metadata) = fs::symlink_metadata(&path) else {
             continue;
@@ -219,9 +252,13 @@ mod tests {
         fs::create_dir(&other_kind).unwrap();
         fs::write(&file, b"x").unwrap();
 
-        let report = sweep_with(&paths, DEFAULT_MIN_AGE, SystemTime::now() + LATER, &|_| {
-            false
-        })
+        let report = sweep_with(
+            &paths,
+            DEFAULT_MIN_AGE,
+            SystemTime::now() + LATER,
+            &|_| false,
+            &HashSet::new(),
+        )
         .unwrap();
         let mut removed = report.removed.clone();
         removed.sort();
@@ -238,14 +275,25 @@ mod tests {
         let root = paths.instances_dir();
         let recent = root.join(".pack.import.4000001.1.tmp");
         fs::create_dir(&recent).unwrap();
-        let report = sweep_with(&paths, DEFAULT_MIN_AGE, SystemTime::now(), &|_| false).unwrap();
+        let report = sweep_with(
+            &paths,
+            DEFAULT_MIN_AGE,
+            SystemTime::now(),
+            &|_| false,
+            &HashSet::new(),
+        )
+        .unwrap();
         assert_eq!(report.kept, std::slice::from_ref(&recent));
         assert!(recent.is_dir());
 
         // Old, but its process is still running.
-        let report = sweep_with(&paths, DEFAULT_MIN_AGE, SystemTime::now() + LATER, &|pid| {
-            pid == 4000001
-        })
+        let report = sweep_with(
+            &paths,
+            DEFAULT_MIN_AGE,
+            SystemTime::now() + LATER,
+            &|pid| pid == 4000001,
+            &HashSet::new(),
+        )
         .unwrap();
         assert_eq!(report.kept, std::slice::from_ref(&recent));
         assert!(recent.is_dir());
@@ -264,7 +312,14 @@ mod tests {
             fs::File::open(path).unwrap().set_modified(old).unwrap();
         }
         // Only the deepest folder and file are recent.
-        let report = sweep_with(&paths, DEFAULT_MIN_AGE, SystemTime::now(), &|_| false).unwrap();
+        let report = sweep_with(
+            &paths,
+            DEFAULT_MIN_AGE,
+            SystemTime::now(),
+            &|_| false,
+            &HashSet::new(),
+        )
+        .unwrap();
         assert_eq!(report.kept, std::slice::from_ref(&staging));
         assert!(file.exists());
     }
@@ -278,9 +333,13 @@ mod tests {
         fs::write(target.join("data"), b"keep").unwrap();
         let link = paths.instances_dir().join(".pack.import.4000001.1.tmp");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        let report = sweep_with(&paths, DEFAULT_MIN_AGE, SystemTime::now() + LATER, &|_| {
-            false
-        })
+        let report = sweep_with(
+            &paths,
+            DEFAULT_MIN_AGE,
+            SystemTime::now() + LATER,
+            &|_| false,
+            &HashSet::new(),
+        )
         .unwrap();
         assert!(report.removed.is_empty() && report.kept.is_empty());
         assert!(fs::symlink_metadata(&link).is_ok());
@@ -297,12 +356,59 @@ mod tests {
         let staging = paths.instances_dir().join(".pack.duplicate.4000001.1.tmp");
         fs::create_dir(&staging).unwrap();
         std::os::unix::fs::symlink(&target, staging.join("link")).unwrap();
-        let report = sweep_with(&paths, DEFAULT_MIN_AGE, SystemTime::now() + LATER, &|_| {
-            false
-        })
+        let report = sweep_with(
+            &paths,
+            DEFAULT_MIN_AGE,
+            SystemTime::now() + LATER,
+            &|_| false,
+            &HashSet::new(),
+        )
         .unwrap();
         assert_eq!(report.removed, std::slice::from_ref(&staging));
         assert_eq!(fs::read(target.join("data")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn folders_named_by_the_manifest_are_never_swept() {
+        let (_temp, paths) = setup();
+        let root = paths.instances_dir();
+        let used = root.join(".x.import.123.1.tmp");
+        let used_by_skipped = root.join(".y.duplicate.123.2.tmp");
+        fs::create_dir(&used).unwrap();
+        fs::write(used.join("options.txt"), b"keep").unwrap();
+        fs::create_dir(&used_by_skipped).unwrap();
+        // A loaded profile (different case) and a preserved invalid entry claim them.
+        fs::write(
+            paths.instances_manifest(),
+            r#"[{"name":"Odd","version":"1.20.1","loader":"Vanilla","directory":".X.Import.123.1.tmp"},
+               {"name":"Y","version":1,"directory":".y.duplicate.123.2.tmp"}]"#,
+        )
+        .unwrap();
+        let loaded = instances::load(&paths).unwrap();
+        assert_eq!(loaded.profiles.len(), 1, "{:?}", loaded.skipped);
+        assert_eq!(loaded.skipped.len(), 1);
+        let claimed = claimed_keys(&loaded.profiles, &loaded.skipped);
+        let report = sweep_with(
+            &paths,
+            DEFAULT_MIN_AGE,
+            SystemTime::now() + LATER,
+            &|_| false,
+            &claimed,
+        )
+        .unwrap();
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert_eq!(fs::read(used.join("options.txt")).unwrap(), b"keep");
+        assert!(used_by_skipped.is_dir());
+    }
+
+    #[test]
+    fn unreadable_manifest_skips_the_sweep() {
+        let (_temp, paths) = setup();
+        let stale = paths.instances_dir().join(".pack.import.4000001.1.tmp");
+        fs::create_dir(&stale).unwrap();
+        fs::write(paths.instances_manifest(), "{ corrupt").unwrap();
+        assert!(sweep_stale_temp_dirs(&paths, Duration::ZERO).is_err());
+        assert!(stale.is_dir());
     }
 
     #[test]
