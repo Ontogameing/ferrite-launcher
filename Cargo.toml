@@ -26,6 +26,9 @@ semver = "1"
 # Default features: COM apartment-threaded init on Windows (Ferrite calls it on a
 # dedicated thread) and DeletionDate in freedesktop .trashinfo files.
 trash = "5.2.9"
+# NFC-normalizes instance names and folder names before case-insensitive comparison
+# (macOS stores decomposed file names; users type composed ones).
+unicode-normalization = "0.1.25"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

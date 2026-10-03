@@ -242,15 +242,21 @@ pub fn directory_slug(name: &str) -> String {
 /// removed, because Windows and macOS folders are case-insensitive and Windows ignores
 /// trailing dots/spaces (`Foo.` and `foo` are the same folder there).
 ///
-/// This does not apply Unicode normalization (NFC/NFD); generated slugs are ASCII, so
-/// only hand-edited legacy names could differ in normalization alone.
+/// Names are NFC-normalized first, so a decomposed name (as macOS stores it) and a
+/// composed one compare equal.
 pub fn directory_key(name: &str) -> String {
-    name.trim_end_matches(['.', ' ']).to_lowercase()
+    use unicode_normalization::UnicodeNormalization;
+    name.trim_end_matches(['.', ' '])
+        .nfc()
+        .collect::<String>()
+        .to_lowercase()
 }
 
-/// Comparison key for display names: trimmed and Unicode-lowercased.
+/// Comparison key for display names: trimmed, NFC-normalized, and Unicode-lowercased,
+/// so `Café` typed composed and `Café` stored decomposed collide.
 pub fn name_key(name: &str) -> String {
-    name.trim().to_lowercase()
+    use unicode_normalization::UnicodeNormalization;
+    name.trim().nfc().collect::<String>().to_lowercase()
 }
 
 // =====================================================================
@@ -600,6 +606,19 @@ pub fn serialize_manifest_v0(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keys_ignore_unicode_normalization_and_case() {
+        let composed = "Caf\u{e9}";
+        let decomposed = "cafe\u{301}";
+        assert_ne!(composed, decomposed);
+        assert_eq!(name_key(composed), name_key(decomposed));
+        assert_eq!(
+            directory_key(composed),
+            directory_key(&format!("{decomposed}."))
+        );
+        assert_ne!(name_key("Cafe"), name_key(composed));
+    }
 
     const V0: &str = r#"[
   {"name": "Fabric 1.21", "version": "1.21.1", "loader": "Fabric", "directory": "fabric-1-21"},
