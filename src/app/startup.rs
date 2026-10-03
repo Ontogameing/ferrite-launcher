@@ -78,7 +78,7 @@ impl StartupApp {
     fn plan(&mut self) {
         let candidates = migration::default_legacy_candidate_dirs();
         self.stage = match migration::plan(&self.paths, &candidates) {
-            Ok(StartupPlan::Ready { paths, notes }) => {
+            Ok(StartupPlan::Ready { paths, notes, .. }) => {
                 self.notes.extend(notes);
                 self.ready(paths)
             }
@@ -87,6 +87,7 @@ impl StartupApp {
                 source,
                 resuming,
                 notes,
+                ..
             }) => {
                 self.notes.extend(notes);
                 if resuming {
@@ -99,6 +100,7 @@ impl StartupApp {
                 paths,
                 candidates,
                 notes,
+                ..
             }) => {
                 self.notes.extend(notes);
                 Stage::Choosing { paths, candidates }
@@ -254,7 +256,7 @@ fn migrating_ui(ui: &mut egui::Ui, task: &MigrationTask) -> Option<Action> {
     );
     ui.add_space(12.0);
     ui.add(
-        egui::ProgressBar::new(progress.fraction())
+        egui::ProgressBar::new(progress.fraction().unwrap_or(0.0))
             .show_percentage()
             .desired_width(ui.available_width().min(560.0)),
     );

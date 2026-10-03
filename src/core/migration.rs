@@ -90,6 +90,16 @@ pub enum MigrationError {
     /// Some source entries could not be copied (not links: special files, unreadable
     /// files or folders). Nothing was committed; staged progress is kept.
     UncopyableFiles(Vec<UncopyableFile>),
+    /// The destination filesystem does not have room for the copy (checked before
+    /// copying). `needed` includes a small safety margin.
+    NotEnoughSpace {
+        needed: u64,
+        available: u64,
+        volume: PathBuf,
+    },
+    /// The old folder changed while it was being copied (found by the re-check right
+    /// before committing). Nothing was committed; a retry re-copies what changed.
+    SourceChanged(String),
     /// The user cancelled; staged progress is kept for resumption.
     Cancelled,
     /// A rolled-back legacy location is no longer usable.
@@ -148,6 +158,21 @@ impl fmt::Display for MigrationError {
                 }
                 Ok(())
             }
+            Self::NotEnoughSpace {
+                needed,
+                available,
+                volume,
+            } => write!(
+                f,
+                "not enough free space on {}: needs {}, {} free",
+                volume.display(),
+                format_size(*needed),
+                format_size(*available)
+            ),
+            Self::SourceChanged(detail) => write!(
+                f,
+                "the old folder changed while it was being copied ({detail}); nothing was moved"
+            ),
             Self::Cancelled => write!(
                 f,
                 "migration cancelled; progress was kept and will resume next time"
@@ -168,6 +193,22 @@ impl fmt::Display for MigrationError {
 }
 
 impl std::error::Error for MigrationError {}
+
+/// Formats a byte count with binary units and one decimal, e.g. `5.0 GiB`.
+pub fn format_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
 
 fn io_ctx(context: impl Into<String>) -> impl FnOnce(io::Error) -> MigrationError {
     let context = context.into();
@@ -309,10 +350,16 @@ fn scan_tree(root: &Path) -> Result<TreeScan, MigrationError> {
 /// A legacy directory that holds Ferrite data.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Candidate {
-    /// Canonical path of the legacy `minecraft` directory.
+    /// Canonical (resolved) path of the legacy `minecraft` directory. A top-level
+    /// symlink is followed by design, so this may differ from [`Self::found_at`].
     pub path: PathBuf,
+    /// Where the folder was found (`<exe dir>/minecraft` or `<cwd>/minecraft`) before
+    /// resolving links.
+    pub found_at: PathBuf,
     /// Number of valid instances in its manifest.
     pub instance_count: usize,
+    /// Names of the valid instances, in manifest order.
+    pub instance_names: Vec<String>,
     /// Human-readable reasons for manifest entries that will be skipped.
     pub skipped_entries: Vec<String>,
     /// Regular files (links and special files excluded).
@@ -333,6 +380,9 @@ pub struct Candidate {
 pub struct Rejection {
     pub path: PathBuf,
     pub reason: String,
+    /// `true` when an `instances.json` exists there, i.e. this looks like old Ferrite
+    /// data that could not be used (as opposed to an unrelated `minecraft` folder).
+    pub manifest_present: bool,
 }
 
 impl fmt::Display for Rejection {
@@ -341,18 +391,27 @@ impl fmt::Display for Rejection {
     }
 }
 
-/// `<base>/minecraft` for each base, canonicalized (non-existent ones dropped) and
-/// de-duplicated in order.
+/// `<base>/minecraft` for each base that exists, de-duplicated in order by its
+/// canonical (resolved) path. The returned paths are the un-resolved locations; the
+/// planner resolves them again and reports both (see [`Candidate::found_at`]).
 pub fn legacy_candidate_dirs(bases: &[Option<&Path>]) -> Vec<PathBuf> {
+    let mut seen: Vec<PathBuf> = Vec::new();
     let mut out: Vec<PathBuf> = Vec::new();
     for base in bases.iter().flatten() {
-        if let Ok(canonical) = fs::canonicalize(base.join(STORAGE_DIR_NAME))
-            && !out.contains(&canonical)
+        let dir = base.join(STORAGE_DIR_NAME);
+        if let Ok(canonical) = fs::canonicalize(&dir)
+            && !seen.contains(&canonical)
         {
-            out.push(canonical);
+            seen.push(canonical);
+            out.push(dir);
         }
     }
     out
+}
+
+/// Whether `dir/instances.json` exists at all (without following a link there).
+fn manifest_present(dir: &Path) -> bool {
+    fs::symlink_metadata(dir.join(INSTANCES_MANIFEST_FILE)).is_ok()
 }
 
 /// Candidate legacy directories for this process: `<exe dir>/minecraft` and
@@ -394,18 +453,27 @@ fn inspect_manifest(dir: &Path) -> Result<(InstanceManifest, Vec<u8>), String> {
     Ok((parsed, bytes))
 }
 
-fn build_candidate(dir: &Path) -> Result<(Candidate, TreeScan, Vec<u8>), Rejection> {
+fn build_candidate(found_at: &Path) -> Result<(Candidate, TreeScan, Vec<u8>), Rejection> {
     let reject = |reason: String| Rejection {
-        path: dir.to_path_buf(),
+        path: found_at.to_path_buf(),
         reason,
+        manifest_present: manifest_present(found_at),
     };
+    let dir = fs::canonicalize(found_at).map_err(|error| reject(error.to_string()))?;
+    let dir = dir.as_path();
     let (parsed, manifest_bytes) = inspect_manifest(dir).map_err(reject)?;
     let scan = scan_tree(dir).map_err(|error| reject(error.to_string()))?;
     let skipped_entries = parsed.skipped.iter().map(ToString::to_string).collect();
     Ok((
         Candidate {
             path: dir.to_path_buf(),
+            found_at: found_at.to_path_buf(),
             instance_count: parsed.instances.len(),
+            instance_names: parsed
+                .instances
+                .iter()
+                .map(|profile| profile.name.clone())
+                .collect(),
             skipped_entries,
             file_count: scan.files.len() as u64,
             total_bytes: scan.total_bytes,
@@ -453,6 +521,9 @@ pub struct MigrationState {
     pub files_total: u64,
     #[serde(default)]
     pub bytes_total: u64,
+    /// Valid instances in the source manifest.
+    #[serde(default)]
+    pub instance_count: usize,
     /// Genuine links that were not copied (relative to source).
     #[serde(default)]
     pub skipped_links: Vec<PathBuf>,
@@ -473,6 +544,7 @@ impl MigrationState {
             source,
             files_total: 0,
             bytes_total: 0,
+            instance_count: 0,
             skipped_links: Vec::new(),
             skipped_entries: Vec::new(),
             message: None,
@@ -525,16 +597,30 @@ fn write_state(paths: &AppPaths, state: &MigrationState) -> Result<(), Migration
 // =====================================================================
 
 /// What startup must do before the launcher can use its storage.
+///
+/// Every variant carries `rejected`: folders that contain an `instances.json` but
+/// could not be used (unparseable, a link, unreadable, ...). The UI must tell the
+/// user about these; otherwise an empty launcher looks like data loss. Folders
+/// without an `instances.json` are not Ferrite data and are not reported.
 #[derive(Debug, Clone)]
 pub enum StartupPlan {
-    /// Use these paths now. `notes` explains anything noteworthy (ignored candidates...).
-    Ready { paths: AppPaths, notes: Vec<String> },
+    /// Use these paths now.
+    Ready {
+        paths: AppPaths,
+        /// Explanations of anything noteworthy.
+        notes: Vec<String>,
+        rejected: Vec<Rejection>,
+        /// Valid old data folders that were *not* migrated because the destination
+        /// already holds data.
+        ignored_legacy: Vec<PathBuf>,
+    },
     /// Copy `source` into the standard location (possibly resuming).
     NeedsMigration {
         paths: AppPaths,
         source: Candidate,
         resuming: bool,
         notes: Vec<String>,
+        rejected: Vec<Rejection>,
     },
     /// Two or more valid candidates differ; the user must choose one. Nothing is
     /// preselected and merging is not offered.
@@ -542,6 +628,7 @@ pub enum StartupPlan {
         paths: AppPaths,
         candidates: Vec<Candidate>,
         notes: Vec<String>,
+        rejected: Vec<Rejection>,
     },
 }
 
@@ -553,6 +640,7 @@ fn exists_no_follow(path: &Path) -> bool {
 /// [`default_legacy_candidate_dirs`]; tests pass explicit directories.
 pub fn plan(paths: &AppPaths, candidate_dirs: &[PathBuf]) -> Result<StartupPlan, MigrationError> {
     let mut notes = Vec::new();
+    let mut rejected = Vec::new();
     let dest = paths.standard_storage_root();
     let staged = paths.migration_staging_dir().join(STORAGE_DIR_NAME);
 
@@ -574,12 +662,16 @@ pub fn plan(paths: &AppPaths, candidate_dirs: &[PathBuf]) -> Result<StartupPlan,
                 return Ok(StartupPlan::Ready {
                     paths: legacy,
                     notes,
+                    rejected,
+                    ignored_legacy: Vec::new(),
                 });
             }
             MigrationPhase::Completed if exists_no_follow(&dest) => {
                 return Ok(StartupPlan::Ready {
                     paths: paths.clone(),
                     notes,
+                    rejected,
+                    ignored_legacy: Vec::new(),
                 });
             }
             MigrationPhase::Completed => notes.push(format!(
@@ -596,6 +688,7 @@ pub fn plan(paths: &AppPaths, candidate_dirs: &[PathBuf]) -> Result<StartupPlan,
                             notes.push(format!(
                                 "An interrupted migration cannot resume: {rejection}"
                             ));
+                            rejected.push(rejection);
                             None
                         }
                     });
@@ -610,6 +703,7 @@ pub fn plan(paths: &AppPaths, candidate_dirs: &[PathBuf]) -> Result<StartupPlan,
                         source,
                         resuming: true,
                         notes,
+                        rejected,
                     });
                 }
             }
@@ -624,16 +718,20 @@ pub fn plan(paths: &AppPaths, candidate_dirs: &[PathBuf]) -> Result<StartupPlan,
     }
 
     if exists_no_follow(&dest) {
-        let ignored: Vec<String> = candidate_dirs
+        let ignored_legacy: Vec<PathBuf> = candidate_dirs
             .iter()
+            .filter_map(|dir| fs::canonicalize(dir).ok())
             .filter(|dir| inspect_manifest(dir).is_ok())
-            .map(|dir| dir.display().to_string())
             .collect();
-        if !ignored.is_empty() {
+        if !ignored_legacy.is_empty() {
             let note = format!(
                 "{} already contains data, so old data at {} was not migrated.",
                 dest.display(),
-                ignored.join(", ")
+                ignored_legacy
+                    .iter()
+                    .map(|dir| dir.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
             eprintln!("Ferrite: {note}");
             notes.push(note);
@@ -641,15 +739,18 @@ pub fn plan(paths: &AppPaths, candidate_dirs: &[PathBuf]) -> Result<StartupPlan,
         return Ok(StartupPlan::Ready {
             paths: paths.clone(),
             notes,
+            rejected,
+            ignored_legacy,
         });
     }
 
     let data_dir = fs::canonicalize(paths.data_dir()).ok();
     let mut valid: Vec<(Candidate, TreeScan, Vec<u8>)> = Vec::new();
     for dir in candidate_dirs {
+        let resolved = fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
         if data_dir
             .as_deref()
-            .is_some_and(|data| dir.starts_with(data))
+            .is_some_and(|data| resolved.starts_with(data))
         {
             notes.push(format!(
                 "Ignored {}: it is inside Ferrite's data directory.",
@@ -659,8 +760,13 @@ pub fn plan(paths: &AppPaths, candidate_dirs: &[PathBuf]) -> Result<StartupPlan,
         }
         match build_candidate(dir) {
             Ok(found) => valid.push(found),
-            // A missing instances.json is the normal "not Ferrite data" case.
-            Err(rejection) => eprintln!("Ferrite: not migrating {rejection}"),
+            Err(rejection) => {
+                eprintln!("Ferrite: not migrating {rejection}");
+                // A missing instances.json is the normal "not Ferrite data" case.
+                if rejection.manifest_present {
+                    rejected.push(rejection);
+                }
+            }
         }
     }
 
@@ -668,12 +774,15 @@ pub fn plan(paths: &AppPaths, candidate_dirs: &[PathBuf]) -> Result<StartupPlan,
         0 => Ok(StartupPlan::Ready {
             paths: paths.clone(),
             notes,
+            rejected,
+            ignored_legacy: Vec::new(),
         }),
         1 => Ok(StartupPlan::NeedsMigration {
             paths: paths.clone(),
             source: valid.remove(0).0,
             resuming: false,
             notes,
+            rejected,
         }),
         _ => {
             let (first, rest) = valid.split_first().expect("at least two candidates");
@@ -690,6 +799,7 @@ pub fn plan(paths: &AppPaths, candidate_dirs: &[PathBuf]) -> Result<StartupPlan,
                     source: valid.remove(0).0,
                     resuming: false,
                     notes,
+                    rejected,
                 })
             } else {
                 Ok(StartupPlan::NeedsUserChoice {
@@ -699,6 +809,7 @@ pub fn plan(paths: &AppPaths, candidate_dirs: &[PathBuf]) -> Result<StartupPlan,
                         .map(|(candidate, _, _)| candidate)
                         .collect(),
                     notes,
+                    rejected,
                 })
             }
         }
@@ -732,12 +843,18 @@ pub struct MigrationProgress {
 }
 
 impl MigrationProgress {
-    /// Fraction of bytes copied (0.0..=1.0).
-    pub fn fraction(&self) -> f32 {
+    /// Fraction of bytes copied (0.0..=1.0) while copying, `Some(1.0)` when done,
+    /// and `None` for steps without measurable progress (starting, scanning,
+    /// verifying, finalizing) so the UI shows an indeterminate indicator instead of
+    /// a misleading 100%.
+    pub fn fraction(&self) -> Option<f32> {
         match self.step {
-            MigrationStep::Done | MigrationStep::Finalizing | MigrationStep::Verifying => 1.0,
-            _ if self.bytes_total == 0 => 0.0,
-            _ => (self.bytes_done as f64 / self.bytes_total as f64).clamp(0.0, 1.0) as f32,
+            MigrationStep::Done => Some(1.0),
+            MigrationStep::Copying if self.bytes_total == 0 => Some(0.0),
+            MigrationStep::Copying => {
+                Some((self.bytes_done as f64 / self.bytes_total as f64).clamp(0.0, 1.0) as f32)
+            }
+            _ => None,
         }
     }
 }
@@ -826,6 +943,8 @@ pub struct MigrationReport {
     pub destination: PathBuf,
     pub files_copied: u64,
     pub bytes_copied: u64,
+    /// Valid instances moved (from the source manifest).
+    pub instance_count: usize,
     pub skipped_links: Vec<PathBuf>,
     pub skipped_entries: Vec<String>,
     /// `true` when nothing had to be done.
@@ -841,6 +960,10 @@ type StepHook<'a> = &'a dyn Fn() -> io::Result<()>;
 struct Hooks<'a> {
     after_file: Option<FileHook<'a>>,
     before_verify: Option<PathHook<'a>>,
+    /// Called with the source right before the pre-commit re-check.
+    before_recheck: Option<PathHook<'a>>,
+    /// Overrides the free-space query (bytes available).
+    available_space: Option<&'a dyn Fn() -> u64>,
     /// Called with each source file right before it is opened; an error simulates
     /// an unreadable source file.
     before_open: Option<PathHook<'a>>,
@@ -895,6 +1018,7 @@ fn run_with_hooks(
         destination: dest.clone(),
         files_copied: 0,
         bytes_copied: 0,
+        instance_count: 0,
         skipped_links: Vec::new(),
         skipped_entries: Vec::new(),
         already_complete: false,
@@ -927,6 +1051,7 @@ fn run_with_hooks(
         let previous = state.expect("checked above");
         report.files_copied = previous.files_total;
         report.bytes_copied = previous.bytes_total;
+        report.instance_count = previous.instance_count;
         report.skipped_links = previous.skipped_links.clone();
         report.skipped_entries = previous.skipped_entries.clone();
         return finalize(paths, previous, control, &staging_root, report);
@@ -942,6 +1067,7 @@ fn run_with_hooks(
             reason,
         })?;
     report.skipped_entries = parsed.skipped.iter().map(ToString::to_string).collect();
+    report.instance_count = parsed.instances.len();
     for entry in &report.skipped_entries {
         eprintln!("Ferrite migration: invalid manifest entry will not be loaded: {entry}");
     }
@@ -962,12 +1088,14 @@ fn run_with_hooks(
         return Err(MigrationError::UncopyableFiles(scan.blocked));
     }
     report.skipped_links = scan.links.clone();
+    fs::create_dir_all(data_dir).map_err(io_ctx(format!("create {}", data_dir.display())))?;
+    check_free_space(data_dir, &staged, &scan, hooks)?;
     let mut state = MigrationState::new(MigrationPhase::Copying, Some(source.clone()));
     state.files_total = scan.files.len() as u64;
     state.bytes_total = scan.total_bytes;
+    state.instance_count = report.instance_count;
     state.skipped_links = scan.links.clone();
     state.skipped_entries = report.skipped_entries.clone();
-    fs::create_dir_all(data_dir).map_err(io_ctx(format!("create {}", data_dir.display())))?;
     write_state(paths, &state)?;
 
     control.update(|progress| {
@@ -996,6 +1124,17 @@ fn run_with_hooks(
         write_state(paths, &failed)?;
         return Err(MigrationError::VerificationFailed(detail));
     }
+    // Re-check the source right before committing: if the game or another launcher
+    // changed it during the copy, refuse to commit a stale snapshot.
+    if let Some(hook) = hooks.before_recheck {
+        hook(&source).map_err(interrupted)?;
+    }
+    let recheck = scan_tree(&source)?;
+    if let Some(change) = describe_change(&scan, &recheck) {
+        eprintln!("Ferrite migration: source changed during copy: {change}");
+        return Err(MigrationError::SourceChanged(change));
+    }
+
     // One full flush of the staged tree before recording Verified and committing.
     fsutil::full_flush(&staged).map_err(io_ctx(format!("flush {}", staged.display())))?;
     state.phase = MigrationPhase::Verified;
@@ -1049,6 +1188,110 @@ fn finalize(
     Ok(report)
 }
 
+/// Safety margin on top of the bytes still to copy: 5%.
+fn with_margin(bytes: u64) -> u64 {
+    bytes.saturating_add(bytes / 20)
+}
+
+/// Fails fast with [`MigrationError::NotEnoughSpace`] when the destination volume
+/// cannot hold what remains to be copied (plus a margin). Bytes already staged by an
+/// interrupted attempt are not counted twice.
+fn check_free_space(
+    data_dir: &Path,
+    staged: &Path,
+    scan: &TreeScan,
+    hooks: &Hooks<'_>,
+) -> Result<(), MigrationError> {
+    let already_staged = if exists_no_follow(staged) {
+        scan_tree(staged).map(|copy| copy.total_bytes).unwrap_or(0)
+    } else {
+        0
+    };
+    let needed = with_margin(scan.total_bytes.saturating_sub(already_staged));
+    let available = match hooks.available_space {
+        Some(query) => query(),
+        None => fsutil::available_space(data_dir).map_err(io_ctx(format!(
+            "check free space on {}",
+            data_dir.display()
+        )))?,
+    };
+    if needed > available {
+        return Err(MigrationError::NotEnoughSpace {
+            needed,
+            available,
+            volume: data_dir.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+/// Compares two scans of the source (file set, sizes, mtimes, folders, links) and
+/// describes the first difference.
+fn describe_change(before: &TreeScan, after: &TreeScan) -> Option<String> {
+    if let Some(blocked) = after.blocked.first() {
+        return Some(format!("{blocked} can no longer be read"));
+    }
+    for (path, info) in &after.files {
+        match before.files.get(path) {
+            None => return Some(format!("{} was added", path.display())),
+            Some(old) if old != info => {
+                return Some(format!("{} was modified", path.display()));
+            }
+            Some(_) => {}
+        }
+    }
+    if let Some(path) = before
+        .files
+        .keys()
+        .find(|path| !after.files.contains_key(*path))
+    {
+        return Some(format!("{} was removed", path.display()));
+    }
+    if before.dirs != after.dirs {
+        return Some("folders were added or removed".into());
+    }
+    if before.links != after.links {
+        return Some("links were added or removed".into());
+    }
+    None
+}
+
+/// Removes staged entries that are no longer in the source scan (left over from an
+/// earlier attempt against a source that has since changed). Only ever touches the
+/// staging directory, which belongs to Ferrite.
+fn prune_staging(staged: &Path, scan: &TreeScan) -> Result<(), MigrationError> {
+    if !exists_no_follow(staged) {
+        return Ok(());
+    }
+    let copy = scan_tree(staged)?;
+    for (path, _) in copy
+        .files
+        .iter()
+        .filter(|(path, _)| !scan.files.contains_key(*path))
+    {
+        let target = staged.join(path);
+        fs::remove_file(&target).map_err(io_ctx(format!("remove stale {}", target.display())))?;
+    }
+    for link in &copy.links {
+        let target = staged.join(link);
+        fs::remove_file(&target).map_err(io_ctx(format!("remove stale {}", target.display())))?;
+    }
+    // Deepest first, so a removed parent never hides a child we still look at.
+    for dir in copy.dirs.iter().rev() {
+        if !scan.dirs.contains(dir) {
+            let target = staged.join(dir);
+            match fs::remove_dir_all(&target) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(io_ctx(format!("remove stale {}", target.display()))(error));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn partial_name(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(PARTIAL_SUFFIX);
@@ -1089,6 +1332,7 @@ fn copy_tree(
     hooks: &Hooks<'_>,
 ) -> Result<(), MigrationError> {
     clear_partials(staged)?;
+    prune_staging(staged, scan)?;
     fs::create_dir_all(staged).map_err(io_ctx(format!("create {}", staged.display())))?;
     for dir in &scan.dirs {
         let target = staged.join(dir);

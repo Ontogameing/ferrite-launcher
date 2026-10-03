@@ -203,6 +203,50 @@ pub fn open_regular_no_follow(path: &Path, expected: &fs::Metadata) -> io::Resul
     }
 }
 
+/// Bytes available to this user on the filesystem containing `path` (which must
+/// exist): `statvfs` (`f_bavail * f_frsize`) on Unix, `GetDiskFreeSpaceExW` on Windows.
+pub fn available_space(path: &Path) -> io::Result<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+        let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: valid NUL-terminated path and a writable statvfs buffer.
+        if unsafe { libc::statvfs(c_path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: statvfs returned success, so the buffer is initialized.
+        let stats = unsafe { stats.assume_init() };
+        #[allow(clippy::unnecessary_cast)] // field widths differ between platforms
+        Ok((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        let mut available = 0_u64;
+        // SAFETY: NUL-terminated UTF-16 path; the optional out-pointers may be null.
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut available,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(available)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Ok(u64::MAX)
+    }
+}
+
 /// Windows reparse tag of a symbolic link (`IO_REPARSE_TAG_SYMLINK`).
 pub const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
 /// Windows reparse tag of a junction / mount point (`IO_REPARSE_TAG_MOUNT_POINT`).
@@ -262,6 +306,7 @@ mod tests {
         full_flush(dir.path()).unwrap();
         let metadata = fs::symlink_metadata(&path).unwrap();
         open_regular_no_follow(&path, &metadata).unwrap();
+        assert!(available_space(dir.path()).unwrap() > 0);
     }
 
     #[cfg(unix)]

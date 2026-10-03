@@ -88,7 +88,23 @@ fn candidate_detection_rejects_folders_without_valid_manifest() {
         );
     }
     match plan(&paths, &dirs).unwrap() {
-        StartupPlan::Ready { paths: ready, .. } => assert_eq!(ready, paths),
+        StartupPlan::Ready {
+            paths: ready,
+            rejected,
+            ..
+        } => {
+            assert_eq!(ready, paths);
+            // Folders with an instances.json that could not be used are reported so
+            // the UI can explain them; a plain `minecraft` folder is not.
+            let reported: Vec<_> = rejected.iter().map(|r| r.path.clone()).collect();
+            assert_eq!(reported.len(), 3, "{rejected:?}");
+            assert!(!reported.iter().any(|path| path.starts_with(&home)));
+            assert!(
+                rejected
+                    .iter()
+                    .all(|r| r.manifest_present && !r.reason.is_empty())
+            );
+        }
         other => panic!("expected fresh install, got {other:?}"),
     }
     assert!(!paths.storage_root().exists());
@@ -116,6 +132,131 @@ fn candidates_are_canonicalized_and_deduplicated() {
     assert!(inspect_candidate(&dirs[0]).is_ok());
     let missing = dir.path().join("missing");
     assert!(legacy_candidate_dirs(&[Some(missing.as_path())]).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn candidate_reports_found_and_resolved_paths_and_instance_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = legacy_tree(&dir.path().join("other-drive"));
+    let base = dir.path().join("cwd");
+    fs::create_dir_all(&base).unwrap();
+    std::os::unix::fs::symlink(&real, base.join("minecraft")).unwrap();
+    let dirs = legacy_candidate_dirs(&[Some(base.as_path())]);
+    assert_eq!(
+        dirs,
+        vec![base.join("minecraft")],
+        "un-resolved path is kept"
+    );
+    let paths = paths_in(&dir.path().join("ferrite"));
+    let (_, candidate, _) = expect_migration(plan(&paths, &dirs).unwrap());
+    assert_eq!(candidate.found_at, base.join("minecraft"));
+    assert_eq!(
+        candidate.path, real,
+        "the resolved path is what gets copied"
+    );
+    assert_eq!(candidate.instance_names, vec!["Survival".to_owned()]);
+}
+
+#[test]
+fn not_enough_space_fails_before_copying() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = legacy_tree(&dir.path().join("old"));
+    let before = snapshot(&source);
+    let paths = paths_in(&dir.path().join("ferrite"));
+    let tiny = || 100_u64;
+    let hooks = Hooks {
+        available_space: Some(&tiny),
+        ..Hooks::default()
+    };
+    let error = run_with_hooks(&paths, &source, &MigrationControl::default(), &hooks).unwrap_err();
+    match &error {
+        MigrationError::NotEnoughSpace {
+            needed, available, ..
+        } => {
+            let total = inspect_candidate(&source).unwrap().total_bytes;
+            assert!(*needed > total, "a margin is added");
+            assert_eq!(*available, 100);
+        }
+        other => panic!("expected NotEnoughSpace, got {other}"),
+    }
+    assert!(error.to_string().contains("100 B free"));
+    assert!(
+        !paths.migration_staging_dir().exists(),
+        "nothing was copied"
+    );
+    assert!(!paths.migration_state_file().exists());
+    assert_eq!(snapshot(&source), before);
+
+    // With enough room the same source migrates.
+    let plenty = || u64::MAX;
+    let hooks = Hooks {
+        available_space: Some(&plenty),
+        ..Hooks::default()
+    };
+    run_with_hooks(&paths, &source, &MigrationControl::default(), &hooks).unwrap();
+}
+
+#[test]
+fn source_changed_during_copy_is_not_committed_and_retry_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = legacy_tree(&dir.path().join("old"));
+    let paths = paths_in(&dir.path().join("ferrite"));
+    // The game writes a new file and deletes another while Ferrite is copying.
+    let game_writes = |source: &Path| {
+        fs::write(
+            source.join("instances/survival/saves/world/session.lock"),
+            b"x",
+        )?;
+        fs::remove_file(source.join("assets/objects/ab/abcdef"))
+    };
+    let hooks = Hooks {
+        before_recheck: Some(&game_writes),
+        ..Hooks::default()
+    };
+    let error = run_with_hooks(&paths, &source, &MigrationControl::default(), &hooks).unwrap_err();
+    assert!(matches!(error, MigrationError::SourceChanged(_)), "{error}");
+    assert!(!paths.storage_root().exists(), "nothing may be committed");
+    assert_eq!(
+        read_state(&paths).unwrap().unwrap().phase,
+        MigrationPhase::Copying
+    );
+
+    // Retry: the staged copy is brought in line with the changed source.
+    let after = snapshot(&source);
+    let (paths, candidate, resuming) = expect_migration(plan(&paths, &[]).unwrap());
+    assert!(resuming);
+    run_migration(&paths, &candidate.path, &MigrationControl::default()).unwrap();
+    assert_eq!(snapshot(paths.storage_root()), after);
+    assert!(
+        !paths
+            .storage_root()
+            .join("assets/objects/ab/abcdef")
+            .exists()
+    );
+}
+
+#[test]
+fn progress_is_indeterminate_outside_copying() {
+    let mut progress = MigrationProgress {
+        step: MigrationStep::Copying,
+        files_done: 1,
+        files_total: 2,
+        bytes_done: 50,
+        bytes_total: 100,
+    };
+    assert_eq!(progress.fraction(), Some(0.5));
+    for step in [
+        MigrationStep::Starting,
+        MigrationStep::Scanning,
+        MigrationStep::Verifying,
+        MigrationStep::Finalizing,
+    ] {
+        progress.step = step;
+        assert_eq!(progress.fraction(), None, "{step:?}");
+    }
+    progress.step = MigrationStep::Done;
+    assert_eq!(progress.fraction(), Some(1.0));
 }
 
 #[test]
@@ -148,11 +289,12 @@ fn happy_path_copies_verifies_and_leaves_source_untouched() {
     let report = run_migration(&paths, &candidate.path, &control).unwrap();
     assert!(!report.already_complete);
     assert_eq!(report.files_copied, 5);
+    assert_eq!(report.instance_count, 1);
     let progress = control.snapshot();
     assert_eq!(progress.step, MigrationStep::Done);
     assert_eq!(progress.files_done, progress.files_total);
     assert_eq!(progress.bytes_done, progress.bytes_total);
-    assert_eq!(progress.fraction(), 1.0);
+    assert_eq!(progress.fraction(), Some(1.0));
 
     assert_eq!(snapshot(paths.storage_root()), before);
     assert_eq!(snapshot(&source), before, "source must be unchanged");
@@ -563,7 +705,14 @@ fn existing_destination_is_never_overwritten() {
     fs::create_dir_all(paths.storage_root()).unwrap();
     fs::write(paths.storage_root().join("mine.txt"), b"mine").unwrap();
     match plan(&paths, std::slice::from_ref(&source)).unwrap() {
-        StartupPlan::Ready { notes, .. } => assert!(!notes.is_empty()),
+        StartupPlan::Ready {
+            notes,
+            ignored_legacy,
+            ..
+        } => {
+            assert!(!notes.is_empty());
+            assert_eq!(ignored_legacy, vec![source.clone()]);
+        }
         other => panic!("expected Ready, got {other:?}"),
     }
     assert!(matches!(
