@@ -24,7 +24,7 @@ Most Minecraft launchers did not fit how I play. I did not want to fork Prism â€
 
 **Active** (wired into the running UI / config):
 
-- `config` appearance + `LayoutConfig`
+- `ui_settings` appearance + `LayoutConfig` (stored in `ui.toml`)
 - `app/layout.rs`
 - Settings Appearance / Layout
 - `background.rs`
@@ -41,6 +41,23 @@ Most Minecraft launchers did not fit how I play. I did not want to fork Prism â€
 Grab a binary from [Releases](https://github.com/Ontogameing/ferrite-launcher/releases) for Linux, Windows, or macOS.
 
 Early development: expect bugs.
+
+## Where Ferrite stores data
+
+Ferrite resolves its directories once at startup from the per-user platform locations
+(never from the current working directory):
+
+| | Linux | Windows | macOS |
+|---|---|---|---|
+| Config (`config.toml`, `ui.toml`) | `~/.config/ferritelauncher/` | `%APPDATA%\Ferrite\Ferrite Launcher\config\` | `~/Library/Application Support/io.Ferrite.Ferrite-Launcher/` |
+| Data (`minecraft/`: instances, versions, libraries, assets) | `~/.local/share/ferritelauncher/` | `%LOCALAPPDATA%\Ferrite\Ferrite Launcher\data\` | `~/Library/Application Support/io.Ferrite.Ferrite-Launcher/` |
+| Cache (downloads, temp files) | `~/.cache/ferritelauncher/` | `%LOCALAPPDATA%\Ferrite\Ferrite Launcher\cache\` | `~/Library/Caches/io.Ferrite.Ferrite-Launcher/` |
+
+Older builds kept data in a `minecraft` folder relative to wherever the launcher was
+started. On first launch Ferrite looks for that folder next to the executable and in
+the current directory, copies it into the data directory (verifying the copy), and
+leaves the old folder untouched. If two different old folders are found you are asked
+which one to use. XDG environment variables are honored on Linux.
 
 ## Building From Source
 

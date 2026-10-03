@@ -11,6 +11,7 @@ mod instances;
 mod layout;
 mod mods;
 mod settings;
+mod startup;
 mod view;
 
 use crate::auth::Account;
@@ -45,7 +46,8 @@ const MUTED: Color32 = Color32::from_rgb(150, 155, 165);
 
 /// Starts Ferrite Launcher in eframe's native window.
 ///
-/// Storage locations are resolved exactly once here and passed down.
+/// Storage locations are resolved exactly once here and passed down. Before the
+/// launcher UI appears, [`startup::StartupApp`] runs the storage migration gate.
 pub fn run() -> eframe::Result {
     let paths = match AppPaths::resolve() {
         Ok(paths) => paths,
@@ -64,7 +66,7 @@ pub fn run() -> eframe::Result {
     eframe::run_native(
         "Ferrite Launcher",
         options,
-        Box::new(|_cc| Ok(Box::new(Ferrite::new(paths)))),
+        Box::new(|_cc| Ok(Box::new(startup::StartupApp::new(paths)))),
     )
 }
 
