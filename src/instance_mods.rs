@@ -192,6 +192,12 @@ fn mods_directory(game_dir: &Path) -> Result<Option<PathBuf>, String> {
     let mut checked = PathBuf::new();
     for component in path.components() {
         checked.push(component.as_os_str());
+        // A Windows prefix (`C:` or `\\?\C:`) is not a directory on its own: `C:` means
+        // the current directory on drive C, and a bare verbatim prefix fails with
+        // "Incorrect function". The root that always follows it is checked next.
+        if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
         match fs::symlink_metadata(&checked) {
             Ok(metadata) if metadata.file_type().is_dir() => {}
             Ok(_) => {
