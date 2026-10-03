@@ -6,6 +6,7 @@
 
 pub mod activity;
 pub mod copy;
+pub mod duplicate;
 pub mod edit;
 pub mod fsutil;
 pub mod instances;
@@ -13,5 +14,6 @@ pub mod manifest;
 pub mod migration;
 pub mod paths;
 pub mod remove;
+pub mod scan;
 
 pub use fsutil::write_atomic;

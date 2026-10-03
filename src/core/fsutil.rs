@@ -247,6 +247,122 @@ pub fn available_space(path: &Path) -> io::Result<u64> {
     }
 }
 
+/// Renames `from` to `to`, failing with [`io::ErrorKind::AlreadyExists`] instead of
+/// replacing anything at `to`, including an empty folder (which plain POSIX `rename`
+/// would silently replace).
+///
+/// Linux uses `renameat2(RENAME_NOREPLACE)` (raw syscall, so old glibc and musl
+/// work), macOS `renamex_np(RENAME_EXCL)`, Windows `MoveFileExW` without
+/// `MOVEFILE_REPLACE_EXISTING`. Where the kernel or file system doesn't support the
+/// exclusive form (`EINVAL`/`ENOSYS`/`ENOTSUP`, e.g. some network or FUSE mounts),
+/// it falls back to checking that `to` doesn't exist right before a plain rename;
+/// that leaves a narrow race, which callers accept for folders they just allocated.
+pub fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    match rename_exclusive(from, to) {
+        Err(error) if exclusive_rename_unsupported(&error) => {
+            if fs::symlink_metadata(to).is_ok() {
+                return Err(already_exists(to));
+            }
+            fs::rename(from, to)
+        }
+        other => other,
+    }
+}
+
+fn already_exists(to: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("{} already exists", to.display()),
+    )
+}
+
+#[cfg(unix)]
+fn exclusive_rename_unsupported(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EINVAL | libc::ENOSYS | libc::ENOTSUP)
+    )
+}
+
+#[cfg(not(unix))]
+fn exclusive_rename_unsupported(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::Unsupported
+}
+
+#[cfg(unix)]
+fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn rename_exclusive(from: &Path, to: &Path) -> io::Result<()> {
+    /// `RENAME_NOREPLACE` from `<linux/fs.h>`.
+    const RENAME_NOREPLACE: libc::c_uint = 1;
+    let (from_c, to_c) = (c_path(from)?, c_path(to)?);
+    // SAFETY: valid NUL-terminated paths; AT_FDCWD is ignored for absolute paths.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            from_c.as_ptr(),
+            libc::AT_FDCWD,
+            to_c.as_ptr(),
+            RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+fn rename_exclusive(from: &Path, to: &Path) -> io::Result<()> {
+    let (from_c, to_c) = (c_path(from)?, c_path(to)?);
+    // SAFETY: valid NUL-terminated paths.
+    if unsafe { libc::renamex_np(from_c.as_ptr(), to_c.as_ptr(), libc::RENAME_EXCL) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn rename_exclusive(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide = |path: &Path| -> Vec<u16> { path.as_os_str().encode_wide().chain([0]).collect() };
+    let (from_w, to_w) = (wide(from), wide(to));
+    // SAFETY: NUL-terminated UTF-16 paths. Flags 0: no replace, same volume only.
+    let ok = unsafe {
+        windows_sys::Win32::Storage::FileSystem::MoveFileExW(from_w.as_ptr(), to_w.as_ptr(), 0)
+    };
+    if ok != 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    // ERROR_FILE_EXISTS (80) / ERROR_ALREADY_EXISTS (183).
+    if matches!(error.raw_os_error(), Some(80 | 183)) {
+        return Err(already_exists(to));
+    }
+    Err(error)
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    windows
+)))]
+fn rename_exclusive(_from: &Path, _to: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no exclusive rename on this platform",
+    ))
+}
+
 /// Windows reparse tag of a symbolic link (`IO_REPARSE_TAG_SYMLINK`).
 pub const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
 /// Windows reparse tag of a junction / mount point (`IO_REPARSE_TAG_MOUNT_POINT`).
@@ -281,6 +397,34 @@ pub fn is_link_like(metadata: &fs::Metadata) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rename_no_replace_moves_and_refuses_existing_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("staging");
+        fs::create_dir(&from).unwrap();
+        fs::write(from.join("file"), b"data").unwrap();
+
+        // An existing empty folder is not replaced (plain rename would replace it).
+        let empty = dir.path().join("empty");
+        fs::create_dir(&empty).unwrap();
+        let error = rename_no_replace(&from, &empty).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(from.join("file").exists());
+        assert_eq!(fs::read_dir(&empty).unwrap().count(), 0);
+
+        // Nor is an existing file.
+        let file = dir.path().join("file");
+        fs::write(&file, b"keep").unwrap();
+        let error = rename_no_replace(&from, &file).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&file).unwrap(), b"keep");
+
+        let to = dir.path().join("final");
+        rename_no_replace(&from, &to).unwrap();
+        assert!(!from.exists());
+        assert_eq!(fs::read(to.join("file")).unwrap(), b"data");
+    }
 
     #[test]
     fn write_atomic_replaces_and_leaves_no_temporaries() {
