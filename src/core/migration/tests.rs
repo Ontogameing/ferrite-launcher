@@ -710,7 +710,7 @@ fn existing_destination_is_never_overwritten() {
             ignored_legacy,
             ..
         } => {
-            assert!(!notes.is_empty());
+            assert!(notes.is_empty(), "reported via ignored_legacy: {notes:?}");
             assert_eq!(ignored_legacy, vec![source.clone()]);
         }
         other => panic!("expected Ready, got {other:?}"),

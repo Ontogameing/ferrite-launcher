@@ -175,6 +175,7 @@ impl Ferrite {
             Widget::TopBar => self.top_bar(ui),
             Widget::PageBody => {
                 self.update_banner(ui);
+                self.startup_cards_ui(ui);
                 match self.current_page {
                     Page::Play => self.play_page(ui),
                     Page::Instances => self.instances_page(ui),

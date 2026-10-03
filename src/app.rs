@@ -221,6 +221,9 @@ struct Ferrite {
     auth: AccountSession,
     /// A short result/status message displayed at the bottom of the window.
     running_text: String,
+    /// One-time cards from the startup storage gate (data moved, old data not
+    /// moved), shown above the page until dismissed.
+    startup_cards: Vec<startup::StartupCard>,
     /// The page currently selected in the sidebar.
     current_page: Page,
     /// The label of the active settings subsection.
@@ -384,6 +387,7 @@ impl Ferrite {
             },
             icons: IconCache::default(),
             running_text,
+            startup_cards: Vec::new(),
             current_page: Page::Play,
             current_settings_tab: String::from("Global"),
             is_global_checked: false,
@@ -494,6 +498,7 @@ impl eframe::App for Ferrite {
                         ui.set_width(content_width);
                         ui.set_min_height(content_height);
                         self.update_banner(ui);
+                        self.startup_cards_ui(ui);
                         let page_height = (ui.available_height() - 34.0).max(0.0);
                         ui.allocate_ui_with_layout(
                             egui::vec2(content_width, page_height),
@@ -567,6 +572,7 @@ mod tests {
             auth: AccountSession::default(),
             icons: IconCache::default(),
             running_text: String::new(),
+            startup_cards: Vec::new(),
             current_page: Page::Mods,
             current_settings_tab: "Global".into(),
             is_global_checked: false,

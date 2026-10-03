@@ -67,9 +67,12 @@ is in progress) `.migration-staging/`. The cache is
 
 Older builds kept data in a `minecraft` folder relative to wherever the launcher was
 started. On first launch Ferrite looks for that folder next to the executable and in
-the current directory, copies it into the data directory (verifying the copy), and
-leaves the old folder untouched. If two different old folders are found you are asked
-which one to use.
+the current directory, checks there is enough free space, copies it into the data
+directory (verifying the copy), and leaves the old folder untouched. If two different
+old folders are found you are asked which one to move. The move can be paused (or the
+window closed) and resumes on the next launch; if it can't finish, "Use old data this
+time" opens Ferrite with the old folder and offers the move again next time. Ferrite
+never deletes the old folder; remove it yourself once everything works.
 
 ## Building From Source
 

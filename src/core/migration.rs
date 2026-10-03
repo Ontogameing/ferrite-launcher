@@ -607,7 +607,8 @@ pub enum StartupPlan {
     /// Use these paths now.
     Ready {
         paths: AppPaths,
-        /// Explanations of anything noteworthy.
+        /// Explanations of anything noteworthy that `rejected` and `ignored_legacy`
+        /// do not already cover.
         notes: Vec<String>,
         rejected: Vec<Rejection>,
         /// Valid old data folders that were *not* migrated because the destination
@@ -685,9 +686,10 @@ pub fn plan(paths: &AppPaths, candidate_dirs: &[PathBuf]) -> Result<StartupPlan,
                     .and_then(|source| match inspect_candidate(source) {
                         Ok(candidate) => Some(candidate),
                         Err(rejection) => {
-                            notes.push(format!(
-                                "An interrupted migration cannot resume: {rejection}"
-                            ));
+                            // Reported through `rejected`, which the UI explains.
+                            eprintln!(
+                                "Ferrite: an interrupted migration cannot resume: {rejection}"
+                            );
                             rejected.push(rejection);
                             None
                         }
@@ -733,8 +735,8 @@ pub fn plan(paths: &AppPaths, candidate_dirs: &[PathBuf]) -> Result<StartupPlan,
                     .collect::<Vec<_>>()
                     .join(", ")
             );
+            // Reported through `ignored_legacy`, which the UI shows as a card.
             eprintln!("Ferrite: {note}");
-            notes.push(note);
         }
         return Ok(StartupPlan::Ready {
             paths: paths.clone(),
@@ -1383,6 +1385,9 @@ fn copy_tree(
     if !uncopyable.is_empty() {
         return Err(MigrationError::UncopyableFiles(uncopyable));
     }
+    // Every file is copied; flushing and checking follow, so stop showing a full
+    // progress bar as if the move were done.
+    control.update(|progress| progress.step = MigrationStep::Verifying);
     // Persist the partial->final renames: sync every staged directory.
     for dir in scan.dirs.iter().rev() {
         let target = staged.join(dir);

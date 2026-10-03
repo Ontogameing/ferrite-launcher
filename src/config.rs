@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Top-level `config.toml` tables that belong to the frontend (`ui.toml`) and are only
@@ -289,7 +289,14 @@ fn legacy_ui_tables(paths: &AppPaths) -> Option<toml::Table> {
 pub fn open_config_folder(paths: &AppPaths) -> Result<(), ConfigError> {
     let folder = paths.config_dir();
     fs::create_dir_all(folder)?;
+    open_folder(folder)
+}
 
+/// Opens `folder` in the platform file manager (Explorer, Finder, or `xdg-open`).
+///
+/// The path is passed as a single argument, never through a shell, so spaces and
+/// special characters are safe. The folder is not created.
+pub fn open_folder(folder: &Path) -> Result<(), ConfigError> {
     #[cfg(target_os = "windows")]
     let program = "explorer";
     #[cfg(target_os = "macos")]
