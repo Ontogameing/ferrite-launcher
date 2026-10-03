@@ -41,7 +41,6 @@ use reqwest::blocking::Client;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use zip::{ZipArchive, ZipWriter};
 
 const FORGE_MAVEN: &str = "https://maven.minecraftforge.net";
@@ -218,12 +217,7 @@ fn run_installer(installer: &Path, minecraft_dir: &Path) -> Result<()> {
         minecraft_abs.display()
     );
 
-    let output = Command::new("java")
-        .arg("-jar")
-        .arg(&patched)
-        .arg("--installClient")
-        .arg(&minecraft_abs)
-        .output()?;
+    let output = super::installer_command(&patched, &minecraft_abs).output()?;
 
     if patched != installer_abs {
         let _ = fs::remove_file(&patched);

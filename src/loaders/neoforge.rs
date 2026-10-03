@@ -30,7 +30,6 @@ use ferrite_launcher::core::paths::AppPaths;
 use reqwest::blocking::Client;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 const NEO_MAVEN: &str = "https://maven.neoforged.net/releases";
 const LEGACY_META: &str =
@@ -248,12 +247,7 @@ fn run_installer(installer: &Path, minecraft_dir: &Path) -> Result<()> {
     let minecraft_abs = fs::canonicalize(minecraft_dir)?;
     let installer_abs = fs::canonicalize(installer)?;
 
-    let output = Command::new("java")
-        .arg("-jar")
-        .arg(&installer_abs)
-        .arg("--installClient")
-        .arg(&minecraft_abs)
-        .output()?;
+    let output = super::installer_command(&installer_abs, &minecraft_abs).output()?;
 
     if !output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);

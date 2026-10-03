@@ -45,6 +45,23 @@ mod quilt;
 use crate::minecraft::{self, Result};
 use ferrite_launcher::core::paths::AppPaths;
 use std::path::Path;
+use std::process::Command;
+
+/// Builds `java -jar <installer> --installClient <minecraft dir>` for the official
+/// Forge/NeoForge installers.
+///
+/// Every path is its own argv element (no shell, no string concatenation), so paths
+/// containing spaces, such as `...\Ferrite\Ferrite Launcher\data\minecraft` on
+/// Windows, reach Java intact.
+pub(crate) fn installer_command(installer: &Path, minecraft_dir: &Path) -> Command {
+    let mut command = Command::new("java");
+    command
+        .arg("-jar")
+        .arg(installer)
+        .arg("--installClient")
+        .arg(minecraft_dir);
+    command
+}
 
 /// Loader implementation to install, inspect, or launch.
 ///
@@ -300,6 +317,24 @@ fn loader_version_from_metadata(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn installer_command_keeps_paths_with_spaces_as_single_arguments() {
+        let installer = Path::new("/tmp/Ferrite Launcher/cache/downloads/forge installer.jar");
+        let minecraft = Path::new("/tmp/Ferrite Launcher/data/minecraft");
+        let command = super::installer_command(installer, minecraft);
+        assert_eq!(command.get_program(), "java");
+        let args: Vec<&std::ffi::OsStr> = command.get_args().collect();
+        assert_eq!(
+            args,
+            [
+                std::ffi::OsStr::new("-jar"),
+                installer.as_os_str(),
+                std::ffi::OsStr::new("--installClient"),
+                minecraft.as_os_str(),
+            ]
+        );
+    }
+
     use super::*;
 
     #[test]

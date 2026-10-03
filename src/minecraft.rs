@@ -1367,6 +1367,90 @@ mod tests {
     }
 
     #[test]
+    fn launch_paths_with_spaces_stay_single_arguments() {
+        let base = std::env::temp_dir().join(format!(
+            "ferrite space test {}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let game_dir = base.join("Ferrite Launcher").join("data").join("minecraft");
+        let natives = "/x/Ferrite Launcher/natives";
+        let assets = "/x/Ferrite Launcher/assets";
+        let classpath = "/x/Ferrite Launcher/libraries/a.jar:/x/Ferrite Launcher/client.jar";
+        let placeholders = HashMap::from([
+            ("classpath".to_string(), classpath.to_string()),
+            ("natives_directory".to_string(), natives.to_string()),
+            ("game_assets".to_string(), assets.to_string()),
+            ("assets_root".to_string(), assets.to_string()),
+        ]);
+
+        // Modern metadata: templated arguments are substituted per element.
+        let command = game_command(
+            &metadata_with_game_dir_argument(),
+            placeholders.clone(),
+            &game_dir,
+            None,
+        )
+        .unwrap();
+        let canonical = fs::canonicalize(&game_dir).unwrap();
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "-cp",
+                classpath,
+                "example.Main",
+                "--gameDir",
+                canonical.to_string_lossy().as_ref()
+            ]
+        );
+
+        // Legacy metadata: `minecraftArguments` is split on whitespace *before*
+        // substitution, so values containing spaces stay one argument each.
+        let legacy: VersionMetadata = serde_json::from_str(
+            r#"{
+                "id": "legacy",
+                "type": "release",
+                "mainClass": "net.minecraft.client.Minecraft",
+                "assets": "legacy",
+                "assetIndex": { "url": "https://example.invalid/assets.json" },
+                "downloads": {
+                    "client": { "url": "https://example.invalid/client.jar", "size": 0 }
+                },
+                "libraries": [],
+                "minecraftArguments": "--gameDir ${game_directory} --assetsDir ${game_assets}"
+            }"#,
+        )
+        .unwrap();
+        let command = game_command(&legacy, placeholders, &game_dir, None).unwrap();
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                format!("-Djava.library.path={natives}").as_str(),
+                "-cp",
+                classpath,
+                "net.minecraft.client.Minecraft",
+                "--gameDir",
+                canonical.to_string_lossy().as_ref(),
+                "--assetsDir",
+                assets,
+            ]
+        );
+        assert_eq!(command.get_current_dir(), Some(canonical.as_path()));
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
     fn game_command_uses_explicit_directory_for_argument_and_cwd() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
