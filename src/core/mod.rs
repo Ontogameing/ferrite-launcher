@@ -15,5 +15,6 @@ pub mod migration;
 pub mod paths;
 pub mod remove;
 pub mod scan;
+pub mod sweep;
 
 pub use fsutil::write_atomic;

@@ -295,6 +295,23 @@ struct Ferrite {
     close_after_remove: bool,
 }
 
+/// Removes stale import/duplicate temp folders from `instances/` in the background.
+/// Silent: the outcome is only logged.
+fn spawn_temp_sweep(paths: &AppPaths) {
+    use ferrite_launcher::core::sweep;
+    let paths = paths.clone();
+    let spawned = std::thread::Builder::new()
+        .name("temp-sweep".into())
+        .spawn(move || {
+            if let Err(error) = sweep::sweep_stale_temp_dirs(&paths, sweep::DEFAULT_MIN_AGE) {
+                eprintln!("Ferrite: could not check for leftover temp folders: {error}");
+            }
+        });
+    if let Err(error) = spawned {
+        eprintln!("Ferrite: could not start the temp folder sweep: {error}");
+    }
+}
+
 impl Ferrite {
     /// Loads startup state, performs the initial version lookup, and optionally starts
     /// update checking. Recoverable config/instance failures become visible UI status.
@@ -375,6 +392,7 @@ impl Ferrite {
             running_text = warning;
         }
         let selected_instance = (!instances.is_empty()).then_some(0);
+        spawn_temp_sweep(&paths);
 
         let mut app = Self {
             paths,
