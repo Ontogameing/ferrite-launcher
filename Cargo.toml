@@ -2,6 +2,9 @@
 name = "ferrite-launcher"
 version = "0.1.0"
 edition = "2024"
+license = "GPL-3.0-only"
+repository = "https://github.com/Ontogameing/ferrite-launcher"
+description = "A lightweight, customizable Minecraft launcher written in Rust"
 
 [dependencies]
 eframe = "0.36.1"

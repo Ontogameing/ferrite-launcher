@@ -156,8 +156,13 @@ pub fn save(profiles: &[InstanceProfile]) -> Result<(), InstanceError> {
 ///
 /// Existing directories are accepted. Other filesystem conflicts and permission
 /// failures are returned without changing profile metadata.
+///
+/// Security: refuses to create unless the resolved game directory is a strict
+/// lexical child of the instances root (same gate as [`delete_game_dir`]).
 pub fn create_game_dir(profile: &InstanceProfile) -> Result<(), InstanceError> {
-    fs::create_dir_all(profile.game_dir())?;
+    let path = profile.game_dir();
+    ensure_game_dir_contained(&path)?;
+    fs::create_dir_all(&path)?;
     Ok(())
 }
 
@@ -168,12 +173,66 @@ pub fn create_game_dir(profile: &InstanceProfile) -> Result<(), InstanceError> {
 /// profile with its files unexpectedly deleted. The existence check is only for
 /// convenient missing-path handling, not a synchronization or security boundary;
 /// deletion errors are returned to the caller.
+///
+/// Security: refuses to delete unless the resolved game directory is a strict
+/// lexical child of the instances root. This blocks malicious `directory`
+/// values restored from metadata (absolute paths, `..` traversal) from causing
+/// `remove_dir_all` outside the launcher-owned instance tree. Create uses the
+/// same containment gate.
 pub fn delete_game_dir(profile: &InstanceProfile) -> Result<(), InstanceError> {
     let path = profile.game_dir();
+    ensure_game_dir_contained(&path)?;
     if path.exists() {
-        fs::remove_dir_all(path)?;
+        fs::remove_dir_all(&path)?;
     }
     Ok(())
+}
+
+/// Rejects paths that escape [`instances_dir`] via absolute components or `..`.
+/// Used by both create and delete so neither can act outside the instances tree.
+fn ensure_game_dir_contained(path: &Path) -> Result<(), InstanceError> {
+    let root = instances_dir();
+    if is_contained_instance_path(path, &root) {
+        Ok(())
+    } else {
+        Err(InstanceError::Io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to modify path outside instances root ({}): {}",
+                root.display(),
+                path.display()
+            ),
+        )))
+    }
+}
+
+/// Lexical containment check (no filesystem access / canonicalize).
+///
+/// Requires `path` to normalize to a strict child of `root` (not equal to root).
+fn is_contained_instance_path(path: &Path, root: &Path) -> bool {
+    let path = lexical_normalize(path);
+    let root = lexical_normalize(root);
+    if path.is_absolute() != root.is_absolute() {
+        return false;
+    }
+    path.starts_with(&root) && path.as_os_str() != root.as_os_str()
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+            Component::RootDir => out.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = out.pop();
+            }
+            Component::Normal(part) => out.push(part),
+        }
+    }
+    out
 }
 
 /// Location of the JSON profile array, relative to the current working directory.
@@ -215,7 +274,8 @@ fn directory_slug(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::directory_slug;
+    use super::*;
+    use std::path::Path;
 
     #[test]
     fn directory_slugs_do_not_contain_path_separators() {
@@ -224,5 +284,77 @@ mod tests {
             "my-----fabric-profile"
         );
         assert_eq!(directory_slug("测试"), "instance");
+    }
+
+    #[test]
+    fn delete_containment_allows_normal_instance_dirs() {
+        let root = Path::new("minecraft").join("instances");
+        assert!(is_contained_instance_path(&root.join("my-fabric"), &root));
+        assert!(is_contained_instance_path(
+            &root.join("nested").join("ok"),
+            &root
+        ));
+    }
+
+    #[test]
+    fn delete_containment_rejects_traversal_and_absolute_escapes() {
+        let root = Path::new("minecraft").join("instances");
+        // Parent traversal after join: minecraft/instances/../../etc
+        assert!(!is_contained_instance_path(
+            &root.join("..").join("..").join("etc"),
+            &root
+        ));
+        // Equal to root itself must not be deleted as a "game dir"
+        assert!(!is_contained_instance_path(&root, &root));
+        // Absolute destination vs relative root
+        assert!(!is_contained_instance_path(Path::new("/tmp/evil"), &root));
+        // Soft link style escape via .. inside name
+        assert!(!is_contained_instance_path(
+            &Path::new("minecraft")
+                .join("instances")
+                .join("..")
+                .join("secrets"),
+            &root
+        ));
+    }
+
+    #[test]
+    fn delete_game_dir_refuses_escaped_profile_directory() {
+        let profile = InstanceProfile {
+            name: "escape".to_owned(),
+            version: "1.20.1".to_owned(),
+            loader: "Vanilla".to_owned(),
+            directory: "../../outside-ferrite-delete-target".to_owned(),
+        };
+        let err = delete_game_dir(&profile).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("outside instances root")
+                || msg.contains("PermissionDenied")
+                || msg.contains("refusing"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn create_game_dir_refuses_escaped_profile_directory() {
+        let profile = InstanceProfile {
+            name: "escape".to_owned(),
+            version: "1.20.1".to_owned(),
+            loader: "Vanilla".to_owned(),
+            directory: "../../outside-ferrite-create-target".to_owned(),
+        };
+        let err = create_game_dir(&profile).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("outside instances root")
+                || msg.contains("PermissionDenied")
+                || msg.contains("refusing"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("modify") || msg.contains("refusing"),
+            "expected generalized refusal message, got: {msg}"
+        );
     }
 }

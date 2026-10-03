@@ -1,0 +1,5 @@
+# Reproducible formatting for Ferrite Launcher CI (`cargo fmt --check`).
+edition = "2024"
+max_width = 100
+use_small_heuristics = "Default"
+newline_style = "Unix"
