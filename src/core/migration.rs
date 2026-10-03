@@ -1013,11 +1013,21 @@ fn run_with_hooks(
     if exists_no_follow(&dest) {
         return Err(MigrationError::DestinationExists(dest));
     }
-    fs::rename(&staged, &dest).map_err(io_ctx(format!(
-        "move {} to {}",
-        staged.display(),
-        dest.display()
-    )))?;
+    // Never replaces anything at the destination, on any attempt; on Windows a brief
+    // lock from antivirus/indexing (errors 5/32) is retried for up to ~1.5 s.
+    match fsutil::rename_no_replace_with_retry(&staged, &dest) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(MigrationError::DestinationExists(dest));
+        }
+        Err(error) => {
+            return Err(io_ctx(format!(
+                "move {} to {}",
+                staged.display(),
+                dest.display()
+            ))(error));
+        }
+    }
     // Persist the commit rename in both parent directories.
     fsutil::sync_dir(data_dir).map_err(io_ctx(format!("sync {}", data_dir.display())))?;
     fsutil::sync_dir(&staging_root).map_err(io_ctx(format!("sync {}", staging_root.display())))?;

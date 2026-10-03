@@ -269,6 +269,44 @@ pub fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
+/// [`rename_no_replace`] that, on Windows only, retries briefly when the OS reports
+/// `ERROR_ACCESS_DENIED` (5) or `ERROR_SHARING_VIOLATION` (32): antivirus scanners,
+/// the search indexer, and Explorer often hold a freshly written folder open for a
+/// moment. Backoff 50, 100, 200, 400, 800 ms (about 1.5 s in total). Every attempt is
+/// a no-replace rename, so a retry can never replace an existing folder; any other
+/// error (including `AlreadyExists`) fails at once.
+pub fn rename_no_replace_with_retry(from: &Path, to: &Path) -> io::Result<()> {
+    retry_transient(
+        cfg!(windows),
+        &mut || rename_no_replace(from, to),
+        &mut std::thread::sleep,
+    )
+}
+
+/// Backoff schedule for [`rename_no_replace_with_retry`] (sum stays under ~2 s).
+const RETRY_BACKOFF_MS: [u64; 5] = [50, 100, 200, 400, 800];
+
+/// Runs `attempt`, retrying per [`RETRY_BACKOFF_MS`] while `retry_enabled` and the
+/// error is a raw OS error 5 or 32. `sleep` is injected for tests.
+pub(crate) fn retry_transient(
+    retry_enabled: bool,
+    attempt: &mut dyn FnMut() -> io::Result<()>,
+    sleep: &mut dyn FnMut(std::time::Duration),
+) -> io::Result<()> {
+    let mut delays = RETRY_BACKOFF_MS.iter();
+    loop {
+        match attempt() {
+            Err(error) if retry_enabled && matches!(error.raw_os_error(), Some(5 | 32)) => {
+                let Some(delay) = delays.next() else {
+                    return Err(error);
+                };
+                sleep(std::time::Duration::from_millis(*delay));
+            }
+            other => return other,
+        }
+    }
+}
+
 fn already_exists(to: &Path) -> io::Error {
     io::Error::new(
         io::ErrorKind::AlreadyExists,
@@ -397,6 +435,92 @@ pub fn is_link_like(metadata: &fs::Metadata) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transient_errors_are_retried_with_capped_backoff() {
+        use std::time::Duration;
+        // Two sharing violations, then success.
+        let mut calls = 0;
+        let mut slept = Vec::new();
+        let result = retry_transient(
+            true,
+            &mut || {
+                calls += 1;
+                if calls <= 2 {
+                    Err(io::Error::from_raw_os_error(32))
+                } else {
+                    Ok(())
+                }
+            },
+            &mut |delay| slept.push(delay),
+        );
+        assert!(result.is_ok());
+        assert_eq!(calls, 3);
+        assert_eq!(
+            slept,
+            [Duration::from_millis(50), Duration::from_millis(100)]
+        );
+
+        // Access denied forever: gives up after the schedule, under ~2 s in total.
+        let mut calls = 0;
+        let mut total = Duration::ZERO;
+        let result = retry_transient(
+            true,
+            &mut || {
+                calls += 1;
+                Err(io::Error::from_raw_os_error(5))
+            },
+            &mut |delay| total += delay,
+        );
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(5));
+        assert_eq!(calls, RETRY_BACKOFF_MS.len() + 1);
+        assert!(total <= Duration::from_secs(2), "{total:?}");
+
+        // Other errors (including AlreadyExists) fail at once, as does a disabled retry.
+        for error in [
+            io::Error::new(io::ErrorKind::AlreadyExists, "exists"),
+            io::Error::from_raw_os_error(2),
+        ] {
+            let mut calls = 0;
+            let mut pending = Some(error);
+            let result = retry_transient(
+                true,
+                &mut || {
+                    calls += 1;
+                    Err(pending.take().unwrap())
+                },
+                &mut |_| panic!("must not sleep"),
+            );
+            assert!(result.is_err());
+            assert_eq!(calls, 1);
+        }
+        let mut calls = 0;
+        let result = retry_transient(
+            false,
+            &mut || {
+                calls += 1;
+                Err(io::Error::from_raw_os_error(32))
+            },
+            &mut |_| panic!("must not sleep"),
+        );
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn retrying_rename_never_replaces_an_existing_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("staging");
+        let to = dir.path().join("final");
+        fs::create_dir(&from).unwrap();
+        fs::create_dir(&to).unwrap();
+        let error = rename_no_replace_with_retry(&from, &to).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(from.is_dir());
+        fs::remove_dir(&to).unwrap();
+        rename_no_replace_with_retry(&from, &to).unwrap();
+        assert!(to.is_dir() && !from.exists());
+    }
 
     #[test]
     fn rename_no_replace_moves_and_refuses_existing_targets() {

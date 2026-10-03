@@ -456,7 +456,7 @@ fn copy_with_hooks(
     if let Some(hook) = hooks.before_rename {
         hook();
     }
-    match fsutil::rename_no_replace(&staging, &target) {
+    match fsutil::rename_no_replace_with_retry(&staging, &target) {
         Ok(()) => guard.disarm(),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             return Err(DuplicateError::TargetExists(target));
