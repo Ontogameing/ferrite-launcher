@@ -10,6 +10,7 @@ mod auth;
 mod instances;
 mod layout;
 mod mods;
+mod remove;
 mod settings;
 mod startup;
 mod view;
@@ -284,6 +285,14 @@ struct Ferrite {
     icons: IconCache,
     /// Live IPC connection governed by `config.discord.rich_presence`.
     discord: Option<DiscordPresence>,
+    /// Which instance is owned by which background operation (delete, ...).
+    activity: ferrite_launcher::core::activity::ActivityTracker,
+    /// The open delete dialog, if any.
+    remove_dialog: Option<remove::RemoveDialog>,
+    /// The trash/delete worker; its presence also defers closing the window.
+    remove_task: Option<remove::RemoveTask>,
+    /// The window was asked to close while a removal was running.
+    close_after_remove: bool,
 }
 
 impl Ferrite {
@@ -427,6 +436,10 @@ impl Ferrite {
             pending_uninstall: None,
             mod_task: None,
             discord,
+            activity: Default::default(),
+            remove_dialog: None,
+            remove_task: None,
+            close_after_remove: false,
         };
         if app.config.launcher.check_for_updates {
             app.start_update_check(false);
@@ -441,6 +454,8 @@ impl eframe::App for Ferrite {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_instance_creation();
         self.poll_pack_task();
+        self.poll_remove_task();
+        self.intercept_close_while_removing(ui.ctx());
         self.poll_mod_task();
         self.poll_auth();
         self.poll_update_check();
@@ -520,9 +535,11 @@ impl eframe::App for Ferrite {
         self.import_pack_window(ui.ctx());
         self.export_pack_window(ui.ctx());
         self.uninstall_window(ui.ctx());
+        self.remove_window(ui.ctx());
         // Channels do not wake egui directly, so poll promptly while workers can send.
         if self.instance_creation_task.is_some()
             || self.pack_task.is_some()
+            || self.remove_task.is_some()
             || self.mod_task.is_some()
             || self.auth.task.is_some()
             || self.update_task.is_some()
@@ -609,6 +626,10 @@ mod tests {
             pending_uninstall: None,
             mod_task: None,
             discord: None,
+            activity: Default::default(),
+            remove_dialog: None,
+            remove_task: None,
+            close_after_remove: false,
         }
     }
 

@@ -22,6 +22,10 @@ directories = "6.0"
 toml = "0.8"
 rfd = "0.15"
 semver = "1"
+# Moves deleted instances to the OS trash (Recycle Bin / Trash / freedesktop trash).
+# Default features: COM apartment-threaded init on Windows (Ferrite calls it on a
+# dedicated thread) and DeletionDate in freedesktop .trashinfo files.
+trash = "5.2.9"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

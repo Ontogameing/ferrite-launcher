@@ -12,6 +12,9 @@ use crate::instances::InstanceProfile;
 use crate::loaders::ModLoader;
 use crate::packs::{ExportOptions, ImportOptions, PackFormat, PackTarget};
 use eframe::egui::{self, Color32, RichText};
+use ferrite_launcher::core::activity::{
+    GlobalBusy, InstanceAction, InstanceStatus, disabled_reason,
+};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, TryRecvError};
 
@@ -365,15 +368,23 @@ impl Ferrite {
             || self.instance_creation_task.is_some()
             || self.mod_task.is_some()
             || self.pending_uninstall.is_some()
-            || crate::minecraft::is_running()
         {
-            self.pack_status = Some("Stop Minecraft and finish other instance work first.".into());
+            self.pack_status = Some("Finish other instance work first.".into());
             return;
         }
         let Some(profile) = self.selected_instance().cloned() else {
             self.pack_status = Some("Select an instance to export.".into());
             return;
         };
+        // Only this instance's own game blocks its export (checked when it starts).
+        if let Some(reason) = disabled_reason(
+            InstanceAction::Export,
+            &profile.name,
+            &self.instance_status(&profile),
+        ) {
+            self.pack_status = Some(reason);
+            return;
+        }
         let mut output = PathBuf::from(self.pack_path.trim());
         if self.pack_path.trim().is_empty() {
             self.pack_status = Some("Enter an output archive path.".into());
@@ -567,51 +578,6 @@ impl Ferrite {
         }
     }
 
-    /// Removes a profile transactionally from the index, then best-effort deletes files.
-    pub(super) fn remove_selected(&mut self) {
-        if self.mod_task.is_some()
-            || self.pending_uninstall.is_some()
-            || self.pack_busy()
-            || crate::minecraft::is_running()
-        {
-            self.running_text =
-                "Stop Minecraft and finish mod management before removing instances.".into();
-            return;
-        }
-        let Some(index) = self.selected_instance else {
-            return;
-        };
-
-        // Persist logical removal first; restore memory if the index write cannot commit.
-        let removed = self.instances.remove(index);
-        if let Err(error) =
-            crate::instances::save(&self.paths, &self.instances, &self.skipped_instances)
-        {
-            self.instances.insert(index, removed);
-            self.running_text = format!("Failed to remove instance: {error}");
-            return;
-        }
-
-        if self
-            .mod_target
-            .as_ref()
-            .is_some_and(|target| target.directory() == removed.directory())
-        {
-            self.mod_target = None;
-            self.installed_mods = None;
-        }
-        self.selected_instance = self
-            .instances
-            .get(index)
-            .map(|_| index)
-            .or_else(|| index.checked_sub(1));
-        let name = removed.name.clone();
-        self.running_text = match crate::instances::delete_game_dir(&self.paths, &removed) {
-            Ok(()) => format!("Removed instance '{name}'."),
-            Err(error) => format!("Removed '{name}', but could not delete its files: {error}"),
-        };
-    }
-
     /// Draws profile cards and executes at most one deferred card action afterward.
     pub(super) fn instances_page(&mut self, ui: &mut egui::Ui) {
         let muted = self.muted_color();
@@ -650,8 +616,14 @@ impl Ferrite {
 
         // Defer mutations until iteration releases its immutable borrow of `instances`.
         let mut launch = false;
-        let mut remove = false;
+        let mut remove = None;
         let mut export = false;
+        let mut open_folder = None;
+        let statuses: Vec<InstanceStatus> = self
+            .instances
+            .iter()
+            .map(|instance| self.instance_status(instance))
+            .collect();
         let mut mods = None;
         let mod_idle =
             self.mod_task.is_none() && self.pending_uninstall.is_none() && !self.pack_busy();
@@ -698,39 +670,42 @@ impl Ferrite {
                             ))
                             .color(muted),
                         );
+                        let status = statuses[index];
+                        let reason = |action| disabled_reason(action, &instance.name, &status);
+                        // Draws one action button, disabled with its reason when needed.
+                        let button = |ui: &mut egui::Ui, label: &str, action, extra: bool| {
+                            let reason = reason(action);
+                            let response =
+                                ui.add_enabled(extra && reason.is_none(), egui::Button::new(label));
+                            let clicked = response.clicked();
+                            if let Some(reason) = reason {
+                                response.on_disabled_hover_text(reason);
+                            }
+                            clicked
+                        };
                         ui.horizontal(|ui| {
-                            if ui
-                                .add_enabled(mod_idle, egui::Button::new("Play"))
-                                .clicked()
-                            {
+                            if button(ui, "Play", InstanceAction::Play, mod_idle) {
                                 self.selected_instance = Some(index);
                                 launch = true;
                             }
-                            if ui
-                                .add_enabled(mod_idle, egui::Button::new("Mods"))
-                                .clicked()
-                            {
+                            if button(ui, "Mods", InstanceAction::Mods, mod_idle) {
                                 mods = Some(instance.clone());
                             }
-                            if ui
-                                .add_enabled(
-                                    mod_idle && !crate::minecraft::is_running(),
-                                    egui::Button::new("Export"),
-                                )
-                                .clicked()
-                            {
+                            if button(ui, "Open folder", InstanceAction::OpenFolder, true) {
+                                open_folder = Some(instance.game_dir(&self.paths));
+                            }
+                            if button(ui, "Export", InstanceAction::Export, true) {
                                 self.selected_instance = Some(index);
                                 export = true;
                             }
-                            if ui
-                                .add_enabled(
-                                    mod_idle && !crate::minecraft::is_running(),
-                                    egui::Button::new("Remove"),
-                                )
-                                .clicked()
-                            {
+                            let delete_action = if status.folder_missing {
+                                InstanceAction::RemoveFromList
+                            } else {
+                                InstanceAction::Delete
+                            };
+                            if button(ui, "Remove", delete_action, true) {
                                 self.selected_instance = Some(index);
-                                remove = true;
+                                remove = Some(instance.directory().clone());
                             }
                         });
                     });
@@ -758,8 +733,29 @@ impl Ferrite {
             self.pack_loader_version.clear();
             self.pack_status = None;
             self.export_pack_open = true;
-        } else if remove {
-            self.remove_selected();
+        } else if let Some(directory) = remove {
+            self.open_remove_dialog(directory);
+        } else if let Some(folder) = open_folder
+            && let Err(error) = crate::config::open_folder(&folder)
+        {
+            self.running_text = format!("Couldn't open {}: {error}", folder.display());
+        }
+    }
+
+    /// Activity, folder presence, and global locks for one card (cheap: one mutex poll
+    /// and one `symlink_metadata` call).
+    pub(super) fn instance_status(&self, instance: &InstanceProfile) -> InstanceStatus {
+        let running = crate::minecraft::is_instance_running(instance.directory().as_str());
+        InstanceStatus {
+            activity: self
+                .activity
+                .activity(instance.directory().as_str(), running),
+            folder_missing: crate::instances::folder_missing(&self.paths, instance),
+            global: GlobalBusy {
+                pack_task: self.pack_busy(),
+                mod_task: self.mod_task.is_some() || self.pending_uninstall.is_some(),
+                creation_task: self.instance_creation_task.is_some(),
+            },
         }
     }
 

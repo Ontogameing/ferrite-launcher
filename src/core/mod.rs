@@ -10,5 +10,6 @@ pub mod instances;
 pub mod manifest;
 pub mod migration;
 pub mod paths;
+pub mod remove;
 
 pub use fsutil::write_atomic;

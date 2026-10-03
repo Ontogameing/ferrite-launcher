@@ -445,7 +445,7 @@ pub fn commit_new_instance(
 
 /// Describes the first manifest entry other than `except` whose folder matches
 /// `directory` case-insensitively: a loaded profile or a skipped entry.
-fn folder_user(
+pub(crate) fn folder_user(
     profiles: &[InstanceProfile],
     skipped: &[SkippedEntry],
     directory: &InstanceDirName,
@@ -465,6 +465,23 @@ fn folder_user(
         .iter()
         .find(|entry| entry.raw_directory().map(directory_key).as_deref() == Some(key.as_str()))
         .map(|entry| format!("a skipped manifest entry ({entry})"))
+}
+
+/// Index of the loaded profile stored in `directory`.
+pub(crate) fn find_profile(
+    profiles: &[InstanceProfile],
+    directory: &InstanceDirName,
+) -> Result<usize, InstanceError> {
+    profiles
+        .iter()
+        .position(|profile| profile.directory() == directory)
+        .ok_or_else(|| InstanceError::NotFound(directory.to_string()))
+}
+
+/// Whether `profile`'s folder is missing from disk (checked without following a link
+/// at that path, so a dangling link does not count as missing).
+pub fn folder_missing(paths: &AppPaths, profile: &InstanceProfile) -> bool {
+    fs::symlink_metadata(profile.game_dir(paths)).is_err()
 }
 
 /// Creates the game directory belonging to `profile` and any missing parents.
@@ -490,7 +507,10 @@ pub fn delete_game_dir(paths: &AppPaths, profile: &InstanceProfile) -> Result<()
 
 /// Rejects paths that escape the instances root (defense in depth; validated
 /// directory names already cannot).
-fn ensure_game_dir_contained(paths: &AppPaths, path: &Path) -> Result<(), InstanceError> {
+pub(crate) fn ensure_game_dir_contained(
+    paths: &AppPaths,
+    path: &Path,
+) -> Result<(), InstanceError> {
     let root = paths.instances_dir();
     if is_contained_instance_path(path, &root) {
         Ok(())
