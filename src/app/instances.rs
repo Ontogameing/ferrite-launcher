@@ -850,17 +850,8 @@ impl Ferrite {
                                 );
                             }
                         });
-                    egui::ComboBox::from_label("Mod loader")
-                        .selected_text(&self.selected_loader)
-                        .show_ui(ui, |ui| {
-                            for loader in ModLoader::ALL {
-                                ui.selectable_value(
-                                    &mut self.selected_loader,
-                                    loader.label().to_owned(),
-                                    loader.label(),
-                                );
-                            }
-                        });
+                    let muted = self.muted_color();
+                    loader_picker(ui, &mut self.selected_loader, muted);
                     ui.checkbox(
                         &mut self.pack_include_optional,
                         "Install optional client files from Modrinth packs",
@@ -995,17 +986,8 @@ impl Ferrite {
                                 );
                             }
                         });
-                    egui::ComboBox::from_label("Mod loader")
-                        .selected_text(&self.selected_loader)
-                        .show_ui(ui, |ui| {
-                            for loader in ModLoader::ALL {
-                                ui.selectable_value(
-                                    &mut self.selected_loader,
-                                    loader.label().to_owned(),
-                                    loader.label(),
-                                );
-                            }
-                        });
+                    let muted = self.muted_color();
+                    loader_picker(ui, &mut self.selected_loader, muted);
                     ui.add_space(12.0);
                     create_requested = ui
                         .add_enabled(
@@ -1022,6 +1004,30 @@ impl Ferrite {
         if create_requested {
             self.create_instance();
         }
+    }
+}
+
+/// The "Mod loader" ComboBox used by Create and generic Import. Quilt reads
+/// "Quilt (experimental)" with a muted note once picked; it's never blocked and the
+/// stored value stays the plain label.
+fn loader_picker(ui: &mut egui::Ui, selected_loader: &mut String, muted: Color32) {
+    let selected_text = ModLoader::from_label(selected_loader)
+        .map(ModLoader::picker_label)
+        .unwrap_or(selected_loader.as_str())
+        .to_owned();
+    egui::ComboBox::from_label("Mod loader")
+        .selected_text(selected_text)
+        .show_ui(ui, |ui| {
+            for loader in ModLoader::ALL {
+                ui.selectable_value(
+                    selected_loader,
+                    loader.label().to_owned(),
+                    loader.picker_label(),
+                );
+            }
+        });
+    if ModLoader::from_label(selected_loader) == Some(ModLoader::Quilt) {
+        ui.label(RichText::new("Quilt support is experimental.").color(muted));
     }
 }
 
