@@ -363,7 +363,46 @@ impl Ferrite {
     }
 
     /// Captures the selected profile and export options for one background archive write.
-    pub(super) fn start_pack_export(&mut self) {
+    /// Opens the native Save-As dialog and, unless cancelled, starts the export.
+    ///
+    /// The dialog itself asks "Replace?" for an existing file, so its answer is an
+    /// explicit overwrite confirmation. If appending the extension produced a different
+    /// name, that name was never confirmed and an existing file there is refused.
+    pub(super) fn choose_export_path_and_start(&mut self) {
+        let Some(profile) = self.selected_instance().cloned() else {
+            self.pack_status = Some("Select an instance to export.".into());
+            return;
+        };
+        let format = self.pack_format;
+        let base = if self.pack_name.trim().is_empty() {
+            profile.name.clone()
+        } else {
+            self.pack_name.trim().to_owned()
+        };
+        let default_name = crate::packs::with_pack_extension(
+            std::path::Path::new(&sanitize_file_name(&base)),
+            format,
+        );
+        let mut dialog = rfd::FileDialog::new()
+            .set_title(format!("Export {}", profile.name))
+            .add_filter(format.label(), &[format.extension()])
+            .set_file_name(default_name.to_string_lossy());
+        if let Some(folder) = directories::UserDirs::new().and_then(|dirs| {
+            dirs.download_dir()
+                .map(std::path::Path::to_path_buf)
+                .or_else(|| Some(dirs.home_dir().to_path_buf()))
+        }) {
+            dialog = dialog.set_directory(folder);
+        }
+        let Some(chosen) = dialog.save_file() else {
+            return;
+        };
+        let output = crate::packs::with_pack_extension(&chosen, format);
+        let confirmed_by_dialog = output == chosen;
+        self.start_pack_export(output, confirmed_by_dialog);
+    }
+
+    pub(super) fn start_pack_export(&mut self, output: PathBuf, replace_existing: bool) {
         if self.pack_busy()
             || self.instance_creation_task.is_some()
             || self.mod_task.is_some()
@@ -385,12 +424,10 @@ impl Ferrite {
             self.pack_status = Some(reason);
             return;
         }
-        let mut output = PathBuf::from(self.pack_path.trim());
-        if self.pack_path.trim().is_empty() {
-            self.pack_status = Some("Enter an output archive path.".into());
+        if !output.is_absolute() {
+            self.pack_status = Some("Choose where to save the pack.".into());
             return;
         }
-        output.set_extension(self.pack_format.extension());
         let output_display = output.display().to_string();
         let options = ExportOptions {
             format: self.pack_format,
@@ -405,6 +442,7 @@ impl Ferrite {
             loader_version: (!self.pack_loader_version.trim().is_empty())
                 .then(|| self.pack_loader_version.trim().to_owned()),
             include_worlds: self.pack_include_worlds,
+            replace_existing,
         };
         let paths = self.paths.clone();
         let (sender, receiver) = mpsc::channel();
@@ -416,7 +454,7 @@ impl Ferrite {
                     let _ = event_sender.send(PackTaskEvent::Progress(step.to_owned()));
                 })
                 .map(|()| output_display)
-                .map_err(|error| error.to_string());
+                .map_err(|error| export_error_message(&error));
                 let _ = sender.send(PackTaskEvent::Exported(result));
             });
         match worker {
@@ -725,7 +763,6 @@ impl Ferrite {
                 .selected_instance()
                 .map(|instance| instance.name.clone())
             {
-                self.pack_path = format!("{}.ferritepack", name.replace(['/', '\\'], "-"));
                 self.pack_name = name;
             }
             self.pack_format = PackFormat::Ferrite;
@@ -863,8 +900,6 @@ impl Ferrite {
             .default_width(500.0)
             .show(context, |ui| {
                 ui.add_enabled_ui(!self.pack_busy(), |ui| {
-                    ui.label("Output path (the usual extension is added when omitted)");
-                    ui.text_edit_singleline(&mut self.pack_path);
                     ui.label("Pack name");
                     ui.text_edit_singleline(&mut self.pack_name);
                     ui.label("Pack version");
@@ -882,11 +917,6 @@ impl Ferrite {
                             self.pack_format,
                             PackFormat::Ferrite | PackFormat::GenericZip
                         );
-                        if !self.pack_path.trim().is_empty() {
-                            let mut output = PathBuf::from(self.pack_path.trim());
-                            output.set_extension(self.pack_format.extension());
-                            self.pack_path = output.display().to_string();
-                        }
                     }
                     if self.pack_format == PackFormat::Lunar {
                         ui.label(RichText::new("Direct .lcpack export is unavailable because Lunar does not publish its schema. Lunar can import the Modrinth and CurseForge formats.").color(self.muted_color()));
@@ -917,9 +947,8 @@ impl Ferrite {
                     ui.add_space(8.0);
                     export_requested = ui
                         .add_enabled(
-                            !self.pack_path.trim().is_empty()
-                                && self.pack_format != PackFormat::Lunar,
-                            egui::Button::new("Export instance").fill(self.accent_color()),
+                            self.pack_format != PackFormat::Lunar,
+                            egui::Button::new("Export…").fill(self.accent_color()),
                         )
                         .clicked();
                 });
@@ -932,7 +961,7 @@ impl Ferrite {
             });
         self.export_pack_open = open;
         if export_requested {
-            self.start_pack_export();
+            self.choose_export_path_and_start();
         }
     }
 
@@ -993,5 +1022,62 @@ impl Ferrite {
         if create_requested {
             self.create_instance();
         }
+    }
+}
+
+/// Plain-words export failure, with the raw error appended for details.
+fn export_error_message(error: &crate::packs::PackError) -> String {
+    use crate::packs::ExportFailureKind;
+    let plain = match error.export_failure_kind() {
+        ExportFailureKind::FileTooLarge => {
+            "The pack is larger than 4 GiB, which this drive's format (FAT32) can't store in \
+             one file. Save it to another drive, or reformat this one as exFAT."
+        }
+        ExportFailureKind::NoSpace => "There isn't enough space on that drive.",
+        ExportFailureKind::PermissionDenied => {
+            "Ferrite can't save to that folder. Choose another one."
+        }
+        ExportFailureKind::AlreadyExists => {
+            "A file with that name already exists. Choose another name."
+        }
+        ExportFailureKind::Other => return error.to_string(),
+    };
+    format!("{plain} ({error})")
+}
+
+/// Default export file name: replaces `< > : " / \ | ? *`, control characters, and
+/// trailing dots or spaces with `-`; dots inside the name are kept (`Pack 1.20`).
+fn sanitize_file_name(name: &str) -> String {
+    let replaced: String = name
+        .trim()
+        .chars()
+        .map(|c| {
+            if matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') || c.is_control() {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let kept = replaced.trim_end_matches(['.', ' ']);
+    let mut result = kept.to_owned();
+    result.extend(std::iter::repeat_n('-', replaced.len() - kept.len()));
+    if result.is_empty() {
+        "pack".to_owned()
+    } else {
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_file_name;
+
+    #[test]
+    fn export_file_names_keep_dots_and_drop_unsafe_characters() {
+        assert_eq!(sanitize_file_name("Pack 1.20"), "Pack 1.20");
+        assert_eq!(sanitize_file_name("a/b:c?"), "a-b-c-");
+        assert_eq!(sanitize_file_name("Trailing."), "Trailing-");
+        assert_eq!(sanitize_file_name("   "), "pack");
     }
 }
