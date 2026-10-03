@@ -28,8 +28,10 @@
 //! Exports are self-contained override archives: Modrinth and CurseForge manifests contain
 //! empty downloadable-file lists, with selected instance files embedded under their
 //! overrides roots. Volatile/user-specific paths are excluded, worlds are opt-in, and
-//! symlinks or special files abort export. The completed ZIP is published with a no-clobber
-//! hard link, so the output filesystem must support hard links. Loader pins are metadata
+//! symlinks or special files abort export. Output paths must be absolute. The completed ZIP
+//! is published with a no-clobber hard link; file systems without hard links (FAT32/exFAT)
+//! fall back to a no-replace rename of the finished temp file, and a confirmed replace renames over the old file.
+//! Loader pins are metadata
 //! only in every format; installing the requested loader remains the caller's responsibility.
 
 use crate::instances::InstanceProfile;
@@ -96,6 +98,24 @@ impl PackFormat {
             Self::GenericZip | Self::Prism | Self::CurseForge => "zip",
         }
     }
+}
+
+/// Appends `format`'s extension to `path` unless its file name already ends with it
+/// (case-insensitive). Never replaces anything: `Pack 1.20` becomes
+/// `Pack 1.20.ferritepack`, not `Pack 1.ferritepack`.
+pub fn with_pack_extension(path: &Path, format: PackFormat) -> PathBuf {
+    let extension = format.extension();
+    let suffix = format!(".{extension}");
+    let has_extension = path.file_name().is_some_and(|name| {
+        let name = name.to_string_lossy().to_lowercase();
+        name.len() > suffix.len() && name.ends_with(&suffix)
+    });
+    if has_extension {
+        return path.to_path_buf();
+    }
+    let mut name = path.as_os_str().to_owned();
+    name.push(&suffix);
+    PathBuf::from(name)
 }
 
 /// Minecraft and loader metadata declared by a pack or supplied for a generic ZIP.
@@ -197,6 +217,11 @@ pub struct ExportOptions {
     /// Exact loader version for formats whose manifests require one.
     pub loader_version: Option<String>,
     pub include_worlds: bool,
+    /// Replace an existing output file (the user confirmed "Replace?" in the native
+    /// Save-As dialog). `false` refuses with [`PackError::AlreadyExists`]. Either way
+    /// the archive is written to a temporary sibling first, so the destination never
+    /// holds a half-written pack.
+    pub replace_existing: bool,
 }
 
 /// Failures are classified so callers can distinguish malformed input, security policy,
@@ -216,6 +241,40 @@ pub enum PackError {
     Unsupported(String),
     AlreadyExists(PathBuf),
     MissingApiKey(String),
+    /// The output file system cannot store a file this large (FAT32's 4 GiB limit).
+    FileTooLarge(PathBuf),
+}
+
+/// Plain classification of an export failure, for user-facing messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportFailureKind {
+    /// Larger than the drive's per-file limit (FAT32: 4 GiB).
+    FileTooLarge,
+    NoSpace,
+    PermissionDenied,
+    AlreadyExists,
+    Other,
+}
+
+impl PackError {
+    /// Best-effort kind of an export failure.
+    pub fn export_failure_kind(&self) -> ExportFailureKind {
+        match self {
+            Self::FileTooLarge(_) => ExportFailureKind::FileTooLarge,
+            Self::AlreadyExists(_) => ExportFailureKind::AlreadyExists,
+            Self::Io(error) => match error.kind() {
+                io::ErrorKind::FileTooLarge => ExportFailureKind::FileTooLarge,
+                io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded => {
+                    ExportFailureKind::NoSpace
+                }
+                io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem => {
+                    ExportFailureKind::PermissionDenied
+                }
+                _ => ExportFailureKind::Other,
+            },
+            _ => ExportFailureKind::Other,
+        }
+    }
 }
 
 impl fmt::Display for PackError {
@@ -233,6 +292,13 @@ impl fmt::Display for PackError {
                 write!(f, "destination already exists: {}", path.display())
             }
             Self::MissingApiKey(message) => write!(f, "CurseForge API key required: {message}"),
+            Self::FileTooLarge(path) => write!(
+                f,
+                "the pack is larger than this drive can store in one file (FAT32 allows at \
+                 most 4 GiB): {}. Save it to another drive, or use a drive formatted as \
+                 exFAT or NTFS",
+                path.display()
+            ),
         }
     }
 }
@@ -521,6 +587,136 @@ pub fn export(
         &target,
         &mut progress,
     )
+}
+
+/// Why a pack can be inspected but not imported as things stand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportBlocker {
+    /// A CurseForge pack lists `mods` required project files that can only be
+    /// downloaded through the CurseForge API, and no API key is configured.
+    NeedsCurseForgeKey { mods: usize },
+}
+
+/// Everything the import preview shows, gathered without network access or
+/// extraction. Counts are best effort and only cover what the archive declares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackPreview {
+    pub info: PackInfo,
+    /// Regular files stored in the archive (including metadata files).
+    pub archive_files: usize,
+    /// Declared uncompressed size of those files (downloads not included).
+    pub archive_bytes: u64,
+    /// Mods: `.jar` files in the pack's game `mods/` folder plus listed mod downloads
+    /// that will be installed by default.
+    pub mod_count: usize,
+    /// Whether the archive contains world folders (`saves/<world>/...`) in its game
+    /// directory.
+    pub has_worlds: bool,
+    /// Modrinth files marked optional for the client (installed only when
+    /// [`ImportOptions::include_optional_modrinth_files`] is set).
+    pub optional_files: usize,
+    pub blocker: Option<ImportBlocker>,
+}
+
+/// [`inspect`] plus the counts and blockers the import preview needs. Reads only
+/// metadata; `curseforge_api_key` is only checked for presence.
+pub fn preview(path: impl AsRef<Path>, curseforge_api_key: Option<&str>) -> Result<PackPreview> {
+    let path = path.as_ref();
+    let info = inspect(path)?;
+    // Re-reads the ZIP central directory only (no payloads).
+    let catalog = scan_archive(path, ArchiveLimits::default())?;
+    let roots: Vec<String> = match info.format {
+        PackFormat::Ferrite => vec!["overrides/".to_owned()],
+        PackFormat::Modrinth => vec!["overrides/".to_owned(), "client-overrides/".to_owned()],
+        PackFormat::CurseForge => {
+            let manifest = read_json(path, &catalog, "manifest.json")?;
+            let overrides = manifest
+                .get("overrides")
+                .and_then(|v| v.as_str())
+                .unwrap_or("overrides");
+            vec![format!("{}/", overrides.trim_end_matches('/'))]
+        }
+        PackFormat::Prism => vec!["minecraft/".to_owned(), ".minecraft/".to_owned()],
+        PackFormat::GenericZip => vec![String::new()],
+        // inspect_catalog already refuses .lcpack.
+        PackFormat::Lunar => return Err(lunar_error()),
+    };
+    let files = catalog.entries.iter().filter(|entry| !entry.is_dir);
+    let archive_files = files.clone().count();
+    let archive_bytes = files.clone().map(|entry| entry.size).sum();
+    let in_game_dir = |name: &str, folder: &str| {
+        roots
+            .iter()
+            .find_map(|root| name.strip_prefix(root.as_str())?.strip_prefix(folder))
+            .map(str::to_owned)
+    };
+    let mut mod_count = files
+        .clone()
+        .filter_map(|entry| in_game_dir(&entry.name, "mods/"))
+        .filter(|rest| !rest.contains('/') && rest.to_ascii_lowercase().ends_with(".jar"))
+        .count();
+    let has_worlds = catalog.entries.iter().any(|entry| {
+        in_game_dir(&entry.name, "saves/").is_some_and(|rest| {
+            rest.split('/')
+                .next()
+                .is_some_and(|world| !world.is_empty())
+                && rest.contains('/')
+        })
+    });
+    let mut optional_files = 0;
+    let mut blocker = None;
+    match info.format {
+        PackFormat::Modrinth => {
+            let index = read_json(path, &catalog, "modrinth.index.json")?;
+            for file in index
+                .get("files")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+            {
+                let client = file
+                    .get("env")
+                    .and_then(|v| v.get("client"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("required");
+                let is_mod = file
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|path| path.starts_with("mods/"));
+                match client {
+                    "optional" => optional_files += 1,
+                    "unsupported" => {}
+                    _ if is_mod => mod_count += 1,
+                    _ => {}
+                }
+            }
+        }
+        PackFormat::CurseForge => {
+            let manifest = read_json(path, &catalog, "manifest.json")?;
+            let required = manifest
+                .get("files")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .filter(|item| item.get("required").and_then(|v| v.as_bool()) != Some(false))
+                .count();
+            mod_count += required;
+            let has_key = curseforge_api_key.is_some_and(|key| !key.trim().is_empty());
+            if required > 0 && !has_key {
+                blocker = Some(ImportBlocker::NeedsCurseForgeKey { mods: required });
+            }
+        }
+        _ => {}
+    }
+    Ok(PackPreview {
+        info,
+        archive_files,
+        archive_bytes,
+        mod_count,
+        has_worlds,
+        optional_files,
+        blocker,
+    })
 }
 
 fn inspect_with_limits(path: &Path, limits: ArchiveLimits) -> Result<PackInfo> {
@@ -1680,9 +1876,34 @@ fn export_directory(
     target: &PackTarget,
     progress: &mut impl FnMut(&str),
 ) -> Result<()> {
-    if output.exists() {
-        return Err(PackError::AlreadyExists(output.to_owned()));
+    export_directory_with(source, output, options, target, progress, &|from, to| {
+        fs::hard_link(from, to)
+    })
+    .map_err(|error| match error {
+        PackError::Io(io) if io.kind() == io::ErrorKind::FileTooLarge => {
+            PackError::FileTooLarge(output.to_owned())
+        }
+        other => other,
+    })
+}
+
+type LinkFn<'a> = &'a dyn Fn(&Path, &Path) -> io::Result<()>;
+
+fn export_directory_with(
+    source: &Path,
+    output: &Path,
+    options: &ExportOptions,
+    target: &PackTarget,
+    progress: &mut impl FnMut(&str),
+    link: LinkFn<'_>,
+) -> Result<()> {
+    if !output.is_absolute() {
+        return Err(PackError::Invalid(format!(
+            "the export path must be absolute (choose a folder with Save As): {}",
+            output.display()
+        )));
     }
+    check_output(output, options.replace_existing)?;
     if !source.is_dir() {
         return Err(PackError::Invalid(format!(
             "instance game directory does not exist: {}",
@@ -1817,16 +2038,84 @@ fn export_directory(
         PackFormat::Lunar => unreachable!(),
     }
     zip.finish()?.sync_all()?;
-    if output.exists() {
-        return Err(PackError::AlreadyExists(output.to_owned()));
-    }
-    // A hard link publishes the completed sibling atomically and fails rather
-    // than replacing an output created concurrently.
-    fs::hard_link(&temporary, output)?;
-    fs::remove_file(&temporary)?;
+    publish_export(&temporary, output, options.replace_existing, link)?;
     cleanup.disarm();
     progress("Export complete");
     Ok(())
+}
+
+/// Refuses an existing output unless replacing was confirmed, and never replaces
+/// anything but a regular file (a folder or link at the path is an error).
+fn check_output(output: &Path, replace_existing: bool) -> Result<()> {
+    match fs::symlink_metadata(output) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+        Ok(_) if !replace_existing => Err(PackError::AlreadyExists(output.to_owned())),
+        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(_) => Err(PackError::Invalid(format!(
+            "{} exists and is not a regular file; it will not be replaced",
+            output.display()
+        ))),
+    }
+}
+
+/// Moves the finished temporary archive (a sibling of `output`) into place.
+///
+/// * Replace: `rename` over the old file, which is atomic on every supported OS.
+/// * No-clobber: a hard link publishes atomically and fails if the output appeared
+///   meanwhile. File systems without hard links (FAT32/exFAT report `EPERM`, others
+///   `ENOTSUP`/`ERROR_INVALID_FUNCTION`) fall back to renaming the temporary file (already
+///   complete and synced, in the same folder) into place with
+///   [`ferrite_launcher::core::fsutil::rename_no_replace`], which never replaces an
+///   existing file. Both paths are atomic: the output is either absent or complete.
+///   Where the OS has no exclusive rename for that file system (rare; e.g. some macOS
+///   network mounts), `rename_no_replace` checks for the output right before a plain
+///   rename, leaving a tiny race window.
+///
+/// The temporary file is removed on success.
+fn publish_export(temporary: &Path, output: &Path, replace: bool, link: LinkFn<'_>) -> Result<()> {
+    if replace {
+        check_output(output, true)?;
+        fs::rename(temporary, output)?;
+        sync_parent(output);
+        return Ok(());
+    }
+    match link(temporary, output) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(PackError::AlreadyExists(output.to_owned()));
+        }
+        Err(link_error) => {
+            // No hard links (FAT32/exFAT, some network shares): the finished temp file
+            // already sits in the destination folder and is synced, so rename it into
+            // place without replacing anything. The output is never half-written.
+            match ferrite_launcher::core::fsutil::rename_no_replace(temporary, output) {
+                Ok(()) => {
+                    eprintln!(
+                        "Ferrite export: hard links unavailable for {} ({link_error}); \
+                         renamed into place instead",
+                        output.display()
+                    );
+                    sync_parent(output);
+                    return Ok(());
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    return Err(PackError::AlreadyExists(output.to_owned()));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    fs::remove_file(temporary)?;
+    sync_parent(output);
+    Ok(())
+}
+
+/// Best-effort durability for the publishing rename/link.
+fn sync_parent(output: &Path) {
+    if let Some(parent) = output.parent() {
+        let _ = ferrite_launcher::core::fsutil::sync_dir(parent);
+    }
 }
 
 // The generic `Serialize` bound lets typed Ferrite manifests and ad-hoc JSON values share
@@ -2053,6 +2342,78 @@ mod tests {
     }
 
     #[test]
+    fn preview_counts_mods_worlds_optional_files_and_curseforge_blockers() {
+        let temp = TempDir::new("preview");
+        let modrinth = temp.0.join("pack.mrpack");
+        let index = br#"{"formatVersion":1,"game":"minecraft","versionId":"1","name":"MR",
+            "dependencies":{"minecraft":"1.20.1","fabric-loader":"0.15.0"},
+            "files":[
+              {"path":"mods/a.jar","hashes":{},"downloads":["https://cdn.modrinth.com/a.jar"],"fileSize":1},
+              {"path":"mods/b.jar","env":{"client":"optional","server":"required"},"hashes":{},"downloads":["https://cdn.modrinth.com/b.jar"],"fileSize":1},
+              {"path":"mods/c.jar","env":{"client":"unsupported","server":"required"},"hashes":{},"downloads":["https://cdn.modrinth.com/c.jar"],"fileSize":1},
+              {"path":"resourcepacks/r.zip","hashes":{},"downloads":["https://cdn.modrinth.com/r.zip"],"fileSize":1}
+            ]}"#;
+        make_zip(
+            &modrinth,
+            &[
+                ("modrinth.index.json", index.as_slice()),
+                ("overrides/mods/local.jar", b"jar"),
+                ("overrides/mods/notes.txt", b"txt"),
+                ("overrides/config/x.toml", b"x"),
+            ],
+        );
+        let preview = super::preview(&modrinth, None).unwrap();
+        assert_eq!(preview.info.format, PackFormat::Modrinth);
+        assert_eq!(preview.archive_files, 4);
+        assert_eq!(preview.archive_bytes, index.len() as u64 + 7);
+        assert_eq!(preview.mod_count, 2); // a.jar + local.jar
+        assert_eq!(preview.optional_files, 1);
+        assert!(!preview.has_worlds);
+        assert_eq!(preview.blocker, None);
+
+        let curse = temp.0.join("curse.zip");
+        let manifest = br#"{"manifestType":"minecraftModpack","manifestVersion":1,"name":"CF",
+            "version":"1","author":"x","overrides":"overrides",
+            "minecraft":{"version":"1.20.1","modLoaders":[{"id":"forge-47.2.0","primary":true}]},
+            "files":[{"projectID":1,"fileID":2,"required":true},
+                     {"projectID":3,"fileID":4,"required":false},
+                     {"projectID":5,"fileID":6}]}"#;
+        make_zip(
+            &curse,
+            &[
+                ("manifest.json", manifest.as_slice()),
+                ("overrides/saves/World/level.dat", b"lvl"),
+            ],
+        );
+        let preview = super::preview(&curse, None).unwrap();
+        assert_eq!(preview.info.format, PackFormat::CurseForge);
+        assert!(preview.has_worlds);
+        assert_eq!(preview.mod_count, 2);
+        assert_eq!(
+            preview.blocker,
+            Some(ImportBlocker::NeedsCurseForgeKey { mods: 2 })
+        );
+        assert_eq!(super::preview(&curse, Some("key")).unwrap().blocker, None);
+        assert!(
+            super::preview(&curse, Some("  "))
+                .unwrap()
+                .blocker
+                .is_some()
+        );
+
+        let generic = temp.0.join("world-backup.zip");
+        make_zip(
+            &generic,
+            &[("saves/My World/level.dat", b"lvl"), ("mods/x.jar", b"j")],
+        );
+        let preview = super::preview(&generic, None).unwrap();
+        assert_eq!(preview.info.format, PackFormat::GenericZip);
+        assert!(preview.info.target.is_none());
+        assert!(preview.has_worlds);
+        assert_eq!(preview.mod_count, 1);
+    }
+
+    #[test]
     fn ferrite_round_trip() {
         let temp = TempDir::new("roundtrip");
         let game = temp.0.join("game");
@@ -2068,6 +2429,7 @@ mod tests {
             summary: None,
             loader_version: None,
             include_worlds: false,
+            replace_existing: false,
         };
         export_directory(&game, &pack, &options, &target(), &mut |_| {}).unwrap();
         let destination = temp.0.join("imported");
@@ -2188,6 +2550,7 @@ mod tests {
             summary: None,
             loader_version: None,
             include_worlds: false,
+            replace_existing: false,
         };
         assert!(matches!(
             export_directory(
@@ -2227,6 +2590,7 @@ mod tests {
             summary: None,
             loader_version: Some("0.15.0".to_owned()),
             include_worlds: false,
+            replace_existing: false,
         };
         export_directory(&game, &output, &options, &target(), &mut |_| {}).unwrap();
         let mut archive = ZipArchive::new(File::open(output).unwrap()).unwrap();
@@ -2335,5 +2699,186 @@ mod tests {
             inspect_with_limits(&pack, total),
             Err(PackError::Limit(_))
         ));
+    }
+
+    fn generic_options(replace_existing: bool) -> ExportOptions {
+        ExportOptions {
+            format: PackFormat::GenericZip,
+            name: "x".to_owned(),
+            version: None,
+            summary: None,
+            loader_version: None,
+            include_worlds: false,
+            replace_existing,
+        }
+    }
+
+    fn game_dir(temp: &TempDir) -> PathBuf {
+        let game = temp.0.join("game");
+        fs::create_dir_all(game.join("config")).unwrap();
+        fs::write(game.join("config/a.toml"), b"a=1").unwrap();
+        game
+    }
+
+    fn leftover_temporaries(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect()
+    }
+
+    #[test]
+    fn extensions_are_appended_never_replaced() {
+        let ferrite = PackFormat::Ferrite;
+        assert_eq!(
+            with_pack_extension(Path::new("/out/Pack 1.20"), ferrite),
+            PathBuf::from("/out/Pack 1.20.ferritepack")
+        );
+        assert_eq!(
+            with_pack_extension(Path::new("/out/Pack.FERRITEPACK"), ferrite),
+            PathBuf::from("/out/Pack.FERRITEPACK")
+        );
+        assert_eq!(
+            with_pack_extension(Path::new("/out/.ferritepack"), ferrite),
+            PathBuf::from("/out/.ferritepack.ferritepack")
+        );
+    }
+
+    #[test]
+    fn export_requires_an_absolute_path() {
+        let temp = TempDir::new("relative");
+        let game = game_dir(&temp);
+        let result = export_directory(
+            &game,
+            Path::new("relative.zip"),
+            &generic_options(false),
+            &target(),
+            &mut |_| {},
+        );
+        assert!(matches!(result, Err(PackError::Invalid(ref m)) if m.contains("absolute")));
+        assert!(!Path::new("relative.zip").exists());
+    }
+
+    #[test]
+    fn existing_output_is_refused_or_replaced_atomically() {
+        let temp = TempDir::new("replace");
+        let game = game_dir(&temp);
+        let output = temp.0.join("Pack 1.20.zip");
+        fs::write(&output, b"old pack").unwrap();
+        let refused = export_directory(
+            &game,
+            &output,
+            &generic_options(false),
+            &target(),
+            &mut |_| {},
+        );
+        assert!(matches!(refused, Err(PackError::AlreadyExists(_))));
+        assert_eq!(
+            refused.unwrap_err().export_failure_kind(),
+            ExportFailureKind::AlreadyExists
+        );
+        assert_eq!(fs::read(&output).unwrap(), b"old pack");
+
+        export_directory(
+            &game,
+            &output,
+            &generic_options(true),
+            &target(),
+            &mut |_| {},
+        )
+        .unwrap();
+        let mut archive = ZipArchive::new(File::open(&output).unwrap()).unwrap();
+        assert!(archive.by_name("config/a.toml").is_ok());
+        assert!(leftover_temporaries(&temp.0).is_empty());
+
+        // A folder at the output path is never replaced.
+        let folder = temp.0.join("folder.zip");
+        fs::create_dir(&folder).unwrap();
+        let result = export_directory(
+            &game,
+            &folder,
+            &generic_options(true),
+            &target(),
+            &mut |_| {},
+        );
+        assert!(matches!(result, Err(PackError::Invalid(_))));
+        assert!(folder.is_dir());
+    }
+
+    #[test]
+    fn link_failure_falls_back_to_no_replace_rename() {
+        let temp = TempDir::new("nolink");
+        let game = game_dir(&temp);
+        let output = temp.0.join("Pack 1.20.zip");
+        // FAT32/exFAT on Linux report EPERM, which Rust maps to PermissionDenied.
+        let no_links = |_: &Path, _: &Path| -> io::Result<()> {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        };
+        export_directory_with(
+            &game,
+            &output,
+            &generic_options(false),
+            &target(),
+            &mut |_| {},
+            &no_links,
+        )
+        .unwrap();
+        let mut archive = ZipArchive::new(File::open(&output).unwrap()).unwrap();
+        assert!(archive.by_name("config/a.toml").is_ok());
+        assert!(leftover_temporaries(&temp.0).is_empty());
+
+        // The fallback is still no-clobber.
+        let output = temp.0.join("Second.zip");
+        let result = export_directory_with(
+            &game,
+            &output,
+            &generic_options(false),
+            &target(),
+            &mut |_| {},
+            &|_: &Path, to: &Path| -> io::Result<()> {
+                // Another writer creates the output between the check and the publish.
+                let _ = fs::write(to, b"theirs");
+                Err(io::Error::from(io::ErrorKind::Unsupported))
+            },
+        );
+        assert!(matches!(result, Err(PackError::AlreadyExists(_))));
+        assert_eq!(fs::read(&output).unwrap(), b"theirs");
+        assert!(leftover_temporaries(&temp.0).is_empty());
+    }
+
+    #[test]
+    fn fallback_rename_is_atomic_and_never_replaces() {
+        let temp = TempDir::new("renamefallback");
+        let output = temp.0.join("out.zip");
+        let temporary = temp.0.join(".out.zip.export.1.1.tmp");
+        let no_links = |_: &Path, _: &Path| -> io::Result<()> {
+            Err(io::Error::from(io::ErrorKind::Unsupported))
+        };
+        // A missing temporary fails without creating anything at the output.
+        let result = publish_export(&temporary, &output, false, &no_links);
+        assert!(result.is_err());
+        assert!(!output.exists());
+
+        // The complete file appears in one step and the temporary is gone.
+        fs::write(&temporary, b"complete archive").unwrap();
+        publish_export(&temporary, &output, false, &no_links).unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"complete archive");
+        assert!(!temporary.exists());
+
+        // An existing output is never replaced by the fallback.
+        fs::write(&temporary, b"second").unwrap();
+        let result = publish_export(&temporary, &output, false, &no_links);
+        assert!(matches!(result, Err(PackError::AlreadyExists(_))));
+        assert_eq!(fs::read(&output).unwrap(), b"complete archive");
+    }
+
+    #[test]
+    fn file_too_large_is_reported_plainly() {
+        let error = PackError::FileTooLarge(PathBuf::from("/media/usb/pack.zip"));
+        assert_eq!(error.export_failure_kind(), ExportFailureKind::FileTooLarge);
+        assert!(error.to_string().contains("4 GiB"));
+        let io_error = PackError::Io(io::Error::from(io::ErrorKind::StorageFull));
+        assert_eq!(io_error.export_failure_kind(), ExportFailureKind::NoSpace);
     }
 }

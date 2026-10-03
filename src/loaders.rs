@@ -104,6 +104,15 @@ impl ModLoader {
         }
     }
 
+    /// Text for loader pickers. Only the shown text differs from [`Self::label`];
+    /// the stored value stays `label()` so saved data doesn't change.
+    pub fn picker_label(self) -> &'static str {
+        match self {
+            ModLoader::Quilt => "Quilt (experimental)",
+            other => other.label(),
+        }
+    }
+
     /// Parses the exact, case-sensitive display label used by [`Self::label`].
     /// Unknown labels return `None` rather than defaulting to vanilla.
     pub fn from_label(label: &str) -> Option<ModLoader> {
@@ -317,6 +326,19 @@ fn loader_version_from_metadata(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn quilt_picker_label_is_marked_experimental_but_stored_label_is_unchanged() {
+        use super::ModLoader;
+        assert_eq!(ModLoader::Quilt.picker_label(), "Quilt (experimental)");
+        assert_eq!(ModLoader::Quilt.label(), "Quilt");
+        assert_eq!(ModLoader::from_label("Quilt"), Some(ModLoader::Quilt));
+        for loader in ModLoader::ALL {
+            if loader != ModLoader::Quilt {
+                assert_eq!(loader.picker_label(), loader.label());
+            }
+        }
+    }
+
     #[test]
     fn installer_command_keeps_paths_with_spaces_as_single_arguments() {
         let installer = Path::new("/tmp/Ferrite Launcher/cache/downloads/forge installer.jar");

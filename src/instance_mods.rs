@@ -192,6 +192,12 @@ fn mods_directory(game_dir: &Path) -> Result<Option<PathBuf>, String> {
     let mut checked = PathBuf::new();
     for component in path.components() {
         checked.push(component.as_os_str());
+        // A Windows prefix (`C:` or `\\?\C:`) is not a directory on its own: `C:` means
+        // the current directory on drive C, and a bare verbatim prefix fails with
+        // "Incorrect function". The root that always follows it is checked next.
+        if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
         match fs::symlink_metadata(&checked) {
             Ok(metadata) if metadata.file_type().is_dir() => {}
             Ok(_) => {
@@ -464,7 +470,14 @@ mod tests {
         assert!(uninstall(&dir.0, "directory.jar").is_err());
         assert!(set_enabled(&dir.0, "directory.jar", true).is_err());
         assert!(list(dir.0.join("missing")).unwrap().is_empty());
-        assert!(list(dir.0.join("missing/../other")).is_err());
+        // Use a plain absolute path: joining onto a canonicalized `\\?\` base would
+        // have `PathBuf::push` drop the `..` before the check could see it.
+        let traversal = if cfg!(windows) {
+            r"C:\missing\..\other"
+        } else {
+            "/missing/../other"
+        };
+        assert!(list(Path::new(traversal)).is_err());
         fs::write(dir.0.join("file"), b"x").unwrap();
         assert!(list(dir.0.join("file")).is_err());
     }

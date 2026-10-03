@@ -37,7 +37,7 @@ jobs:
         run: cargo clippy --all-targets
 
       - name: test
-        run: cargo test --all-targets
+        run: cargo test --all-targets --no-fail-fast
 
   build:
     name: Release build (${{ matrix.os }})
@@ -63,6 +63,12 @@ jobs:
 
       - name: Build release
         run: cargo build --release
+
+      # Ubuntu tests run in the check job; also run them on Windows/macOS so
+      # platform-specific code (fsutil no-replace rename, trash, cfg(unix) link tests) is exercised.
+      - name: Test (Windows/macOS)
+        if: runner.os != 'Linux'
+        run: cargo test --all-targets --no-fail-fast
 
       # Rename binaries so upload-artifact names match softprops/action-gh-release paths.
       - name: Package Linux artifact

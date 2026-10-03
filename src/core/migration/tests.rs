@@ -5,6 +5,8 @@ use super::*;
 use crate::core::paths::StorageMode;
 use crate::core::paths::test_support::paths_in;
 use std::cell::Cell;
+use std::collections::BTreeMap;
+use std::fs::File;
 use std::time::Duration;
 
 const V0: &str =
@@ -581,7 +583,11 @@ fn unreadable_source_file_blocks_the_commit() {
         }
         other => panic!("expected UncopyableFiles, got {other}"),
     }
-    assert!(error.to_string().contains("libraries/org/example/lib.jar"));
+    let lib = Path::new("libraries")
+        .join("org")
+        .join("example")
+        .join("lib.jar");
+    assert!(error.to_string().contains(&lib.display().to_string()));
     assert!(!paths.storage_root().exists(), "nothing may be committed");
     assert_eq!(snapshot(&source), before);
     assert_eq!(

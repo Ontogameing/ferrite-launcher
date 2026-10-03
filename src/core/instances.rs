@@ -15,6 +15,7 @@
 //!   defense in depth on top of directory-name validation.
 
 pub use crate::core::manifest::{InstanceDirName, InstanceProfile, SkippedEntry};
+pub use crate::core::manifest::{directory_key, name_key};
 
 use crate::core::fsutil;
 use crate::core::manifest::{self, ManifestError};
@@ -35,6 +36,19 @@ pub enum InstanceError {
     Json(serde_json::Error),
     /// An existing manifest that this build cannot read would have been overwritten.
     RefusingToOverwrite(String),
+    /// The requested display name is empty, taken, or otherwise unusable.
+    Name(NameError),
+    /// No loaded instance uses the given folder.
+    NotFound(String),
+    /// Another manifest entry (possibly a skipped one) uses the same folder, so its
+    /// files cannot be touched without destroying that entry's data.
+    FolderShared { directory: String, other: String },
+    /// A folder that was expected to be new already exists on disk.
+    FolderExists(PathBuf),
+    /// No free folder name could be found for a new instance.
+    NoFreeFolder(String),
+    /// Installing game files for a new or changed instance failed.
+    Install(String),
 }
 
 impl fmt::Display for InstanceError {
@@ -47,6 +61,24 @@ impl fmt::Display for InstanceError {
                 f,
                 "refusing to overwrite the existing instance manifest: {detail}"
             ),
+            Self::Name(error) => write!(f, "{error}"),
+            Self::NotFound(directory) => {
+                write!(f, "no instance uses the folder '{directory}'")
+            }
+            Self::FolderShared { directory, other } => write!(
+                f,
+                "the folder '{directory}' is also used by {other}; its files were left \
+                 untouched"
+            ),
+            Self::FolderExists(path) => write!(
+                f,
+                "the instance folder {} already exists and will not be reused",
+                path.display()
+            ),
+            Self::NoFreeFolder(base) => {
+                write!(f, "could not find a free folder name based on '{base}'")
+            }
+            Self::Install(detail) => write!(f, "{detail}"),
         }
     }
 }
@@ -64,6 +96,36 @@ impl From<ManifestError> for InstanceError {
         Self::Manifest(error)
     }
 }
+
+impl From<NameError> for InstanceError {
+    fn from(error: NameError) -> Self {
+        Self::Name(error)
+    }
+}
+
+/// Why a proposed display name was rejected by [`validate_instance_name`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NameError {
+    /// Empty or only whitespace.
+    Empty,
+    /// Contains a control character (tabs, newlines, ...).
+    ControlCharacter,
+    /// Another loaded instance already uses this name, compared case-insensitively.
+    /// Carries the existing instance's name as written (`foo` reports `Foo`).
+    Taken(String),
+}
+
+impl fmt::Display for NameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => write!(f, "a name is required"),
+            Self::ControlCharacter => write!(f, "names cannot contain control characters"),
+            Self::Taken(existing) => write!(f, "an instance named '{existing}' already exists"),
+        }
+    }
+}
+
+impl std::error::Error for NameError {}
 
 impl From<serde_json::Error> for InstanceError {
     fn from(error: serde_json::Error) -> Self {
@@ -159,6 +221,269 @@ fn guard_existing_manifest(path: &Path) -> Result<(), InstanceError> {
     }
 }
 
+// =====================================================================
+// Names and folder allocation
+// =====================================================================
+
+/// Maximum numeric suffix tried when looking for a free folder name.
+const MAX_FOLDER_SUFFIX: u32 = 10_000;
+
+/// The shared, side-effect-free display-name check used by create, rename, duplicate,
+/// and the import preview. Returns the trimmed name.
+///
+/// Names are compared case-insensitively against loaded profiles other than `except`
+/// (the instance being renamed). Skipped manifest entries are invisible in the UI and
+/// do not block a name; their folders are protected by [`allocate_directory`] instead.
+pub fn validate_instance_name(
+    name: &str,
+    profiles: &[InstanceProfile],
+    except: Option<&InstanceDirName>,
+) -> Result<String, NameError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(NameError::Empty);
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(NameError::ControlCharacter);
+    }
+    let key = name_key(trimmed);
+    if let Some(existing) = profiles
+        .iter()
+        .filter(|profile| except.is_none_or(|except| profile.directory() != except))
+        .find(|profile| name_key(&profile.name) == key)
+    {
+        return Err(NameError::Taken(existing.name.clone()));
+    }
+    Ok(trimmed.to_owned())
+}
+
+/// Whether a loaded profile other than `except` already uses `name`, compared
+/// case-insensitively (`Foo` and `foo` collide).
+pub fn name_taken(
+    profiles: &[InstanceProfile],
+    name: &str,
+    except: Option<&InstanceDirName>,
+) -> bool {
+    matches!(
+        validate_instance_name(name, profiles, except),
+        Err(NameError::Taken(_))
+    )
+}
+
+/// Returns `base`, or `base (2)`, `base (3)`, ... — the first name no loaded profile
+/// uses (case-insensitively). Import, duplicate, and the import preview use this.
+pub fn suggest_name(profiles: &[InstanceProfile], base: &str) -> String {
+    let base = base.trim();
+    let base = if base.is_empty() { "Instance" } else { base };
+    let mut name = base.to_owned();
+    let mut suffix = 2;
+    while name_taken(profiles, &name, None) {
+        name = format!("{base} ({suffix})");
+        suffix += 1;
+    }
+    name
+}
+
+/// Folder keys (see [`directory_key`]) that are already claimed: by loaded profiles,
+/// by skipped manifest entries (whatever their raw `directory` says), and by every
+/// entry already present in the instances directory on disk (listed without following
+/// links, so a dangling link or a file also blocks its name).
+fn claimed_folder_keys(
+    paths: &AppPaths,
+    profiles: &[InstanceProfile],
+    skipped: &[SkippedEntry],
+) -> Result<std::collections::HashSet<String>, InstanceError> {
+    let mut claimed: std::collections::HashSet<String> = profiles
+        .iter()
+        .map(|profile| directory_key(profile.directory().as_str()))
+        .collect();
+    claimed.extend(
+        skipped
+            .iter()
+            .filter_map(SkippedEntry::raw_directory)
+            .map(directory_key),
+    );
+    match fs::read_dir(paths.instances_dir()) {
+        Ok(entries) => {
+            for entry in entries {
+                claimed.insert(directory_key(&entry?.file_name().to_string_lossy()));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(claimed)
+}
+
+/// Chooses a free folder for a new instance named `name`.
+///
+/// The folder is the name's slug, with `-2`, `-3`, ... appended until it is free
+/// case-insensitively against loaded profiles, skipped manifest entries, and folders
+/// already on disk. Nothing is created; [`create_new_game_dir`] claims the folder
+/// exclusively, so a racing creator makes that step fail instead of sharing a folder.
+pub fn allocate_directory(
+    paths: &AppPaths,
+    name: &str,
+    profiles: &[InstanceProfile],
+    skipped: &[SkippedEntry],
+) -> Result<InstanceDirName, InstanceError> {
+    let claimed = claimed_folder_keys(paths, profiles, skipped)?;
+    let base = manifest::directory_slug(name);
+    let mut candidate = base.clone();
+    for suffix in 2..=MAX_FOLDER_SUFFIX + 1 {
+        if !claimed.contains(&directory_key(&candidate))
+            && let Ok(directory) = InstanceDirName::parse(candidate.clone())
+        {
+            return Ok(directory);
+        }
+        candidate = format!("{base}-{suffix}");
+    }
+    Err(InstanceError::NoFreeFolder(base))
+}
+
+/// Validates `name` (non-empty, unique case-insensitively) and builds the metadata for
+/// a new instance in a freshly allocated folder (see [`allocate_directory`]).
+pub fn new_instance_profile(
+    paths: &AppPaths,
+    name: &str,
+    version: &str,
+    loader: &str,
+    profiles: &[InstanceProfile],
+    skipped: &[SkippedEntry],
+) -> Result<InstanceProfile, InstanceError> {
+    let name = validate_instance_name(name, profiles, None)?;
+    let directory = allocate_directory(paths, &name, profiles, skipped)?;
+    Ok(InstanceProfile::with_directory(
+        name,
+        version.to_owned(),
+        loader.to_owned(),
+        directory,
+    ))
+}
+
+/// Creates `profile`'s folder exclusively: fails with [`InstanceError::FolderExists`]
+/// instead of adopting a folder that already exists.
+pub fn create_new_game_dir(
+    paths: &AppPaths,
+    profile: &InstanceProfile,
+) -> Result<(), InstanceError> {
+    let path = profile.game_dir(paths);
+    ensure_game_dir_contained(paths, &path)?;
+    fs::create_dir_all(paths.instances_dir())?;
+    match fs::create_dir(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            Err(InstanceError::FolderExists(path))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Creates a new instance's folder, then runs `install` (game/loader downloads).
+///
+/// If `install` fails, the folder created here is removed again so no orphan is left
+/// behind. The profile is not added to the manifest; call [`commit_new_instance`] on
+/// success.
+pub fn create_instance_files(
+    paths: &AppPaths,
+    profile: &InstanceProfile,
+    install: impl FnOnce() -> Result<(), String>,
+) -> Result<(), InstanceError> {
+    create_new_game_dir(paths, profile)?;
+    if let Err(detail) = install() {
+        if let Err(error) = delete_game_dir(paths, profile) {
+            eprintln!(
+                "Ferrite: could not clean up {} after a failed create: {error}",
+                profile.game_dir(paths).display()
+            );
+        }
+        return Err(InstanceError::Install(detail));
+    }
+    Ok(())
+}
+
+/// Adds a newly created instance (whose folder this launcher just created) to the
+/// list and saves the manifest. Returns the new index.
+///
+/// Name and folder are re-checked because the list may have changed while files were
+/// being prepared. If the name is now taken or saving fails, the profile is not kept
+/// and its folder is removed. If another entry now claims the same folder, nothing is
+/// deleted (the folder might be that entry's) and [`InstanceError::FolderShared`] is
+/// returned.
+pub fn commit_new_instance(
+    paths: &AppPaths,
+    profiles: &mut Vec<InstanceProfile>,
+    skipped: &[SkippedEntry],
+    profile: InstanceProfile,
+) -> Result<usize, InstanceError> {
+    if let Some(other) = folder_user(profiles, skipped, profile.directory(), None) {
+        return Err(InstanceError::FolderShared {
+            directory: profile.directory().to_string(),
+            other,
+        });
+    }
+    let discard = |profile: &InstanceProfile| {
+        if let Err(error) = delete_game_dir(paths, profile) {
+            eprintln!(
+                "Ferrite: could not remove uncommitted instance folder {}: {error}",
+                profile.game_dir(paths).display()
+            );
+        }
+    };
+    if let Err(error) = validate_instance_name(&profile.name, profiles, None) {
+        discard(&profile);
+        return Err(error.into());
+    }
+    profiles.push(profile);
+    if let Err(error) = save(paths, profiles, skipped) {
+        let profile = profiles.pop().expect("pushed above");
+        discard(&profile);
+        return Err(error);
+    }
+    Ok(profiles.len() - 1)
+}
+
+/// Describes the first manifest entry other than `except` whose folder matches
+/// `directory` case-insensitively: a loaded profile or a skipped entry.
+pub(crate) fn folder_user(
+    profiles: &[InstanceProfile],
+    skipped: &[SkippedEntry],
+    directory: &InstanceDirName,
+    except: Option<usize>,
+) -> Option<String> {
+    let key = directory_key(directory.as_str());
+    if let Some(profile) = profiles
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| Some(*index) != except)
+        .map(|(_, profile)| profile)
+        .find(|profile| directory_key(profile.directory().as_str()) == key)
+    {
+        return Some(format!("the instance '{}'", profile.name));
+    }
+    skipped
+        .iter()
+        .find(|entry| entry.raw_directory().map(directory_key).as_deref() == Some(key.as_str()))
+        .map(|entry| format!("a skipped manifest entry ({entry})"))
+}
+
+/// Index of the loaded profile stored in `directory`.
+pub(crate) fn find_profile(
+    profiles: &[InstanceProfile],
+    directory: &InstanceDirName,
+) -> Result<usize, InstanceError> {
+    profiles
+        .iter()
+        .position(|profile| profile.directory() == directory)
+        .ok_or_else(|| InstanceError::NotFound(directory.to_string()))
+}
+
+/// Whether `profile`'s folder is missing from disk (checked without following a link
+/// at that path, so a dangling link does not count as missing).
+pub fn folder_missing(paths: &AppPaths, profile: &InstanceProfile) -> bool {
+    fs::symlink_metadata(profile.game_dir(paths)).is_err()
+}
+
 /// Creates the game directory belonging to `profile` and any missing parents.
 pub fn create_game_dir(paths: &AppPaths, profile: &InstanceProfile) -> Result<(), InstanceError> {
     let path = profile.game_dir(paths);
@@ -182,7 +507,10 @@ pub fn delete_game_dir(paths: &AppPaths, profile: &InstanceProfile) -> Result<()
 
 /// Rejects paths that escape the instances root (defense in depth; validated
 /// directory names already cannot).
-fn ensure_game_dir_contained(paths: &AppPaths, path: &Path) -> Result<(), InstanceError> {
+pub(crate) fn ensure_game_dir_contained(
+    paths: &AppPaths,
+    path: &Path,
+) -> Result<(), InstanceError> {
     let root = paths.instances_dir();
     if is_contained_instance_path(path, &root) {
         Ok(())
@@ -406,5 +734,166 @@ mod tests {
         let message = create_game_dir(&paths, &escaped).unwrap_err().to_string();
         assert!(message.contains("refusing to modify"), "{message}");
         assert!(target.exists());
+    }
+
+    // ----- Stage 2: names and folder allocation -----
+
+    fn manifest_with(paths: &AppPaths, text: &str) -> LoadedInstances {
+        fs::create_dir_all(paths.storage_root()).unwrap();
+        fs::write(paths.instances_manifest(), text).unwrap();
+        load(paths).unwrap()
+    }
+
+    #[test]
+    fn names_are_unique_case_insensitively() {
+        let existing = vec![profile("Foo", &[])];
+        assert_eq!(
+            validate_instance_name("  foo ", &existing, None),
+            Err(NameError::Taken("Foo".into()))
+        );
+        assert_eq!(
+            validate_instance_name("   ", &existing, None),
+            Err(NameError::Empty)
+        );
+        assert_eq!(
+            validate_instance_name("a\tb", &existing, None),
+            Err(NameError::ControlCharacter)
+        );
+        assert_eq!(
+            validate_instance_name(" Bar ", &existing, None).unwrap(),
+            "Bar"
+        );
+        // Renaming an instance to a different casing of its own name is allowed.
+        let own = existing[0].directory().clone();
+        assert_eq!(
+            validate_instance_name("FOO", &existing, Some(&own)).unwrap(),
+            "FOO"
+        );
+        assert_eq!(suggest_name(&existing, "foo"), "foo (2)");
+        assert_eq!(suggest_name(&existing, "Other"), "Other");
+    }
+
+    #[test]
+    fn allocation_is_case_insensitive_against_profiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        // A legacy entry whose folder differs from the new slug only by case.
+        let loaded = manifest_with(
+            &paths,
+            r#"[{"name":"Old","version":"1","loader":"Vanilla","directory":"Foo"}]"#,
+        );
+        let new =
+            new_instance_profile(&paths, "foo", "1.21.1", "Fabric", &loaded.profiles, &[]).unwrap();
+        assert_eq!(new.directory().as_str(), "foo-2");
+        let error =
+            new_instance_profile(&paths, "OLD", "1", "Vanilla", &loaded.profiles, &[]).unwrap_err();
+        assert!(matches!(error, InstanceError::Name(NameError::Taken(ref n)) if n == "Old"));
+    }
+
+    #[test]
+    fn allocation_skips_leftover_folders_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        // Left behind by a crash, a failed delete, or "remove from list, keep files".
+        fs::create_dir_all(paths.instances_dir().join("My-Pack")).unwrap();
+        fs::write(paths.instances_dir().join("My-Pack/keep.txt"), b"user data").unwrap();
+        let new = new_instance_profile(&paths, "My Pack", "1", "Vanilla", &[], &[]).unwrap();
+        assert_eq!(new.directory().as_str(), "my-pack-2");
+        create_new_game_dir(&paths, &new).unwrap();
+        assert_eq!(
+            fs::read(paths.instances_dir().join("My-Pack/keep.txt")).unwrap(),
+            b"user data"
+        );
+    }
+
+    #[test]
+    fn allocation_skips_folders_of_skipped_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        let loaded = manifest_with(
+            &paths,
+            r#"[{"name":"A","version":"1","loader":"Vanilla","directory":"alpha"},
+                {"name":"B","version":"1","loader":"Vanilla","directory":"ALPHA"},
+                {"name":"C","version":"1","loader":"Vanilla","directory":"beta."}]"#,
+        );
+        assert_eq!(loaded.skipped.len(), 2);
+        // `beta.` is invalid, but on Windows it names the same folder as `beta`.
+        let beta =
+            new_instance_profile(&paths, "Beta", "1", "Vanilla", &[], &loaded.skipped).unwrap();
+        assert_eq!(beta.directory().as_str(), "beta-2");
+        let alpha =
+            new_instance_profile(&paths, "alpha", "1", "Vanilla", &[], &loaded.skipped).unwrap();
+        assert_eq!(alpha.directory().as_str(), "alpha-2");
+    }
+
+    #[test]
+    fn create_never_adopts_an_existing_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        let first = profile("Same", &[]);
+        fs::create_dir_all(first.game_dir(&paths)).unwrap();
+        let error = create_new_game_dir(&paths, &first).unwrap_err();
+        assert!(matches!(error, InstanceError::FolderExists(_)), "{error}");
+    }
+
+    #[test]
+    fn failed_create_removes_its_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        let new = new_instance_profile(&paths, "Broken", "1", "Vanilla", &[], &[]).unwrap();
+        let error = create_instance_files(&paths, &new, || {
+            fs::write(new.game_dir(&paths).join("partial.txt"), b"x").unwrap();
+            Err("download failed".into())
+        })
+        .unwrap_err();
+        assert!(matches!(error, InstanceError::Install(ref d) if d == "download failed"));
+        assert!(!new.game_dir(&paths).exists());
+        assert!(
+            paths.instances_dir().is_dir(),
+            "only the new folder is removed"
+        );
+    }
+
+    #[test]
+    fn commit_rolls_back_and_cleans_up_when_save_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        let new = new_instance_profile(&paths, "New", "1", "Vanilla", &[], &[]).unwrap();
+        create_instance_files(&paths, &new, || Ok(())).unwrap();
+        // A manifest this build cannot read makes `save` refuse.
+        fs::write(paths.instances_manifest(), "{ corrupt").unwrap();
+        let mut profiles = Vec::new();
+        let error = commit_new_instance(&paths, &mut profiles, &[], new.clone()).unwrap_err();
+        assert!(matches!(error, InstanceError::RefusingToOverwrite(_)));
+        assert!(profiles.is_empty());
+        assert!(!new.game_dir(&paths).exists());
+
+        // Success path.
+        fs::remove_file(paths.instances_manifest()).unwrap();
+        let new = new_instance_profile(&paths, "New", "1", "Vanilla", &[], &[]).unwrap();
+        create_instance_files(&paths, &new, || Ok(())).unwrap();
+        assert_eq!(
+            commit_new_instance(&paths, &mut profiles, &[], new).unwrap(),
+            0
+        );
+        assert_eq!(load(&paths).unwrap().profiles, profiles);
+    }
+
+    #[test]
+    fn commit_refuses_a_name_taken_meanwhile() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        let new = new_instance_profile(&paths, "Dup", "1", "Vanilla", &[], &[]).unwrap();
+        create_instance_files(&paths, &new, || Ok(())).unwrap();
+        let mut profiles = vec![InstanceProfile::with_directory(
+            "DUP".into(),
+            "1".into(),
+            "Vanilla".into(),
+            InstanceDirName::parse("other").unwrap(),
+        )];
+        let error = commit_new_instance(&paths, &mut profiles, &[], new.clone()).unwrap_err();
+        assert!(matches!(error, InstanceError::Name(NameError::Taken(_))));
+        assert_eq!(profiles.len(), 1);
+        assert!(!new.game_dir(&paths).exists());
     }
 }

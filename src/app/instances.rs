@@ -4,14 +4,14 @@
 //! The UI thread polls progress and alone mutates the profile list or saves its index,
 //! preserving a clear commit point between filesystem preparation and visible state.
 
-use super::{
-    Ferrite, InstanceCreationEvent, InstanceCreationStage, PackImportOutcome, PackTaskEvent, Page,
-    page_heading,
-};
+use super::{Ferrite, InstanceCreationEvent, InstanceCreationStage, Page, page_heading};
 use crate::instances::InstanceProfile;
 use crate::loaders::ModLoader;
-use crate::packs::{ExportOptions, ImportOptions, PackFormat, PackTarget};
+use crate::packs::PackFormat;
 use eframe::egui::{self, Color32, RichText};
+use ferrite_launcher::core::activity::{
+    BusyOperation, GlobalBusy, InstanceAction, InstanceStatus, disabled_reason,
+};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, TryRecvError};
 
@@ -38,7 +38,7 @@ impl Ferrite {
     /// The new profile is moved into the worker; only a successful terminal event adds
     /// it to UI state and persists the profile index.
     pub(super) fn create_instance(&mut self) {
-        if self.instance_creation_task.is_some() || self.pack_busy() {
+        if self.instance_creation_task.is_some() || self.create_import_lock().is_some() {
             return;
         }
         self.instance_creation_status = None;
@@ -47,7 +47,7 @@ impl Ferrite {
             self.running_text = "An instance name is required.".to_owned();
             return;
         }
-        if self.instances.iter().any(|instance| instance.name == name) {
+        if crate::instances::name_taken(&self.instances, name, None) {
             self.running_text = format!("An instance named '{name}' already exists.");
             return;
         }
@@ -65,12 +65,22 @@ impl Ferrite {
             return;
         }
 
-        let profile = InstanceProfile::new(
-            name.to_owned(),
-            self.selected_version.clone(),
-            self.selected_loader.clone(),
+        // The folder is allocated case-insensitively against loaded profiles, skipped
+        // manifest entries, and folders already on disk; it is never adopted.
+        let profile = match crate::instances::new_instance_profile(
+            &self.paths,
+            name,
+            &self.selected_version,
+            &self.selected_loader,
             &self.instances,
-        );
+            &self.skipped_instances,
+        ) {
+            Ok(profile) => profile,
+            Err(error) => {
+                self.running_text = format!("Cannot create instance: {error}");
+                return;
+            }
+        };
         let paths = self.paths.clone();
         let (sender, receiver) = mpsc::channel();
         let worker = std::thread::Builder::new()
@@ -80,29 +90,16 @@ impl Ferrite {
                     let _ = sender.send(InstanceCreationEvent::Stage(
                         InstanceCreationStage::Preparing,
                     ));
-                    crate::instances::create_game_dir(&paths, &profile)
-                        .map_err(|error| format!("Failed to create instance directory: {error}"))?;
-                    let _ = sender.send(InstanceCreationEvent::Stage(
-                        InstanceCreationStage::DownloadingMinecraft,
-                    ));
-                    crate::minecraft::install_version_with_progress(
-                        &paths,
-                        &profile.version,
-                        |message| {
-                            let _ = sender
-                                .send(InstanceCreationEvent::DownloadProgress(message.into()));
-                        },
-                    )
-                    .map_err(|error| format!("Failed to download Minecraft: {error}"))?;
-                    if loader != ModLoader::Vanilla {
-                        let _ = sender.send(InstanceCreationEvent::Stage(
-                            InstanceCreationStage::InstallingLoader,
-                        ));
-                        // Loader backends repeat the vanilla install, reusing cached downloads.
-                        crate::loaders::install(&paths, &profile.version, loader).map_err(
-                            |error| format!("Failed to install {}: {error}", loader.label()),
-                        )?;
-                    }
+                    // A failed install removes the folder this call created.
+                    crate::instances::create_instance_files(&paths, &profile, || {
+                        install_game_files(&paths, &profile.version, loader, &|event| {
+                            let _ = sender.send(event);
+                        })
+                    })
+                    .map_err(|error| match error {
+                        crate::instances::InstanceError::Install(detail) => detail,
+                        other => format!("Failed to create instance directory: {other}"),
+                    })?;
                     let _ = sender.send(InstanceCreationEvent::Stage(
                         InstanceCreationStage::Finalizing,
                     ));
@@ -143,19 +140,23 @@ impl Ferrite {
                     match result {
                         Ok(profile) => {
                             let name = profile.name.clone();
-                            self.instances.push(profile);
-                            if let Err(error) = crate::instances::save(
+                            // On failure the profile is not kept and its new folder is
+                            // removed, so memory, manifest, and disk stay consistent.
+                            let index = match crate::instances::commit_new_instance(
                                 &self.paths,
-                                &self.instances,
+                                &mut self.instances,
                                 &self.skipped_instances,
+                                profile,
                             ) {
-                                self.instances.pop();
-                                self.instance_creation_failed(format!(
-                                    "Failed to save instance: {error}"
-                                ));
-                                return;
-                            }
-                            self.selected_instance = Some(self.instances.len() - 1);
+                                Ok(index) => index,
+                                Err(error) => {
+                                    self.instance_creation_failed(format!(
+                                        "Failed to save instance: {error}"
+                                    ));
+                                    return;
+                                }
+                            };
+                            self.selected_instance = Some(index);
                             self.running_text = format!("Created instance '{name}'.");
                             self.instance_creation_status = None;
                             self.instance_name.clear();
@@ -187,305 +188,6 @@ impl Ferrite {
     /// Treats the single pack receiver as both task handle and serialization guard.
     pub(super) fn pack_busy(&self) -> bool {
         self.pack_task.is_some()
-    }
-
-    /// Imports and installs an archive on a worker, returning an uncommitted profile.
-    ///
-    /// Existing profiles and form options are cloned into the `'static` worker so it
-    /// never borrows [`Ferrite`]. The pack subsystem stages validation internally, then
-    /// publishes files to the final game directory before returning. If the UI cannot
-    /// persist the profile index, dropping the outcome removes those published files.
-    pub(super) fn start_pack_import(&mut self) {
-        if self.pack_busy()
-            || self.instance_creation_task.is_some()
-            || self.mod_task.is_some()
-            || self.pending_uninstall.is_some()
-            || crate::minecraft::is_running()
-        {
-            self.pack_status = Some("Stop Minecraft and finish other instance work first.".into());
-            return;
-        }
-        let source = PathBuf::from(self.pack_path.trim());
-        if self.pack_path.trim().is_empty() || !source.is_file() {
-            self.pack_status = Some("Choose an existing pack archive path.".into());
-            return;
-        }
-        let Some(generic_loader) = self.selected_loader() else {
-            self.pack_status = Some("Select a valid loader for generic ZIP imports.".into());
-            return;
-        };
-        let generic_target = PackTarget {
-            minecraft_version: self.selected_version.clone(),
-            loader: generic_loader,
-            loader_version: None,
-        };
-        let requested_name = self.pack_name.trim().to_owned();
-        // The snapshot makes naming deterministic without sharing the live profile list.
-        let existing = self.instances.clone();
-        let include_optional = self.pack_include_optional;
-        let curseforge_api_key = std::env::var("FERRITE_CURSEFORGE_API_KEY").ok();
-        let paths = self.paths.clone();
-        let (sender, receiver) = mpsc::channel();
-        let event_sender = sender.clone();
-        let worker = std::thread::Builder::new()
-            .name("pack-import".to_owned())
-            .spawn(move || {
-                let result = (|| -> Result<PackImportOutcome, String> {
-                    let info = crate::packs::inspect(&source).map_err(|error| error.to_string())?;
-                    let target = info.target.clone().unwrap_or(generic_target);
-                    let base_name = if requested_name.is_empty() {
-                        info.name.trim().to_owned()
-                    } else {
-                        requested_name
-                    };
-                    if base_name.is_empty() {
-                        return Err("The imported instance needs a name.".into());
-                    }
-                    let mut name = base_name.clone();
-                    let mut suffix = 2;
-                    loop {
-                        let candidate = InstanceProfile::new(
-                            name.clone(),
-                            target.minecraft_version.clone(),
-                            target.loader.label().to_owned(),
-                            &existing,
-                        );
-                        if !existing.iter().any(|profile| profile.name == name)
-                            && !candidate.game_dir(&paths).exists()
-                        {
-                            break;
-                        }
-                        name = format!("{base_name} ({suffix})");
-                        suffix += 1;
-                    }
-                    let profile = InstanceProfile::new(
-                        name,
-                        target.minecraft_version.clone(),
-                        target.loader.label().to_owned(),
-                        &existing,
-                    );
-                    let parent = profile
-                        .game_dir(&paths)
-                        .parent()
-                        .expect("instance game directory has a parent")
-                        .to_owned();
-                    std::fs::create_dir_all(parent)
-                        .map_err(|error| format!("Failed to prepare instance storage: {error}"))?;
-                    let options = ImportOptions {
-                        generic_target: Some(target.clone()),
-                        include_optional_modrinth_files: include_optional,
-                        curseforge_api_key,
-                        ..ImportOptions::default()
-                    };
-                    let report = crate::packs::import(&source, profile.game_dir(&paths), &options, |step| {
-                        let _ = event_sender.send(PackTaskEvent::Progress(step.to_owned()));
-                    })
-                    .map_err(|error| error.to_string())?;
-                    if report.info.target.as_ref() != Some(&target) {
-                        let _ = crate::instances::delete_game_dir(&paths, &profile);
-                        return Err("The pack changed while it was being imported; no instance was kept.".into());
-                    }
-
-                    let install = (|| -> Result<(), String> {
-                        let _ = event_sender.send(PackTaskEvent::Progress(
-                            "Installing Minecraft files...".into(),
-                        ));
-                        crate::minecraft::install_version_with_progress(
-                            &paths,
-                            &target.minecraft_version,
-                            |message| {
-                                let _ = event_sender
-                                    .send(PackTaskEvent::Progress(message.to_owned()));
-                            },
-                        )
-                        .map_err(|error| format!("Failed to install Minecraft: {error}"))?;
-                        if target.loader != ModLoader::Vanilla {
-                            let _ = event_sender.send(PackTaskEvent::Progress(format!(
-                                "Installing {}...",
-                                target.loader.label()
-                            )));
-                            crate::loaders::install_version(
-                                &paths,
-                                &target.minecraft_version,
-                                target.loader,
-                                target.loader_version.as_deref(),
-                            )
-                            .map_err(|error| {
-                                format!("Failed to install {}: {error}", target.loader.label())
-                            })?;
-                            if let Some(requested) = target.loader_version.as_deref() {
-                                let installed = crate::loaders::installed_loader_version(
-                                    &paths,
-                                    &target.minecraft_version,
-                                    target.loader,
-                                );
-                                if installed.as_deref() != Some(requested) {
-                                    return Err(format!(
-                                        "Pack requires {} {requested}, but Ferrite installed {}. Exact loader-version installation is required for this pack.",
-                                        target.loader.label(),
-                                        installed.as_deref().unwrap_or("an unknown version")
-                                    ));
-                                }
-                            }
-                        }
-                        Ok(())
-                    })();
-                    if let Err(error) = install {
-                        let _ = crate::instances::delete_game_dir(&paths, &profile);
-                        return Err(error);
-                    }
-                    Ok(PackImportOutcome {
-                        paths: paths.clone(),
-                        profile,
-                        files: report.files_written,
-                        bytes: report.bytes_written,
-                        warnings: report.warnings,
-                        committed: false,
-                    })
-                })();
-                let _ = sender.send(PackTaskEvent::Imported(result.map(Box::new)));
-            });
-        match worker {
-            Ok(_) => {
-                self.pack_task = Some(receiver);
-                self.pack_status = Some("Inspecting pack...".into());
-            }
-            Err(error) => self.pack_status = Some(format!("Failed to start import: {error}")),
-        }
-    }
-
-    /// Captures the selected profile and export options for one background archive write.
-    pub(super) fn start_pack_export(&mut self) {
-        if self.pack_busy()
-            || self.instance_creation_task.is_some()
-            || self.mod_task.is_some()
-            || self.pending_uninstall.is_some()
-            || crate::minecraft::is_running()
-        {
-            self.pack_status = Some("Stop Minecraft and finish other instance work first.".into());
-            return;
-        }
-        let Some(profile) = self.selected_instance().cloned() else {
-            self.pack_status = Some("Select an instance to export.".into());
-            return;
-        };
-        let mut output = PathBuf::from(self.pack_path.trim());
-        if self.pack_path.trim().is_empty() {
-            self.pack_status = Some("Enter an output archive path.".into());
-            return;
-        }
-        output.set_extension(self.pack_format.extension());
-        let output_display = output.display().to_string();
-        let options = ExportOptions {
-            format: self.pack_format,
-            name: if self.pack_name.trim().is_empty() {
-                profile.name.clone()
-            } else {
-                self.pack_name.trim().to_owned()
-            },
-            version: (!self.pack_version.trim().is_empty())
-                .then(|| self.pack_version.trim().to_owned()),
-            summary: None,
-            loader_version: (!self.pack_loader_version.trim().is_empty())
-                .then(|| self.pack_loader_version.trim().to_owned()),
-            include_worlds: self.pack_include_worlds,
-        };
-        let paths = self.paths.clone();
-        let (sender, receiver) = mpsc::channel();
-        let event_sender = sender.clone();
-        let worker = std::thread::Builder::new()
-            .name("pack-export".to_owned())
-            .spawn(move || {
-                let result = crate::packs::export(&paths, &profile, &output, &options, |step| {
-                    let _ = event_sender.send(PackTaskEvent::Progress(step.to_owned()));
-                })
-                .map(|()| output_display)
-                .map_err(|error| error.to_string());
-                let _ = sender.send(PackTaskEvent::Exported(result));
-            });
-        match worker {
-            Ok(_) => {
-                self.pack_task = Some(receiver);
-                self.pack_status = Some("Preparing export...".into());
-            }
-            Err(error) => self.pack_status = Some(format!("Failed to start export: {error}")),
-        }
-    }
-
-    /// Drains pack progress and performs the import's final profile-list commit.
-    ///
-    /// Marking an outcome committed only after `instances::save` succeeds transfers
-    /// cleanup responsibility away from its [`Drop`] rollback guard.
-    pub(super) fn poll_pack_task(&mut self) {
-        loop {
-            let Some(receiver) = &self.pack_task else {
-                return;
-            };
-            match receiver.try_recv() {
-                Ok(PackTaskEvent::Progress(message)) => self.pack_status = Some(message),
-                Ok(PackTaskEvent::Imported(result)) => {
-                    self.pack_task = None;
-                    match result {
-                        Ok(mut outcome) => {
-                            let name = outcome.profile.name.clone();
-                            self.instances.push(outcome.profile.clone());
-                            if let Err(error) = crate::instances::save(
-                                &self.paths,
-                                &self.instances,
-                                &self.skipped_instances,
-                            ) {
-                                self.instances.pop();
-                                self.pack_status = Some(format!(
-                                    "Imported files but could not save the instance: {error}"
-                                ));
-                                return;
-                            }
-                            outcome.committed = true;
-                            self.selected_instance = Some(self.instances.len() - 1);
-                            let mib = outcome.bytes as f64 / (1024.0 * 1024.0);
-                            let warning = if outcome.warnings.is_empty() {
-                                String::new()
-                            } else {
-                                format!(" Warnings: {}", outcome.warnings.join(" "))
-                            };
-                            let message = format!(
-                                "Imported '{name}' ({} files, {mib:.1} MiB).{warning}",
-                                outcome.files
-                            );
-                            self.pack_status = Some(message.clone());
-                            self.running_text = message;
-                            self.import_pack_open = false;
-                        }
-                        Err(error) => {
-                            self.pack_status = Some(format!("Import failed: {error}"));
-                            self.running_text = format!("Import failed: {error}");
-                        }
-                    }
-                    return;
-                }
-                Ok(PackTaskEvent::Exported(result)) => {
-                    self.pack_task = None;
-                    let message = match result {
-                        Ok(path) => {
-                            self.export_pack_open = false;
-                            format!("Exported instance to {path}.")
-                        }
-                        Err(error) => format!("Export failed: {error}"),
-                    };
-                    self.pack_status = Some(message.clone());
-                    self.running_text = message;
-                    return;
-                }
-                Err(TryRecvError::Disconnected) => {
-                    self.pack_task = None;
-                    let message = "The import/export worker stopped unexpectedly.".to_owned();
-                    self.pack_status = Some(message.clone());
-                    self.running_text = message;
-                    return;
-                }
-                Err(TryRecvError::Empty) => return,
-            }
-        }
     }
 
     /// Returns the user-actionable reason authenticated launch is currently unavailable.
@@ -562,49 +264,17 @@ impl Ferrite {
         }
     }
 
-    /// Removes a profile transactionally from the index, then best-effort deletes files.
-    pub(super) fn remove_selected(&mut self) {
-        if self.mod_task.is_some()
-            || self.pending_uninstall.is_some()
-            || self.pack_busy()
-            || crate::minecraft::is_running()
-        {
-            self.running_text =
-                "Stop Minecraft and finish mod management before removing instances.".into();
-            return;
+    /// Why Create and Import are unavailable right now, if they are.
+    pub(super) fn create_import_lock(&self) -> Option<String> {
+        if self.pack_busy() {
+            return Some("Wait for the import or export to finish.".into());
         }
-        let Some(index) = self.selected_instance else {
-            return;
-        };
-
-        // Persist logical removal first; restore memory if the index write cannot commit.
-        let removed = self.instances.remove(index);
-        if let Err(error) =
-            crate::instances::save(&self.paths, &self.instances, &self.skipped_instances)
+        if let Some(task) = &self.edit_task
+            && task.installing().is_some()
         {
-            self.instances.insert(index, removed);
-            self.running_text = format!("Failed to remove instance: {error}");
-            return;
+            return Some("Wait for Ferrite to finish updating the instance.".into());
         }
-
-        if self
-            .mod_target
-            .as_ref()
-            .is_some_and(|target| target.directory() == removed.directory())
-        {
-            self.mod_target = None;
-            self.installed_mods = None;
-        }
-        self.selected_instance = self
-            .instances
-            .get(index)
-            .map(|_| index)
-            .or_else(|| index.checked_sub(1));
-        let name = removed.name.clone();
-        self.running_text = match crate::instances::delete_game_dir(&self.paths, &removed) {
-            Ok(()) => format!("Removed instance '{name}'."),
-            Err(error) => format!("Removed '{name}', but could not delete its files: {error}"),
-        };
+        None
     }
 
     /// Draws profile cards and executes at most one deferred card action afterward.
@@ -612,24 +282,25 @@ impl Ferrite {
         let muted = self.muted_color();
         page_heading(ui, "Instances", "Manage your Minecraft profiles.");
         ui.add_space(8.0);
+        let lock = self.create_import_lock();
         ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    !self.pack_busy(),
-                    egui::Button::new("＋ Create instance").fill(self.accent_color()),
-                )
-                .clicked()
-            {
+            let create = ui.add_enabled(
+                lock.is_none(),
+                egui::Button::new(RichText::new("+ Create instance").color(Color32::WHITE))
+                    .fill(self.accent_color()),
+            );
+            if create.clicked() {
                 self.create_instance_open = true;
             }
-            if ui
-                .add_enabled(!self.pack_busy(), egui::Button::new("Import pack"))
-                .clicked()
-            {
-                self.pack_path.clear();
-                self.pack_name.clear();
-                self.pack_status = None;
-                self.import_pack_open = true;
+            if let Some(reason) = &lock {
+                create.on_disabled_hover_text(reason);
+            }
+            let import = ui.add_enabled(lock.is_none(), egui::Button::new("Import pack"));
+            if import.clicked() {
+                self.open_import_window();
+            }
+            if let Some(reason) = &lock {
+                import.on_disabled_hover_text(reason);
             }
         });
         ui.add_space(20.0);
@@ -644,294 +315,199 @@ impl Ferrite {
         }
 
         // Defer mutations until iteration releases its immutable borrow of `instances`.
-        let mut launch = false;
-        let mut remove = false;
-        let mut export = false;
-        let mut mods = None;
+        let mut action = None;
+        let cards: Vec<CardInfo> = self
+            .instances
+            .iter()
+            .map(|instance| {
+                let status = self.instance_status(instance);
+                let chip = self.instance_chip(instance, &status);
+                CardInfo {
+                    status,
+                    chip,
+                    folder: instance.game_dir(&self.paths),
+                }
+            })
+            .collect();
         let mod_idle =
             self.mod_task.is_none() && self.pending_uninstall.is_none() && !self.pack_busy();
+        let scroll_to = self.scroll_to_instance.take();
+        let light = self.ui_settings.appearance.theme == "light";
+        let accent = self.accent_color();
+        let card_color = self.card_color();
+        let corner_radius = self.ui_settings.appearance.corner_radius;
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (index, instance) in self.instances.iter().enumerate() {
                 let selected = self.selected_instance == Some(index);
-                egui::Frame::new()
-                    .fill(if selected {
-                        if self.ui_settings.appearance.theme == "light" {
-                            Color32::from_rgb(255, 240, 232)
-                        } else {
-                            Color32::from_rgb(43, 39, 44)
-                        }
-                    } else {
-                        self.card_color()
-                    })
-                    .stroke(egui::Stroke::new(
-                        if selected { 1.5 } else { 1.0 },
-                        if selected {
-                            self.accent_color()
-                        } else {
-                            Color32::from_rgb(50, 55, 64)
-                        },
-                    ))
-                    .corner_radius(self.ui_settings.appearance.corner_radius)
-                    .inner_margin(18.0)
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        // Metadata and actions use separate rows so long names do
-                        // not push buttons beyond a narrow viewport.
-                        if ui
-                            .selectable_label(
-                                selected,
-                                RichText::new(&instance.name).size(20.0).strong(),
-                            )
-                            .clicked()
-                        {
-                            self.selected_instance = Some(index);
-                        }
-                        ui.label(
-                            RichText::new(format!(
-                                "Minecraft {}  •  {}",
-                                instance.version, instance.loader
+                let info = &cards[index];
+                let card = ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .id_salt(("instance-card", instance.directory().as_str()))
+                        .sense(egui::Sense::click()),
+                    |ui| {
+                        egui::Frame::new()
+                            .fill(match (selected, light) {
+                                (true, true) => Color32::from_rgb(255, 240, 232),
+                                (true, false) => Color32::from_rgb(43, 39, 44),
+                                _ => card_color,
+                            })
+                            .stroke(egui::Stroke::new(
+                                if selected { 1.5 } else { 1.0 },
+                                if selected {
+                                    accent
+                                } else {
+                                    Color32::from_rgb(50, 55, 64)
+                                },
                             ))
-                            .color(muted),
-                        );
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add_enabled(mod_idle, egui::Button::new("Play"))
-                                .clicked()
-                            {
-                                self.selected_instance = Some(index);
-                                launch = true;
-                            }
-                            if ui
-                                .add_enabled(mod_idle, egui::Button::new("Mods"))
-                                .clicked()
-                            {
-                                mods = Some(instance.clone());
-                            }
-                            if ui
-                                .add_enabled(
-                                    mod_idle && !crate::minecraft::is_running(),
-                                    egui::Button::new("Export"),
-                                )
-                                .clicked()
-                            {
-                                self.selected_instance = Some(index);
-                                export = true;
-                            }
-                            if ui
-                                .add_enabled(
-                                    mod_idle && !crate::minecraft::is_running(),
-                                    egui::Button::new("Remove"),
-                                )
-                                .clicked()
-                            {
-                                self.selected_instance = Some(index);
-                                remove = true;
-                            }
-                        });
-                    });
+                            .corner_radius(corner_radius)
+                            .inner_margin(18.0)
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                instance_card(ui, index, instance, info, mod_idle, accent, muted)
+                            })
+                            .inner
+                    },
+                );
+                if let Some(card_action) = card.inner {
+                    action = Some(card_action);
+                }
+                let response = card.response;
+                if response.clicked() {
+                    action = Some(CardAction::Select(index));
+                }
+                response.context_menu(|ui| {
+                    if let Some(menu_action) = card_menu(ui, index, instance, info) {
+                        action = Some(menu_action);
+                    }
+                });
+                if scroll_to.as_ref() == Some(instance.directory()) {
+                    response.scroll_to_me(Some(egui::Align::Center));
+                }
                 ui.add_space(10.0);
             }
         });
-        if let Some(target) = mods {
-            self.set_mod_target(target);
-            self.show_installed = true;
-            self.current_page = Page::Mods;
-            self.local_mod_task(None);
+        if let Some(action) = action {
+            self.run_card_action(action);
         }
-        if launch {
-            self.launch_selected();
-        } else if export {
-            if let Some(name) = self
-                .selected_instance()
-                .map(|instance| instance.name.clone())
-            {
-                self.pack_path = format!("{}.ferritepack", name.replace(['/', '\\'], "-"));
-                self.pack_name = name;
+    }
+
+    /// The status chip for a card (spec §2.3), if any.
+    fn instance_chip(&self, instance: &InstanceProfile, status: &InstanceStatus) -> Option<Chip> {
+        use ferrite_launcher::core::activity::InstanceActivity;
+        match status.activity {
+            InstanceActivity::Busy(BusyOperation::Deleting) => Some(Chip::Busy {
+                text: format!("Moving to {}…", super::dialogs::trash_word()),
+                reopen: None,
+            }),
+            InstanceActivity::Busy(BusyOperation::Updating) => Some(Chip::Busy {
+                text: "Updating…".into(),
+                reopen: Some(Reopen::Update),
+            }),
+            InstanceActivity::Busy(BusyOperation::Duplicating) => Some(Chip::Busy {
+                text: self
+                    .duplicate_job_for(instance.directory())
+                    .and_then(super::duplicate::DuplicateJob::progress)
+                    .map(|progress| super::duplicate::chip_text(&progress))
+                    .unwrap_or_else(|| "Copying…".into()),
+                reopen: Some(Reopen::Duplicate(instance.directory().clone())),
+            }),
+            InstanceActivity::Running => Some(Chip::Running),
+            InstanceActivity::Idle if status.folder_missing => Some(Chip::FolderMissing),
+            InstanceActivity::Idle => None,
+        }
+    }
+
+    /// Carries out one card or menu action after the cards were drawn.
+    fn run_card_action(&mut self, action: CardAction) {
+        match action {
+            CardAction::Select(index) => self.selected_instance = Some(index),
+            CardAction::Play(index) => {
+                self.selected_instance = Some(index);
+                self.launch_selected();
             }
-            self.pack_format = PackFormat::Ferrite;
-            self.pack_include_worlds = true;
-            self.pack_loader_version.clear();
-            self.pack_status = None;
-            self.export_pack_open = true;
-        } else if remove {
-            self.remove_selected();
+            CardAction::Mods(index) => {
+                if let Some(target) = self.instances.get(index).cloned() {
+                    self.set_mod_target(target);
+                    self.show_installed = true;
+                    self.current_page = Page::Mods;
+                    self.local_mod_task(None);
+                }
+            }
+            CardAction::OpenFolder(folder) => {
+                if let Some(message) = super::dialogs::open_folder(&folder) {
+                    self.running_text = message;
+                }
+            }
+            CardAction::Edit(index) => {
+                self.selected_instance = Some(index);
+                if let Some(directory) = self.instances.get(index).map(|p| p.directory().clone()) {
+                    self.open_edit_dialog(&directory);
+                }
+            }
+            CardAction::Duplicate(index) => {
+                self.selected_instance = Some(index);
+                if let Some(directory) = self.instances.get(index).map(|p| p.directory().clone()) {
+                    self.open_duplicate_dialog(&directory);
+                }
+            }
+            CardAction::Export(index) => {
+                self.selected_instance = Some(index);
+                self.open_export_window();
+            }
+            CardAction::Delete(index) => {
+                self.selected_instance = Some(index);
+                if let Some(directory) = self.instances.get(index).map(|p| p.directory().clone()) {
+                    self.open_remove_dialog(directory);
+                }
+            }
+            CardAction::Reopen(Reopen::Update) => self.show_edit_window(),
+            CardAction::Reopen(Reopen::Duplicate(directory)) => {
+                self.show_duplicate_window(&directory)
+            }
         }
     }
 
-    /// Draws import form/progress and starts requested work after the window closure.
-    pub(super) fn import_pack_window(&mut self, context: &egui::Context) {
-        if !self.import_pack_open {
+    /// Opens the Export window for the selected instance (spec §6).
+    pub(super) fn open_export_window(&mut self) {
+        let Some(profile) = self.selected_instance().cloned() else {
             return;
-        }
-        let mut open = self.import_pack_open;
-        let mut import_requested = false;
-        egui::Window::new("Import instance pack")
-            .open(&mut open)
-            .collapsible(false)
-            .default_width(500.0)
-            .show(context, |ui| {
-                ui.label("Supported: Ferrite, Modrinth, Prism/MultiMC, CurseForge, and generic ZIP archives.");
-                ui.label("Archive contents are validated and staged before the instance is committed.");
-                ui.add_space(8.0);
-                ui.add_enabled_ui(!self.pack_busy(), |ui| {
-                    ui.label("Pack archive");
-                    ui.horizontal(|ui| {
-                        if ui.button("Choose Pack File…").clicked()
-                            && let Some(path) = rfd::FileDialog::new()
-                                .set_title("Choose a Minecraft instance pack")
-                                .add_filter(
-                                    "Minecraft instance packs",
-                                    &["ferritepack", "mrpack", "zip", "lcpack"],
-                                )
-                                .pick_file()
-                        {
-                            self.pack_path = path.display().to_string();
-                            self.pack_status = None;
-                        }
-                        if !self.pack_path.is_empty() && ui.button("Clear").clicked() {
-                            self.pack_path.clear();
-                        }
-                    });
-                    if self.pack_path.is_empty() {
-                        ui.label(RichText::new("No pack selected.").color(self.muted_color()));
-                    } else {
-                        ui.label(RichText::new(&self.pack_path).monospace());
-                    }
-                    ui.label("Instance name override (optional)");
-                    ui.text_edit_singleline(&mut self.pack_name);
-                    ui.separator();
-                    ui.label("Fallback metadata for generic ZIP files");
-                    egui::ComboBox::from_label("Minecraft version")
-                        .selected_text(&self.selected_version)
-                        .show_ui(ui, |ui| {
-                            for version in &self.versions {
-                                ui.selectable_value(
-                                    &mut self.selected_version,
-                                    version.clone(),
-                                    version,
-                                );
-                            }
-                        });
-                    egui::ComboBox::from_label("Mod loader")
-                        .selected_text(&self.selected_loader)
-                        .show_ui(ui, |ui| {
-                            for loader in ModLoader::ALL {
-                                ui.selectable_value(
-                                    &mut self.selected_loader,
-                                    loader.label().to_owned(),
-                                    loader.label(),
-                                );
-                            }
-                        });
-                    ui.checkbox(
-                        &mut self.pack_include_optional,
-                        "Install optional client files from Modrinth packs",
-                    );
-                    ui.label("CurseForge packs containing indexed mods require FERRITE_CURSEFORGE_API_KEY.");
-                    ui.add_space(8.0);
-                    import_requested = ui
-                        .add_enabled(
-                            !self.pack_path.trim().is_empty(),
-                            egui::Button::new("Import and install").fill(self.accent_color()),
-                        )
-                        .clicked();
-                });
-                if self.pack_busy() {
-                    ui.spinner();
-                }
-                if let Some(status) = &self.pack_status {
-                    ui.label(status);
-                }
-            });
-        self.import_pack_open = open;
-        if import_requested {
-            self.start_pack_import();
-        }
+        };
+        self.pack_name = profile.name.clone();
+        self.pack_format = PackFormat::Ferrite;
+        self.pack_include_worlds = true;
+        self.pack_loader_version = ModLoader::from_label(&profile.loader)
+            .filter(|loader| *loader != ModLoader::Vanilla)
+            .and_then(|loader| {
+                crate::loaders::installed_loader_version(&self.paths, &profile.version, loader)
+            })
+            .unwrap_or_default();
+        self.export_loader_prefilled = !self.pack_loader_version.is_empty();
+        self.pack_status = None;
+        self.export_pack_open = true;
     }
 
-    /// Draws export options, including format-dependent safety and metadata controls.
-    pub(super) fn export_pack_window(&mut self, context: &egui::Context) {
-        if !self.export_pack_open {
-            return;
-        }
-        let mut open = self.export_pack_open;
-        let mut export_requested = false;
-        egui::Window::new("Export instance")
-            .open(&mut open)
-            .collapsible(false)
-            .default_width(500.0)
-            .show(context, |ui| {
-                ui.add_enabled_ui(!self.pack_busy(), |ui| {
-                    ui.label("Output path (the usual extension is added when omitted)");
-                    ui.text_edit_singleline(&mut self.pack_path);
-                    ui.label("Pack name");
-                    ui.text_edit_singleline(&mut self.pack_name);
-                    ui.label("Pack version");
-                    ui.text_edit_singleline(&mut self.pack_version);
-                    let previous = self.pack_format;
-                    egui::ComboBox::from_label("Format")
-                        .selected_text(self.pack_format.label())
-                        .show_ui(ui, |ui| {
-                            for format in PackFormat::ALL {
-                                ui.selectable_value(&mut self.pack_format, format, format.label());
-                            }
-                        });
-                    if previous != self.pack_format {
-                        self.pack_include_worlds = matches!(
-                            self.pack_format,
-                            PackFormat::Ferrite | PackFormat::GenericZip
-                        );
-                        if !self.pack_path.trim().is_empty() {
-                            let mut output = PathBuf::from(self.pack_path.trim());
-                            output.set_extension(self.pack_format.extension());
-                            self.pack_path = output.display().to_string();
-                        }
-                    }
-                    if self.pack_format == PackFormat::Lunar {
-                        ui.label(RichText::new("Direct .lcpack export is unavailable because Lunar does not publish its schema. Lunar can import the Modrinth and CurseForge formats.").color(self.muted_color()));
-                    }
-                    let modded = self
-                        .selected_instance()
-                        .is_some_and(|profile| profile.loader != "Vanilla");
-                    if modded
-                        && matches!(
-                            self.pack_format,
-                            PackFormat::Modrinth | PackFormat::Prism | PackFormat::CurseForge
-                        )
-                    {
-                        ui.label("Exact loader version required by this format");
-                        ui.text_edit_singleline(&mut self.pack_loader_version);
-                    }
-                    ui.checkbox(&mut self.pack_include_worlds, "Include worlds/saves");
-                    if matches!(
-                        self.pack_format,
-                        PackFormat::Modrinth | PackFormat::Prism | PackFormat::CurseForge
-                    ) && self.pack_include_worlds
-                    {
-                        ui.label(RichText::new("Warning: distributable packs normally exclude private worlds.").color(self.muted_color()));
-                    }
-                    if matches!(self.pack_format, PackFormat::Modrinth | PackFormat::CurseForge) {
-                        ui.label("This is an override-based export: Ferrite does not invent provider project IDs or download provenance for local JARs.");
-                    }
-                    ui.add_space(8.0);
-                    export_requested = ui
-                        .add_enabled(
-                            !self.pack_path.trim().is_empty()
-                                && self.pack_format != PackFormat::Lunar,
-                            egui::Button::new("Export instance").fill(self.accent_color()),
-                        )
-                        .clicked();
-                });
-                if self.pack_busy() {
-                    ui.spinner();
-                }
-                if let Some(status) = &self.pack_status {
-                    ui.label(status);
-                }
-            });
-        self.export_pack_open = open;
-        if export_requested {
-            self.start_pack_export();
+    /// Opens the Import window on its first step.
+    pub(super) fn open_import_window(&mut self) {
+        self.pack_path.clear();
+        self.pack_name.clear();
+        self.pack_status = None;
+        self.import_pack_open = true;
+    }
+
+    /// Activity, folder presence, and global locks for one card (cheap: one mutex poll
+    /// and one `symlink_metadata` call).
+    pub(super) fn instance_status(&self, instance: &InstanceProfile) -> InstanceStatus {
+        let running = crate::minecraft::is_instance_running(instance.directory().as_str());
+        InstanceStatus {
+            activity: self
+                .activity
+                .activity(instance.directory().as_str(), running),
+            folder_missing: crate::instances::folder_missing(&self.paths, instance),
+            global: GlobalBusy {
+                pack_task: self.pack_busy(),
+                mod_task: self.mod_task.is_some() || self.pending_uninstall.is_some(),
+                creation_task: self.instance_creation_task.is_some(),
+            },
         }
     }
 
@@ -944,6 +520,8 @@ impl Ferrite {
         let mut open = self.create_instance_open;
         let mut create_requested = false;
         egui::Window::new("Create instance")
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(context.content_rect().center())
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -965,17 +543,8 @@ impl Ferrite {
                                 );
                             }
                         });
-                    egui::ComboBox::from_label("Mod loader")
-                        .selected_text(&self.selected_loader)
-                        .show_ui(ui, |ui| {
-                            for loader in ModLoader::ALL {
-                                ui.selectable_value(
-                                    &mut self.selected_loader,
-                                    loader.label().to_owned(),
-                                    loader.label(),
-                                );
-                            }
-                        });
+                    let muted = self.muted_color();
+                    loader_picker(ui, &mut self.selected_loader, muted);
                     ui.add_space(12.0);
                     create_requested = ui
                         .add_enabled(
@@ -992,5 +561,284 @@ impl Ferrite {
         if create_requested {
             self.create_instance();
         }
+    }
+}
+
+/// Per-card state computed before drawing.
+struct CardInfo {
+    status: InstanceStatus,
+    chip: Option<Chip>,
+    folder: PathBuf,
+}
+
+/// Which task window a chip reopens.
+#[derive(Clone)]
+enum Reopen {
+    Update,
+    Duplicate(crate::instances::InstanceDirName),
+}
+
+/// The status chip next to a card's name (spec §2.3).
+enum Chip {
+    FolderMissing,
+    Running,
+    Busy {
+        text: String,
+        reopen: Option<Reopen>,
+    },
+}
+
+/// What the user did on a card.
+enum CardAction {
+    Select(usize),
+    Play(usize),
+    Mods(usize),
+    OpenFolder(PathBuf),
+    Edit(usize),
+    Duplicate(usize),
+    Export(usize),
+    Delete(usize),
+    Reopen(Reopen),
+}
+
+/// One action button, disabled with its reason when needed.
+fn card_button(
+    ui: &mut egui::Ui,
+    button: egui::Button,
+    reason: Option<String>,
+    extra_enabled: bool,
+) -> bool {
+    let response = ui.add_enabled(extra_enabled && reason.is_none(), button);
+    let clicked = response.clicked();
+    if let Some(reason) = reason {
+        response.on_disabled_hover_text(reason);
+    }
+    clicked
+}
+
+/// The card body: name row with chip and Quilt badge, the version line, and the
+/// Play / Mods / ⋯ row (spec §2.1).
+fn instance_card(
+    ui: &mut egui::Ui,
+    index: usize,
+    instance: &InstanceProfile,
+    info: &CardInfo,
+    mod_idle: bool,
+    accent: Color32,
+    muted: Color32,
+) -> Option<CardAction> {
+    let mut action = None;
+    let reason = |action| disabled_reason(action, &instance.name, &info.status);
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::Label::new(RichText::new(&instance.name).size(20.0).strong()).selectable(false),
+        );
+        if let Some(chip) = &info.chip
+            && let Some(reopen) = chip_ui(ui, chip, muted)
+        {
+            action = Some(CardAction::Reopen(reopen));
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        super::dialogs::loader_text(
+            ui,
+            &instance.loader,
+            RichText::new(format!(
+                "Minecraft {}  •  {}",
+                instance.version, instance.loader
+            ))
+            .color(muted),
+            muted,
+        );
+    });
+    ui.horizontal(|ui| {
+        let play = egui::Button::new(RichText::new("Play").color(Color32::WHITE)).fill(accent);
+        if card_button(ui, play, reason(InstanceAction::Play), mod_idle) {
+            action = Some(CardAction::Play(index));
+        }
+        if card_button(
+            ui,
+            egui::Button::new("Mods"),
+            reason(InstanceAction::Mods),
+            mod_idle,
+        ) {
+            action = Some(CardAction::Mods(index));
+        }
+        let menu = ui.menu_button("…", |ui| card_menu(ui, index, instance, info));
+        if let Some(Some(menu_action)) = menu.inner {
+            action = Some(menu_action);
+        }
+        menu.response.on_hover_text("More actions");
+    });
+    action
+}
+
+/// Draws a chip; returns the window to reopen when it was clicked.
+fn chip_ui(ui: &mut egui::Ui, chip: &Chip, muted: Color32) -> Option<Reopen> {
+    let frame = egui::Frame::new()
+        .stroke(egui::Stroke::new(1.0, muted.gamma_multiply(0.6)))
+        .corner_radius(8.0)
+        .inner_margin(egui::Margin::symmetric(6, 2));
+    let small =
+        |text: &str| egui::Label::new(RichText::new(text).small().color(muted)).selectable(false);
+    match chip {
+        Chip::FolderMissing => {
+            frame
+                .show(ui, |ui| ui.add(small("Folder missing")))
+                .response
+                .on_hover_text(
+                    "Ferrite can't find this instance's folder. It may have been moved or deleted.",
+                );
+            None
+        }
+        Chip::Running => {
+            frame.show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                    ui.painter()
+                        .circle_filled(rect.center(), 4.0, super::dialogs::RUNNING_GREEN);
+                    ui.add(small("Running"));
+                });
+            });
+            None
+        }
+        Chip::Busy { text, reopen } => {
+            let response = frame
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui.add(egui::Spinner::new().size(10.0));
+                        ui.add(small(text));
+                    });
+                })
+                .response;
+            let response = if reopen.is_some() {
+                response
+                    .interact(egui::Sense::click())
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text("Show progress")
+            } else {
+                response
+            };
+            if response.clicked() {
+                reopen.clone()
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// The card menu (⋯ button and right-click, spec §2.2). Disabled items stay visible
+/// with their reason.
+fn card_menu(
+    ui: &mut egui::Ui,
+    index: usize,
+    instance: &InstanceProfile,
+    info: &CardInfo,
+) -> Option<CardAction> {
+    let status = &info.status;
+    let reason = |action| disabled_reason(action, &instance.name, status);
+    let mut action = None;
+    let mut item = |ui: &mut egui::Ui, text: RichText, why: Option<String>, chosen: CardAction| {
+        let response = ui.add_enabled(why.is_none(), egui::Button::new(text));
+        if response.clicked() {
+            action = Some(chosen);
+            ui.close();
+        }
+        if let Some(why) = why {
+            response.on_disabled_hover_text(why);
+        }
+    };
+    item(
+        ui,
+        RichText::new("Open folder"),
+        reason(InstanceAction::OpenFolder),
+        CardAction::OpenFolder(info.folder.clone()),
+    );
+    item(
+        ui,
+        RichText::new("Edit…"),
+        reason(InstanceAction::Rename),
+        CardAction::Edit(index),
+    );
+    item(
+        ui,
+        RichText::new("Duplicate…"),
+        reason(InstanceAction::Duplicate),
+        CardAction::Duplicate(index),
+    );
+    item(
+        ui,
+        RichText::new("Export…"),
+        reason(InstanceAction::Export),
+        CardAction::Export(index),
+    );
+    ui.separator();
+    let delete_action = if status.folder_missing {
+        InstanceAction::RemoveFromList
+    } else {
+        InstanceAction::Delete
+    };
+    item(
+        ui,
+        RichText::new("Delete…").color(super::dialogs::DANGER),
+        reason(delete_action),
+        CardAction::Delete(index),
+    );
+    action
+}
+
+/// Installs the shared Minecraft files for `version` and, unless Vanilla, the loader:
+/// the same steps Create runs, reused by Edit's "Save and install". Never touches an
+/// instance folder. Progress goes to `events` as creation stages and messages.
+pub(super) fn install_game_files(
+    paths: &ferrite_launcher::core::paths::AppPaths,
+    version: &str,
+    loader: ModLoader,
+    events: &dyn Fn(InstanceCreationEvent),
+) -> Result<(), String> {
+    events(InstanceCreationEvent::Stage(
+        InstanceCreationStage::DownloadingMinecraft,
+    ));
+    crate::minecraft::install_version_with_progress(paths, version, |message| {
+        events(InstanceCreationEvent::DownloadProgress(message.into()));
+    })
+    .map_err(|error| format!("Failed to download Minecraft: {error}"))?;
+    if loader != ModLoader::Vanilla {
+        events(InstanceCreationEvent::Stage(
+            InstanceCreationStage::InstallingLoader,
+        ));
+        // Loader backends repeat the vanilla install, reusing cached downloads.
+        crate::loaders::install(paths, version, loader)
+            .map_err(|error| format!("Failed to install {}: {error}", loader.label()))?;
+    }
+    Ok(())
+}
+
+/// The "Mod loader" ComboBox used by Create and generic Import. Quilt reads
+/// "Quilt (experimental)" with a muted note once picked; it's never blocked and the
+/// stored value stays the plain label.
+pub(super) fn loader_picker(ui: &mut egui::Ui, selected_loader: &mut String, muted: Color32) {
+    let selected_text = ModLoader::from_label(selected_loader)
+        .map(ModLoader::picker_label)
+        .unwrap_or(selected_loader.as_str())
+        .to_owned();
+    egui::ComboBox::from_label("Mod loader")
+        .selected_text(selected_text)
+        .show_ui(ui, |ui| {
+            for loader in ModLoader::ALL {
+                ui.selectable_value(
+                    selected_loader,
+                    loader.label().to_owned(),
+                    loader.picker_label(),
+                );
+            }
+        });
+    if ModLoader::from_label(selected_loader) == Some(ModLoader::Quilt) {
+        ui.label(RichText::new("Quilt support is experimental.").color(muted));
     }
 }

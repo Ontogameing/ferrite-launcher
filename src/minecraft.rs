@@ -37,8 +37,9 @@
 //! Existing libraries and assets are treated as a download cache; version
 //! metadata and asset indexes are refreshed during installation.
 //!
-//! A process-wide `OnceLock<Mutex<Option<Child>>>` stores the one Minecraft
-//! child started by this process. The mutex permits UI and worker threads to
+//! A process-wide `OnceLock<Mutex<Option<RunningGame>>>` stores the one Minecraft
+//! child started by this process, together with the instance folder it runs in
+//! (see [`is_instance_running`]). The mutex permits UI and worker threads to
 //! inspect or kill the same owned `Child` handle without exposing it publicly;
 //! it is not inter-process locking, so another Ferrite process is independent.
 //!
@@ -516,8 +517,30 @@ fn launch_with_auth(
     println!("Launching Minecraft {}...", metadata.id);
     let child = command.spawn()?;
 
-    *process_slot().lock().unwrap() = Some(child);
+    *process_slot().lock().unwrap() = Some(RunningGame {
+        child,
+        instance: instance_folder_of(paths, game_dir),
+    });
     Ok(())
+}
+
+/// The instance folder name when `game_dir` is directly inside the instances root
+/// (both canonicalized; the game directory exists by now); `None` for any other
+/// directory.
+fn instance_folder_of(paths: &AppPaths, game_dir: &Path) -> Option<String> {
+    let game_dir = abs(game_dir).ok()?;
+    let root = abs(&paths.instances_dir()).ok()?;
+    if game_dir.parent()? != root {
+        return None;
+    }
+    Some(game_dir.file_name()?.to_string_lossy().into_owned())
+}
+
+/// Whether `running` (the folder recorded at launch) names the instance `directory`.
+/// Compared case-insensitively so a case-only alias of a folder also counts as running,
+/// which errs on the side of blocking destructive actions.
+fn same_instance_folder(running: &str, directory: &str) -> bool {
+    running.to_lowercase() == directory.to_lowercase()
 }
 
 // Keep argument substitution and the child's working directory tied to the
@@ -550,10 +573,33 @@ fn game_command(
 // propagates as a panic through `unwrap`. The check in `launch_with_auth` and the
 // later store are separate lock acquisitions, so this is process management for
 // normal launcher use rather than a claim of atomic concurrent launch admission.
-static RUNNING_PROCESS: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
+static RUNNING_PROCESS: OnceLock<Mutex<Option<RunningGame>>> = OnceLock::new();
 
-fn process_slot() -> &'static Mutex<Option<Child>> {
+/// The child process plus the instance folder it was launched in.
+struct RunningGame {
+    child: Child,
+    /// Folder name under the instances root, or `None` for a directory elsewhere.
+    instance: Option<String>,
+}
+
+fn process_slot() -> &'static Mutex<Option<RunningGame>> {
     RUNNING_PROCESS.get_or_init(|| Mutex::new(None))
+}
+
+/// Polls the stored child (clearing the slot if it exited) and returns the folder of
+/// the instance it was launched in. See [`is_running`] for the polling rules.
+fn poll_running(slot: &mut Option<RunningGame>) -> Option<Option<String>> {
+    match slot.as_mut() {
+        Some(game) => match game.child.try_wait() {
+            Ok(Some(_status)) => {
+                *slot = None; // it already exited on its own
+                None
+            }
+            Ok(None) => Some(game.instance.clone()),
+            Err(_) => None,
+        },
+        None => None,
+    }
 }
 
 /// Returns whether this Ferrite process owns a child that has not exited.
@@ -563,18 +609,21 @@ fn process_slot() -> &'static Mutex<Option<Child>> {
 /// the slot so [`kill`] can still attempt cleanup. This does not detect games
 /// launched by another launcher process.
 pub fn is_running() -> bool {
-    let mut slot = process_slot().lock().unwrap();
-    match slot.as_mut() {
-        Some(child) => match child.try_wait() {
-            Ok(Some(_status)) => {
-                *slot = None; // it already exited on its own
-                false
-            }
-            Ok(None) => true,
-            Err(_) => false,
-        },
-        None => false,
-    }
+    poll_running(&mut process_slot().lock().unwrap()).is_some()
+}
+
+/// Folder name of the instance whose game this process is running, if any.
+///
+/// Uses the same live poll as [`is_running`]; a game launched in a directory outside
+/// the instances root counts as running but returns `None`.
+pub fn running_instance() -> Option<String> {
+    poll_running(&mut process_slot().lock().unwrap()).flatten()
+}
+
+/// Whether this process is running the game of the instance stored in `directory`
+/// (its folder name). Call it right before acting, not only when a dialog opens.
+pub fn is_instance_running(directory: &str) -> bool {
+    running_instance().is_some_and(|running| same_instance_folder(&running, directory))
 }
 
 /// Forcibly kills and reaps the child owned by this launcher, if any.
@@ -584,9 +633,9 @@ pub fn is_running() -> bool {
 /// `wait` are intentionally ignored. Calling this with no stored child succeeds.
 pub fn kill() -> Result<()> {
     let mut slot = process_slot().lock().unwrap();
-    if let Some(mut child) = slot.take() {
-        child.kill()?;
-        let _ = child.wait(); // reap it so it doesn't linger as a zombie
+    if let Some(mut game) = slot.take() {
+        game.child.kill()?;
+        let _ = game.child.wait(); // reap it so it doesn't linger as a zombie
     }
     Ok(())
 }
@@ -1491,5 +1540,53 @@ mod tests {
         );
 
         fs::remove_dir(&game_dir).unwrap();
+    }
+
+    fn temp_paths(root: &Path) -> AppPaths {
+        AppPaths::from_base_dirs(ferrite_launcher::core::paths::BaseDirs {
+            config: root.join("config"),
+            data_local: root.join("data"),
+            cache: root.join("cache"),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn running_game_records_only_instance_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = temp_paths(dir.path());
+        let instances = paths.instances_dir();
+        fs::create_dir_all(instances.join("survival/saves")).unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        assert_eq!(
+            instance_folder_of(&paths, &instances.join("survival")).as_deref(),
+            Some("survival")
+        );
+        assert_eq!(
+            instance_folder_of(&paths, &instances.join("survival/saves")),
+            None
+        );
+        assert_eq!(instance_folder_of(&paths, &instances), None);
+        assert_eq!(instance_folder_of(&paths, &elsewhere), None);
+        assert!(same_instance_folder("Survival", "survival"));
+        assert!(!same_instance_folder("survival", "survival-2"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn poll_reports_the_running_instance_until_it_exits() {
+        // A private slot, so the global launcher state is never touched.
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let mut slot = Some(RunningGame {
+            child,
+            instance: Some("survival".into()),
+        });
+        assert_eq!(poll_running(&mut slot), Some(Some("survival".into())));
+        let game = slot.as_mut().unwrap();
+        game.child.kill().unwrap();
+        game.child.wait().unwrap();
+        assert_eq!(poll_running(&mut slot), None);
+        assert!(slot.is_none(), "an exited child is cleared");
     }
 }

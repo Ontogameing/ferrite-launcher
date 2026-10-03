@@ -247,6 +247,160 @@ pub fn available_space(path: &Path) -> io::Result<u64> {
     }
 }
 
+/// Renames `from` to `to`, failing with [`io::ErrorKind::AlreadyExists`] instead of
+/// replacing anything at `to`, including an empty folder (which plain POSIX `rename`
+/// would silently replace).
+///
+/// Linux uses `renameat2(RENAME_NOREPLACE)` (raw syscall, so old glibc and musl
+/// work), macOS `renamex_np(RENAME_EXCL)`, Windows `MoveFileExW` without
+/// `MOVEFILE_REPLACE_EXISTING`. Where the kernel or file system doesn't support the
+/// exclusive form (`EINVAL`/`ENOSYS`/`ENOTSUP`, e.g. some network or FUSE mounts),
+/// it falls back to checking that `to` doesn't exist right before a plain rename;
+/// that leaves a narrow race, which callers accept for folders they just allocated.
+pub fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    match rename_exclusive(from, to) {
+        Err(error) if exclusive_rename_unsupported(&error) => {
+            if fs::symlink_metadata(to).is_ok() {
+                return Err(already_exists(to));
+            }
+            fs::rename(from, to)
+        }
+        other => other,
+    }
+}
+
+/// [`rename_no_replace`] that, on Windows only, retries briefly when the OS reports
+/// `ERROR_ACCESS_DENIED` (5) or `ERROR_SHARING_VIOLATION` (32): antivirus scanners,
+/// the search indexer, and Explorer often hold a freshly written folder open for a
+/// moment. Backoff 50, 100, 200, 400, 800 ms (about 1.5 s in total). Every attempt is
+/// a no-replace rename, so a retry can never replace an existing folder; any other
+/// error (including `AlreadyExists`) fails at once.
+pub fn rename_no_replace_with_retry(from: &Path, to: &Path) -> io::Result<()> {
+    retry_transient(
+        cfg!(windows),
+        &mut || rename_no_replace(from, to),
+        &mut std::thread::sleep,
+    )
+}
+
+/// Backoff schedule for [`rename_no_replace_with_retry`] (sum stays under ~2 s).
+const RETRY_BACKOFF_MS: [u64; 5] = [50, 100, 200, 400, 800];
+
+/// Runs `attempt`, retrying per [`RETRY_BACKOFF_MS`] while `retry_enabled` and the
+/// error is a raw OS error 5 or 32. `sleep` is injected for tests.
+pub(crate) fn retry_transient(
+    retry_enabled: bool,
+    attempt: &mut dyn FnMut() -> io::Result<()>,
+    sleep: &mut dyn FnMut(std::time::Duration),
+) -> io::Result<()> {
+    let mut delays = RETRY_BACKOFF_MS.iter();
+    loop {
+        match attempt() {
+            Err(error) if retry_enabled && matches!(error.raw_os_error(), Some(5 | 32)) => {
+                let Some(delay) = delays.next() else {
+                    return Err(error);
+                };
+                sleep(std::time::Duration::from_millis(*delay));
+            }
+            other => return other,
+        }
+    }
+}
+
+fn already_exists(to: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("{} already exists", to.display()),
+    )
+}
+
+#[cfg(unix)]
+fn exclusive_rename_unsupported(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EINVAL | libc::ENOSYS | libc::ENOTSUP)
+    )
+}
+
+#[cfg(not(unix))]
+fn exclusive_rename_unsupported(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::Unsupported
+}
+
+#[cfg(unix)]
+fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn rename_exclusive(from: &Path, to: &Path) -> io::Result<()> {
+    /// `RENAME_NOREPLACE` from `<linux/fs.h>`.
+    const RENAME_NOREPLACE: libc::c_uint = 1;
+    let (from_c, to_c) = (c_path(from)?, c_path(to)?);
+    // SAFETY: valid NUL-terminated paths; AT_FDCWD is ignored for absolute paths.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            from_c.as_ptr(),
+            libc::AT_FDCWD,
+            to_c.as_ptr(),
+            RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+fn rename_exclusive(from: &Path, to: &Path) -> io::Result<()> {
+    let (from_c, to_c) = (c_path(from)?, c_path(to)?);
+    // SAFETY: valid NUL-terminated paths.
+    if unsafe { libc::renamex_np(from_c.as_ptr(), to_c.as_ptr(), libc::RENAME_EXCL) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn rename_exclusive(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide = |path: &Path| -> Vec<u16> { path.as_os_str().encode_wide().chain([0]).collect() };
+    let (from_w, to_w) = (wide(from), wide(to));
+    // SAFETY: NUL-terminated UTF-16 paths. Flags 0: no replace, same volume only.
+    let ok = unsafe {
+        windows_sys::Win32::Storage::FileSystem::MoveFileExW(from_w.as_ptr(), to_w.as_ptr(), 0)
+    };
+    if ok != 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    // ERROR_FILE_EXISTS (80) / ERROR_ALREADY_EXISTS (183).
+    if matches!(error.raw_os_error(), Some(80 | 183)) {
+        return Err(already_exists(to));
+    }
+    Err(error)
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    windows
+)))]
+fn rename_exclusive(_from: &Path, _to: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no exclusive rename on this platform",
+    ))
+}
+
 /// Windows reparse tag of a symbolic link (`IO_REPARSE_TAG_SYMLINK`).
 pub const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
 /// Windows reparse tag of a junction / mount point (`IO_REPARSE_TAG_MOUNT_POINT`).
@@ -281,6 +435,120 @@ pub fn is_link_like(metadata: &fs::Metadata) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transient_errors_are_retried_with_capped_backoff() {
+        use std::time::Duration;
+        // Two sharing violations, then success.
+        let mut calls = 0;
+        let mut slept = Vec::new();
+        let result = retry_transient(
+            true,
+            &mut || {
+                calls += 1;
+                if calls <= 2 {
+                    Err(io::Error::from_raw_os_error(32))
+                } else {
+                    Ok(())
+                }
+            },
+            &mut |delay| slept.push(delay),
+        );
+        assert!(result.is_ok());
+        assert_eq!(calls, 3);
+        assert_eq!(
+            slept,
+            [Duration::from_millis(50), Duration::from_millis(100)]
+        );
+
+        // Access denied forever: gives up after the schedule, under ~2 s in total.
+        let mut calls = 0;
+        let mut total = Duration::ZERO;
+        let result = retry_transient(
+            true,
+            &mut || {
+                calls += 1;
+                Err(io::Error::from_raw_os_error(5))
+            },
+            &mut |delay| total += delay,
+        );
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(5));
+        assert_eq!(calls, RETRY_BACKOFF_MS.len() + 1);
+        assert!(total <= Duration::from_secs(2), "{total:?}");
+
+        // Other errors (including AlreadyExists) fail at once, as does a disabled retry.
+        for error in [
+            io::Error::new(io::ErrorKind::AlreadyExists, "exists"),
+            io::Error::from_raw_os_error(2),
+        ] {
+            let mut calls = 0;
+            let mut pending = Some(error);
+            let result = retry_transient(
+                true,
+                &mut || {
+                    calls += 1;
+                    Err(pending.take().unwrap())
+                },
+                &mut |_| panic!("must not sleep"),
+            );
+            assert!(result.is_err());
+            assert_eq!(calls, 1);
+        }
+        let mut calls = 0;
+        let result = retry_transient(
+            false,
+            &mut || {
+                calls += 1;
+                Err(io::Error::from_raw_os_error(32))
+            },
+            &mut |_| panic!("must not sleep"),
+        );
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn retrying_rename_never_replaces_an_existing_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("staging");
+        let to = dir.path().join("final");
+        fs::create_dir(&from).unwrap();
+        fs::create_dir(&to).unwrap();
+        let error = rename_no_replace_with_retry(&from, &to).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(from.is_dir());
+        fs::remove_dir(&to).unwrap();
+        rename_no_replace_with_retry(&from, &to).unwrap();
+        assert!(to.is_dir() && !from.exists());
+    }
+
+    #[test]
+    fn rename_no_replace_moves_and_refuses_existing_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("staging");
+        fs::create_dir(&from).unwrap();
+        fs::write(from.join("file"), b"data").unwrap();
+
+        // An existing empty folder is not replaced (plain rename would replace it).
+        let empty = dir.path().join("empty");
+        fs::create_dir(&empty).unwrap();
+        let error = rename_no_replace(&from, &empty).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(from.join("file").exists());
+        assert_eq!(fs::read_dir(&empty).unwrap().count(), 0);
+
+        // Nor is an existing file.
+        let file = dir.path().join("file");
+        fs::write(&file, b"keep").unwrap();
+        let error = rename_no_replace(&from, &file).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&file).unwrap(), b"keep");
+
+        let to = dir.path().join("final");
+        rename_no_replace(&from, &to).unwrap();
+        assert!(!from.exists());
+        assert_eq!(fs::read(to.join("file")).unwrap(), b"data");
+    }
 
     #[test]
     fn write_atomic_replaces_and_leaves_no_temporaries() {

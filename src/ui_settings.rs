@@ -25,6 +25,9 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub struct UiSettings {
+    /// Folder of the last successful export; the Save-As dialog starts there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_export_dir: Option<PathBuf>,
     pub appearance: AppearanceConfig,
     /// Opt-in per-page widget grid. Disabled by default to preserve the current shell.
     pub layout: LayoutConfig,
@@ -729,6 +732,20 @@ mod tests {
             cache: root.join("cache"),
         })
         .unwrap()
+    }
+
+    #[test]
+    fn last_export_dir_round_trips_and_is_optional() {
+        let mut settings = UiSettings::default();
+        assert!(!to_toml(&settings).unwrap().contains("last_export_dir"));
+        settings.last_export_dir = Some(PathBuf::from("/home/me/Packs"));
+        let text = to_toml(&settings).unwrap();
+        assert_eq!(parse_toml(&text).unwrap(), settings);
+        assert_eq!(
+            parse_toml("").unwrap().last_export_dir,
+            None,
+            "older ui.toml files load unchanged"
+        );
     }
 
     const LEGACY_CONFIG: &str = "[appearance]\ntheme = 'light'\naccent = '#123abc'\nfont_scale = 1.25\ncorner_radius = 4\n\n[appearance.theme_config]\npreset = 'custom'\n\n[appearance.theme_config.custom_palette]\nbackground = '#010203'\n\n[appearance.background]\nuse_per_page = true\n\n[appearance.background.play]\nopacity = 0.4\n\n[appearance.background.play.source]\nkind = 'local_file'\npath = '/pictures/play.png'\n\n[layout]\nenabled = true\n\n[layout.grid]\ngap = 20\n\n[launcher]\nclose_on_launch = true\n\n[minecraft]\ndefault_memory_mb = 6144\n";

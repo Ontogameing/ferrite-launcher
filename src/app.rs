@@ -7,9 +7,14 @@
 //! to UI/persistent state, and requests periodic repainting while work is outstanding.
 
 mod auth;
+mod dialogs;
+mod duplicate;
+mod edit;
 mod instances;
 mod layout;
 mod mods;
+mod packs_ui;
+mod remove;
 mod settings;
 mod startup;
 mod view;
@@ -128,7 +133,8 @@ enum InstanceCreationEvent {
 enum PackTaskEvent {
     Progress(String),
     Imported(Result<Box<PackImportOutcome>, String>),
-    Exported(Result<String, String>),
+    /// The written file, or (plain-words reason, raw error).
+    Exported(Result<std::path::PathBuf, (String, String)>),
 }
 
 /// Imported files awaiting the UI thread's final profile-list commit.
@@ -254,9 +260,14 @@ struct Ferrite {
     pack_version: String,
     pack_loader_version: String,
     pack_include_worlds: bool,
-    pack_include_optional: bool,
     pack_task: Option<Receiver<PackTaskEvent>>,
     pack_status: Option<String>,
+    /// Which step the Import window shows (choose, reading, preview, ...).
+    import_step: packs_ui::ImportStep,
+    /// The last export's result, shown in the Export window.
+    export_result: Option<packs_ui::ExportResult>,
+    /// Ferrite prefilled the Export loader-version field (cleared when the user edits it).
+    export_loader_prefilled: bool,
     /// Release versions fetched from Mojang.
     versions: Vec<String>,
     /// Profiles loaded from and saved to the persistent instance store.
@@ -284,6 +295,43 @@ struct Ferrite {
     icons: IconCache,
     /// Live IPC connection governed by `config.discord.rich_presence`.
     discord: Option<DiscordPresence>,
+    /// Which instance is owned by which background operation (delete, ...).
+    activity: ferrite_launcher::core::activity::ActivityTracker,
+    /// The open delete dialog, if any.
+    remove_dialog: Option<remove::DeleteDialog>,
+    /// The trash/delete worker; its presence also defers closing the window.
+    remove_task: Option<remove::RemoveTask>,
+    /// The window was asked to close while a removal was running.
+    close_after_remove: bool,
+    /// The open Duplicate setup modal, if any.
+    duplicate_setup: Option<duplicate::DuplicateSetup>,
+    /// Running and finished-but-still-shown duplicates.
+    duplicate_jobs: Vec<duplicate::DuplicateJob>,
+    /// Scroll this instance's card into view on the next Instances frame.
+    scroll_to_instance: Option<crate::instances::InstanceDirName>,
+    /// Source of window ids for task windows.
+    next_job_id: u64,
+    /// The open Edit modal, if any.
+    edit_dialog: Option<edit::EditDialog>,
+    /// The single version/loader update (installing, or failed and still shown).
+    edit_task: Option<edit::EditTask>,
+}
+
+/// Removes stale import/duplicate temp folders from `instances/` in the background.
+/// Silent: the outcome is only logged.
+fn spawn_temp_sweep(paths: &AppPaths) {
+    use ferrite_launcher::core::sweep;
+    let paths = paths.clone();
+    let spawned = std::thread::Builder::new()
+        .name("temp-sweep".into())
+        .spawn(move || {
+            if let Err(error) = sweep::sweep_stale_temp_dirs(&paths, sweep::DEFAULT_MIN_AGE) {
+                eprintln!("Ferrite: could not check for leftover temp folders: {error}");
+            }
+        });
+    if let Err(error) = spawned {
+        eprintln!("Ferrite: could not start the temp folder sweep: {error}");
+    }
 }
 
 impl Ferrite {
@@ -366,6 +414,7 @@ impl Ferrite {
             running_text = warning;
         }
         let selected_instance = (!instances.is_empty()).then_some(0);
+        spawn_temp_sweep(&paths);
 
         let mut app = Self {
             paths,
@@ -409,9 +458,11 @@ impl Ferrite {
             pack_version: String::from("1.0.0"),
             pack_loader_version: String::new(),
             pack_include_worlds: true,
-            pack_include_optional: false,
             pack_task: None,
             pack_status: None,
+            import_step: Default::default(),
+            export_result: None,
+            export_loader_prefilled: false,
             versions,
             instances,
             skipped_instances,
@@ -427,6 +478,16 @@ impl Ferrite {
             pending_uninstall: None,
             mod_task: None,
             discord,
+            activity: Default::default(),
+            remove_dialog: None,
+            remove_task: None,
+            close_after_remove: false,
+            duplicate_setup: None,
+            duplicate_jobs: Vec::new(),
+            scroll_to_instance: None,
+            next_job_id: 0,
+            edit_dialog: None,
+            edit_task: None,
         };
         if app.config.launcher.check_for_updates {
             app.start_update_check(false);
@@ -441,6 +502,11 @@ impl eframe::App for Ferrite {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_instance_creation();
         self.poll_pack_task();
+        self.poll_import_preview();
+        self.poll_remove_task();
+        self.poll_duplicates();
+        self.poll_edit_task();
+        self.intercept_close_while_removing(ui.ctx());
         self.poll_mod_task();
         self.poll_auth();
         self.poll_update_check();
@@ -520,9 +586,19 @@ impl eframe::App for Ferrite {
         self.import_pack_window(ui.ctx());
         self.export_pack_window(ui.ctx());
         self.uninstall_window(ui.ctx());
+        self.remove_window(ui.ctx());
+        self.duplicate_setup_window(ui.ctx());
+        self.duplicate_windows(ui.ctx());
+        self.edit_window(ui.ctx());
+        self.edit_task_window(ui.ctx());
         // Channels do not wake egui directly, so poll promptly while workers can send.
         if self.instance_creation_task.is_some()
             || self.pack_task.is_some()
+            || self.remove_task.is_some()
+            || self.remove_dialog_busy()
+            || self.duplicate_busy()
+            || self.edit_busy()
+            || self.import_reading()
             || self.mod_task.is_some()
             || self.auth.task.is_some()
             || self.update_task.is_some()
@@ -591,9 +667,11 @@ mod tests {
             pack_version: "1.0.0".into(),
             pack_loader_version: String::new(),
             pack_include_worlds: true,
-            pack_include_optional: false,
             pack_task: None,
             pack_status: None,
+            import_step: Default::default(),
+            export_result: None,
+            export_loader_prefilled: false,
             versions: Vec::new(),
             instances: Vec::new(),
             skipped_instances: Vec::new(),
@@ -609,6 +687,16 @@ mod tests {
             pending_uninstall: None,
             mod_task: None,
             discord: None,
+            activity: Default::default(),
+            remove_dialog: None,
+            remove_task: None,
+            close_after_remove: false,
+            duplicate_setup: None,
+            duplicate_jobs: Vec::new(),
+            scroll_to_instance: None,
+            next_job_id: 0,
+            edit_dialog: None,
+            edit_task: None,
         }
     }
 
@@ -823,11 +911,18 @@ mod tests {
         assert_eq!(app.pack_status.as_deref(), Some("Validating archive"));
         assert!(app.pack_busy());
         sender
-            .send(PackTaskEvent::Exported(Err("disk full".into())))
+            .send(PackTaskEvent::Exported(Err((
+                "There isn't enough space on that drive.".into(),
+                "disk full".into(),
+            ))))
             .unwrap();
         app.poll_pack_task();
         assert!(!app.pack_busy());
-        assert!(app.running_text.contains("disk full"));
+        assert!(app.running_text.contains("enough space"));
+        assert!(matches!(
+            app.export_result,
+            Some(packs_ui::ExportResult::Failed { ref error, .. }) if error == "disk full"
+        ));
     }
 
     #[test]

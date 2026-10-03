@@ -794,23 +794,23 @@ fn path_line(
 }
 
 /// Piece of a sentence that may contain paths.
-enum Segment {
+pub(super) enum Segment {
     Text(String),
     Path(String),
 }
 
 impl Segment {
-    fn text(text: impl Into<String>) -> Self {
+    pub(super) fn text(text: impl Into<String>) -> Self {
         Self::Text(text.into())
     }
 
-    fn path(path: &Path) -> Self {
+    pub(super) fn path(path: &Path) -> Self {
         Self::Path(path.display().to_string())
     }
 }
 
 /// Renders text with inline monospace, selectable paths, wrapping as one paragraph.
-fn sentence(ui: &mut egui::Ui, segments: &[Segment]) {
+pub(super) fn sentence(ui: &mut egui::Ui, segments: &[Segment]) {
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         for segment in segments {
@@ -832,7 +832,11 @@ fn sentence(ui: &mut egui::Ui, segments: &[Segment]) {
 
 /// "Details" disclosure listing the first [`DETAILS_LIMIT`] lines, with a Copy
 /// button that copies all of them.
-fn details(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, lines: &[String]) {
+pub(super) fn details(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    lines: &[String],
+) {
     egui::CollapsingHeader::new(RichText::new("Details").small())
         .id_salt(id)
         .show(ui, |ui| {
@@ -1133,7 +1137,7 @@ fn link_label(found_at: &Path, resolved: &Path) -> String {
 }
 
 /// `1234567` → `"1,234,567"`.
-fn group_thousands(value: u64) -> String {
+pub(super) fn group_thousands(value: u64) -> String {
     let digits = value.to_string();
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, digit) in digits.chars().enumerate() {
@@ -1146,7 +1150,7 @@ fn group_thousands(value: u64) -> String {
 }
 
 /// `"1 file"`, `"1,204 files"`.
-fn plural(count: u64, one: &str, many: &str) -> String {
+pub(super) fn plural(count: u64, one: &str, many: &str) -> String {
     format!(
         "{} {}",
         group_thousands(count),
@@ -1155,7 +1159,7 @@ fn plural(count: u64, one: &str, many: &str) -> String {
 }
 
 /// `"1.2 of 4.8 GiB"`: both numbers in the unit of `total`.
-fn size_pair(done: u64, total: u64) -> String {
+pub(super) fn size_pair(done: u64, total: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut unit = 0;
     let mut scale = 1.0_f64;

@@ -52,7 +52,16 @@ impl Ferrite {
     pub(super) fn play_page(&mut self, ui: &mut egui::Ui) {
         // Own the snapshot so controls can freely mutate `self` later in this frame.
         let selected = self.selected_instance().cloned();
+        // This instance's own state (running, updating, copying, folder missing).
+        let launch_block = selected.as_ref().and_then(|instance| {
+            ferrite_launcher::core::activity::disabled_reason(
+                ferrite_launcher::core::activity::InstanceAction::Play,
+                &instance.name,
+                &self.instance_status(instance),
+            )
+        });
         let can_launch = selected.is_some()
+            && launch_block.is_none()
             && self.mod_task.is_none()
             && self.pending_uninstall.is_none()
             && !self.pack_busy();
@@ -118,6 +127,8 @@ impl Ferrite {
                                 .size(15.0)
                                 .color(MUTED),
                             );
+                            // Centered under the line in this centered layout.
+                            super::dialogs::quilt_badge(ui, &instance.loader, MUTED);
                         } else {
                             ui.label(
                                 RichText::new("Create or import an instance to get started.")
@@ -153,22 +164,24 @@ impl Ferrite {
             });
 
         ui.add_space(14.0);
-        if ui
-            .add_enabled(
-                can_launch,
-                egui::Button::new(
-                    RichText::new(match selected.as_ref() {
-                        Some(instance) => format!("LAUNCH {}", instance.loader.to_uppercase()),
-                        None => "SELECT AN INSTANCE".to_owned(),
-                    })
-                    .size(16.0)
-                    .strong(),
-                )
-                .fill(self.accent_color())
-                .min_size(egui::vec2(ui.available_width(), 56.0)),
+        let launch = ui.add_enabled(
+            can_launch,
+            egui::Button::new(
+                RichText::new(match selected.as_ref() {
+                    Some(instance) => format!("LAUNCH {}", instance.loader.to_uppercase()),
+                    None => "SELECT AN INSTANCE".to_owned(),
+                })
+                .size(16.0)
+                .strong(),
             )
-            .clicked()
-        {
+            .fill(self.accent_color())
+            .min_size(egui::vec2(ui.available_width(), 56.0)),
+        );
+        let launch_clicked = launch.clicked();
+        if let Some(reason) = &launch_block {
+            launch.on_disabled_hover_text(reason);
+        }
+        if launch_clicked {
             self.launch_selected();
         }
 
@@ -194,7 +207,7 @@ impl Ferrite {
                             if let Some(instance) = &selected {
                                 dashboard_row(ui, "Profile", &instance.name);
                                 dashboard_row(ui, "Minecraft", &instance.version);
-                                dashboard_row(ui, "Loader", &instance.loader);
+                                dashboard_loader_row(ui, &instance.loader);
                                 dashboard_row(
                                     ui,
                                     "Memory",
@@ -311,6 +324,17 @@ pub(super) fn dashboard_row(ui: &mut egui::Ui, label: &str, value: &str) {
         columns[0].label(RichText::new(label).color(MUTED));
         columns[1].with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add(egui::Label::new(RichText::new(value).strong()).truncate());
+        });
+    });
+}
+
+/// The "Loader" overview row, with the Quilt badge when relevant (spec §8).
+fn dashboard_loader_row(ui: &mut egui::Ui, loader: &str) {
+    ui.columns(2, |columns| {
+        columns[0].label(RichText::new("Loader").color(MUTED));
+        columns[1].with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            super::dialogs::quilt_badge(ui, loader, MUTED);
+            ui.add(egui::Label::new(RichText::new(loader).strong()).truncate());
         });
     });
 }
