@@ -13,9 +13,13 @@
 //!   source, or an interrupted run to resume), or [`StartupPlan::NeedsUserChoice`] when
 //!   two valid candidates differ. It never picks between differing candidates.
 //! * **Copying** ([`run_migration`]) goes into `<data dir>/.migration-staging/minecraft`,
-//!   which is on the same filesystem as the destination. Symlinks, Windows reparse
-//!   points (junctions etc.), and special files are never followed or copied; each one
-//!   is logged and listed in the report and state file. Every file is written to a
+//!   which is on the same filesystem as the destination. Genuine links (symlinks;
+//!   on Windows junctions and other name-surrogate reparse points) are never followed
+//!   or copied; each one is logged and listed in the report and state file. Other
+//!   reparse points (OneDrive placeholders, dedup) are read like regular files.
+//!   Anything else that cannot be copied (special files, unreadable files or folders)
+//!   **blocks the commit** with [`MigrationError::UncopyableFiles`] listing the paths,
+//!   so a migration can never "succeed" with files missing. Every file is written to a
 //!   `.ferrite-partial` name, fsynced, then renamed, so a staged file with its final
 //!   name is always complete.
 //! * **Verification** compares the staged tree against the source scan (the exact
@@ -81,6 +85,9 @@ pub enum MigrationError {
     DestinationExists(PathBuf),
     /// The staged copy did not match the source; staging was removed.
     VerificationFailed(String),
+    /// Some source entries could not be copied (not links: special files, unreadable
+    /// files or folders). Nothing was committed; staged progress is kept.
+    UncopyableFiles(Vec<UncopyableFile>),
     /// The user cancelled; staged progress is kept for resumption.
     Cancelled,
     /// A rolled-back legacy location is no longer usable.
@@ -122,6 +129,23 @@ impl fmt::Display for MigrationError {
                 "verification of the copied data failed ({detail}); the partial copy was \
                  removed and your original data was not changed"
             ),
+            Self::UncopyableFiles(files) => {
+                write!(
+                    f,
+                    "{} item(s) in the old folder could not be copied, so nothing was moved: ",
+                    files.len()
+                )?;
+                for (index, file) in files.iter().take(20).enumerate() {
+                    if index > 0 {
+                        write!(f, "; ")?;
+                    }
+                    write!(f, "{file}")?;
+                }
+                if files.len() > 20 {
+                    write!(f, "; and {} more", files.len() - 20)?;
+                }
+                Ok(())
+            }
             Self::Cancelled => write!(
                 f,
                 "migration cancelled; progress was kept and will resume next time"
@@ -159,13 +183,30 @@ struct ScannedFile {
     modified: Option<SystemTime>,
 }
 
+/// An entry in the old folder that cannot be copied and is not a link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UncopyableFile {
+    /// Path relative to the old `minecraft` folder.
+    pub path: PathBuf,
+    /// Plain-language reason (includes the OS error where there is one).
+    pub reason: String,
+}
+
+impl fmt::Display for UncopyableFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} ({})", self.path.display(), self.reason)
+    }
+}
+
 /// Recursive listing of a tree, relative to its root.
 #[derive(Debug, Clone, Default)]
 struct TreeScan {
     dirs: Vec<PathBuf>,
     files: BTreeMap<PathBuf, ScannedFile>,
-    /// Links, reparse points, and special files that were not traversed.
-    skipped: Vec<PathBuf>,
+    /// Genuine links that are deliberately not traversed or copied.
+    links: Vec<PathBuf>,
+    /// Entries that are not links but cannot be copied; these block the commit.
+    blocked: Vec<UncopyableFile>,
     total_bytes: u64,
 }
 
@@ -185,25 +226,50 @@ impl TreeScan {
     }
 }
 
+/// Lists `root` without following links. Only a failure to read `root` itself is an
+/// error; problems further down are recorded in [`TreeScan::blocked`].
 fn scan_tree(root: &Path) -> Result<TreeScan, MigrationError> {
     let mut scan = TreeScan::default();
+    fs::read_dir(root).map_err(io_ctx(format!("read {}", root.display())))?;
     let mut pending = vec![PathBuf::new()];
     while let Some(relative) = pending.pop() {
         let absolute = root.join(&relative);
-        let entries =
-            fs::read_dir(&absolute).map_err(io_ctx(format!("read {}", absolute.display())))?;
+        let entries = match fs::read_dir(&absolute) {
+            Ok(entries) => entries,
+            Err(error) => {
+                scan.blocked.push(UncopyableFile {
+                    path: relative,
+                    reason: format!("folder could not be read: {error}"),
+                });
+                continue;
+            }
+        };
         for entry in entries {
-            let entry = entry.map_err(io_ctx(format!("read {}", absolute.display())))?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    scan.blocked.push(UncopyableFile {
+                        path: relative.clone(),
+                        reason: format!("folder could not be listed: {error}"),
+                    });
+                    break;
+                }
+            };
             let rel = relative.join(entry.file_name());
             let path = entry.path();
-            let metadata = fs::symlink_metadata(&path)
-                .map_err(io_ctx(format!("inspect {}", path.display())))?;
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    scan.blocked.push(UncopyableFile {
+                        path: rel,
+                        reason: format!("could not be inspected: {error}"),
+                    });
+                    continue;
+                }
+            };
             if fsutil::is_link_like(&metadata) {
-                eprintln!(
-                    "Ferrite migration: not following link/reparse point {}",
-                    path.display()
-                );
-                scan.skipped.push(rel);
+                eprintln!("Ferrite migration: not following link {}", path.display());
+                scan.links.push(rel);
             } else if metadata.is_dir() {
                 scan.dirs.push(rel.clone());
                 pending.push(rel);
@@ -218,15 +284,19 @@ fn scan_tree(root: &Path) -> Result<TreeScan, MigrationError> {
                 );
             } else {
                 eprintln!(
-                    "Ferrite migration: skipping special file {}",
+                    "Ferrite migration: cannot copy special file {}",
                     path.display()
                 );
-                scan.skipped.push(rel);
+                scan.blocked.push(UncopyableFile {
+                    path: rel,
+                    reason: "not a regular file, folder, or link".into(),
+                });
             }
         }
     }
     scan.dirs.sort();
-    scan.skipped.sort();
+    scan.links.sort();
+    scan.blocked.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(scan)
 }
 
@@ -249,8 +319,11 @@ pub struct Candidate {
     pub total_bytes: u64,
     /// Newest file modification time in the tree.
     pub last_modified: Option<SystemTime>,
-    /// Links/reparse points/special files that will not be copied.
+    /// Genuine links that will not be copied.
     pub skipped_links: Vec<PathBuf>,
+    /// Non-link entries that cannot be copied; migrating this candidate will fail
+    /// with [`MigrationError::UncopyableFiles`] until they are fixed.
+    pub uncopyable: Vec<UncopyableFile>,
 }
 
 /// Why a candidate directory was not accepted.
@@ -335,7 +408,8 @@ fn build_candidate(dir: &Path) -> Result<(Candidate, TreeScan, Vec<u8>), Rejecti
             file_count: scan.files.len() as u64,
             total_bytes: scan.total_bytes,
             last_modified: scan.last_modified(),
-            skipped_links: scan.skipped.clone(),
+            skipped_links: scan.links.clone(),
+            uncopyable: scan.blocked.clone(),
         },
         scan,
         manifest_bytes,
@@ -377,7 +451,7 @@ pub struct MigrationState {
     pub files_total: u64,
     #[serde(default)]
     pub bytes_total: u64,
-    /// Links/reparse points/special files that were not copied (relative to source).
+    /// Genuine links that were not copied (relative to source).
     #[serde(default)]
     pub skipped_links: Vec<PathBuf>,
     /// Manifest entries reported as invalid during migration.
@@ -765,6 +839,9 @@ type StepHook<'a> = &'a dyn Fn() -> io::Result<()>;
 struct Hooks<'a> {
     after_file: Option<FileHook<'a>>,
     before_verify: Option<PathHook<'a>>,
+    /// Called with each source file right before it is opened; an error simulates
+    /// an unreadable source file.
+    before_open: Option<PathHook<'a>>,
     before_rename: Option<StepHook<'a>>,
     after_rename: Option<StepHook<'a>>,
 }
@@ -878,11 +955,15 @@ fn run_with_hooks(
 
     control.update(|progress| progress.step = MigrationStep::Scanning);
     let scan = scan_tree(&source)?;
-    report.skipped_links = scan.skipped.clone();
+    if !scan.blocked.is_empty() {
+        // Fail before copying anything: these would be missing from the copy.
+        return Err(MigrationError::UncopyableFiles(scan.blocked));
+    }
+    report.skipped_links = scan.links.clone();
     let mut state = MigrationState::new(MigrationPhase::Copying, Some(source.clone()));
     state.files_total = scan.files.len() as u64;
     state.bytes_total = scan.total_bytes;
-    state.skipped_links = scan.skipped.clone();
+    state.skipped_links = scan.links.clone();
     state.skipped_entries = report.skipped_entries.clone();
     fs::create_dir_all(data_dir).map_err(io_ctx(format!("create {}", data_dir.display())))?;
     write_state(paths, &state)?;
@@ -1009,6 +1090,7 @@ fn copy_tree(
     }
     let mut buffer = vec![0_u8; COPY_CHUNK];
     let mut files_done = 0_u64;
+    let mut uncopyable = Vec::new();
     for (relative, info) in &scan.files {
         control.check_cancel()?;
         let from = source.join(relative);
@@ -1025,7 +1107,22 @@ fn copy_tree(
         if already {
             control.update(|progress| progress.bytes_done += info.len);
         } else {
-            copy_one(&from, &to, info, control, &mut buffer)?;
+            match copy_one(&from, &to, info, control, &mut buffer, hooks) {
+                Ok(()) => {}
+                // A source-side problem: record it, keep copying the rest so the user
+                // sees the complete list, and refuse to commit afterwards.
+                Err(CopyError::Source(reason)) => {
+                    eprintln!(
+                        "Ferrite migration: cannot copy {}: {reason}",
+                        from.display()
+                    );
+                    uncopyable.push(UncopyableFile {
+                        path: relative.clone(),
+                        reason,
+                    });
+                }
+                Err(CopyError::Fatal(error)) => return Err(error),
+            }
         }
         files_done += 1;
         control.update(|progress| progress.files_done = files_done);
@@ -1033,8 +1130,25 @@ fn copy_tree(
             hook(files_done).map_err(interrupted)?;
         }
     }
+    if !uncopyable.is_empty() {
+        return Err(MigrationError::UncopyableFiles(uncopyable));
+    }
     fsutil::sync_dir(staged).map_err(io_ctx(format!("sync {}", staged.display())))?;
     Ok(())
+}
+
+/// Why one file could not be copied.
+enum CopyError {
+    /// The source could not be read (recorded; blocks the commit).
+    Source(String),
+    /// Destination-side failure or cancellation (aborts immediately).
+    Fatal(MigrationError),
+}
+
+impl From<MigrationError> for CopyError {
+    fn from(error: MigrationError) -> Self {
+        Self::Fatal(error)
+    }
 }
 
 fn copy_one(
@@ -1043,33 +1157,45 @@ fn copy_one(
     info: &ScannedFile,
     control: &MigrationControl,
     buffer: &mut [u8],
-) -> Result<(), MigrationError> {
+    hooks: &Hooks<'_>,
+) -> Result<(), CopyError> {
     // Re-check right before opening so a file swapped for a link after the scan is
     // not followed (a narrow race remains between this check and `open`).
-    let metadata =
-        fs::symlink_metadata(from).map_err(io_ctx(format!("inspect {}", from.display())))?;
+    let metadata = fs::symlink_metadata(from)
+        .map_err(|error| CopyError::Source(format!("could not be inspected: {error}")))?;
     if !metadata.is_file() || fsutil::is_link_like(&metadata) {
-        return Err(MigrationError::VerificationFailed(format!(
-            "{} changed type during migration",
-            from.display()
-        )));
+        return Err(CopyError::Source(
+            "changed from a regular file while Ferrite was copying".into(),
+        ));
     }
+    if let Some(hook) = hooks.before_open {
+        hook(from).map_err(|error| CopyError::Source(format!("could not be opened: {error}")))?;
+    }
+    let mut input = File::open(from)
+        .map_err(|error| CopyError::Source(format!("could not be opened: {error}")))?;
     let partial = partial_name(to);
-    let mut input = File::open(from).map_err(io_ctx(format!("open {}", from.display())))?;
     let mut output =
         File::create(&partial).map_err(io_ctx(format!("create {}", partial.display())))?;
-    loop {
-        control.check_cancel()?;
-        let read = input
-            .read(buffer)
-            .map_err(io_ctx(format!("read {}", from.display())))?;
-        if read == 0 {
-            break;
+    let copied = (|| -> Result<(), CopyError> {
+        loop {
+            control.check_cancel()?;
+            let read = input
+                .read(buffer)
+                .map_err(|error| CopyError::Source(format!("could not be read: {error}")))?;
+            if read == 0 {
+                break;
+            }
+            output
+                .write_all(&buffer[..read])
+                .map_err(io_ctx(format!("write {}", partial.display())))?;
+            control.update(|progress| progress.bytes_done += read as u64);
         }
-        output
-            .write_all(&buffer[..read])
-            .map_err(io_ctx(format!("write {}", partial.display())))?;
-        control.update(|progress| progress.bytes_done += read as u64);
+        Ok(())
+    })();
+    if let Err(error) = copied {
+        drop(output);
+        let _ = fs::remove_file(&partial);
+        return Err(error);
     }
     output
         .sync_all()
@@ -1078,15 +1204,19 @@ fn copy_one(
         let _ = output.set_modified(modified);
     }
     drop(output);
-    fs::rename(&partial, to).map_err(io_ctx(format!("finish {}", to.display())))
+    fs::rename(&partial, to).map_err(io_ctx(format!("finish {}", to.display())))?;
+    Ok(())
 }
 
 /// Checks the staged tree against the source scan: identical relative file set,
 /// identical sizes, no extra entries, and an identical manifest.
 fn verify(staged: &Path, scan: &TreeScan, manifest_bytes: &[u8]) -> Result<(), String> {
     let copy = scan_tree(staged).map_err(|error| error.to_string())?;
-    if let Some(link) = copy.skipped.first() {
+    if let Some(link) = copy.links.first() {
         return Err(format!("unexpected link in staging: {}", link.display()));
+    }
+    if let Some(blocked) = copy.blocked.first() {
+        return Err(format!("unreadable entry in staging: {blocked}"));
     }
     if copy.files.len() != scan.files.len() {
         return Err(format!(

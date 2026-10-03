@@ -413,6 +413,77 @@ fn symlinks_inside_source_are_not_followed() {
 }
 
 #[test]
+fn unreadable_source_file_blocks_the_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = legacy_tree(&dir.path().join("old"));
+    let before = snapshot(&source);
+    let paths = paths_in(&dir.path().join("ferrite"));
+    // Simulates e.g. an online-only OneDrive file that cannot be hydrated.
+    let fail_lib = |path: &Path| {
+        if path.ends_with("libraries/org/example/lib.jar") {
+            Err(io::Error::other("cloud file provider is not running"))
+        } else {
+            Ok(())
+        }
+    };
+    let hooks = Hooks {
+        before_open: Some(&fail_lib),
+        ..Hooks::default()
+    };
+    let error = run_with_hooks(&paths, &source, &MigrationControl::default(), &hooks).unwrap_err();
+    match &error {
+        MigrationError::UncopyableFiles(files) => {
+            assert_eq!(files.len(), 1);
+            assert_eq!(files[0].path, Path::new("libraries/org/example/lib.jar"));
+            assert!(files[0].reason.contains("cloud file provider"));
+        }
+        other => panic!("expected UncopyableFiles, got {other}"),
+    }
+    assert!(error.to_string().contains("libraries/org/example/lib.jar"));
+    assert!(!paths.storage_root().exists(), "nothing may be committed");
+    assert_eq!(snapshot(&source), before);
+    assert_eq!(
+        read_state(&paths).unwrap().unwrap().phase,
+        MigrationPhase::Copying,
+        "staged progress is kept for a retry"
+    );
+
+    // Once the file is readable again, a retry resumes and completes.
+    let (paths, candidate, resuming) = expect_migration(plan(&paths, &[]).unwrap());
+    assert!(resuming);
+    run_migration(&paths, &candidate.path, &MigrationControl::default()).unwrap();
+    assert_eq!(snapshot(paths.storage_root()), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn special_file_blocks_the_commit_before_copying() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = legacy_tree(&dir.path().join("old"));
+    let fifo = source.join("instances/survival/pipe");
+    let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: valid NUL-terminated path; mkfifo has no other preconditions.
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    let paths = paths_in(&dir.path().join("ferrite"));
+
+    let candidate = inspect_candidate(&source).unwrap();
+    assert_eq!(candidate.uncopyable.len(), 1);
+    assert!(candidate.skipped_links.is_empty(), "a FIFO is not a link");
+
+    match run_migration(&paths, &source, &MigrationControl::default()) {
+        Err(MigrationError::UncopyableFiles(files)) => {
+            assert_eq!(files[0].path, Path::new("instances/survival/pipe"));
+        }
+        other => panic!("expected UncopyableFiles, got {other:?}"),
+    }
+    assert!(!paths.storage_root().exists());
+    assert!(
+        !paths.migration_staging_dir().exists(),
+        "nothing was copied"
+    );
+}
+
+#[test]
 fn verification_failure_rolls_back_and_leaves_source_untouched() {
     let dir = tempfile::tempdir().unwrap();
     let source = legacy_tree(&dir.path().join("old"));

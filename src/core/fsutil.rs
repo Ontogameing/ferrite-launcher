@@ -89,22 +89,35 @@ pub fn sync_dir(dir: &Path) -> io::Result<()> {
     }
 }
 
-/// Whether `metadata` (from `symlink_metadata`) describes a link-like entry that
-/// must never be traversed: a symlink on every platform, plus any reparse point
-/// (junctions, mount points, OneDrive placeholders, ...) on Windows.
+/// Windows reparse tag of a symbolic link (`IO_REPARSE_TAG_SYMLINK`).
+pub const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+/// Windows reparse tag of a junction / mount point (`IO_REPARSE_TAG_MOUNT_POINT`).
+pub const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+/// `IsReparseTagNameSurrogate`: the tag redirects to another named entity.
+const REPARSE_TAG_NAME_SURROGATE_BIT: u32 = 0x2000_0000;
+
+/// Whether a Windows reparse tag denotes a link (a *name surrogate*: symlinks,
+/// junctions/mount points, and any other tag with the `IsReparseTagNameSurrogate`
+/// bit). Data-carrying reparse points such as OneDrive/cloud-files placeholders
+/// (`0x9000001A` and friends) or deduplicated files (`0x80000013`) are *not*
+/// links: their contents are read and copied like any regular file.
+///
+/// This is a pure function so the classification can be tested on every platform.
+/// It is the same rule Rust's standard library applies on Windows in
+/// [`fs::FileType::is_symlink`], which [`is_link_like`] relies on.
+pub fn reparse_tag_is_link(tag: u32) -> bool {
+    tag & REPARSE_TAG_NAME_SURROGATE_BIT != 0
+}
+
+/// Whether `metadata` (from `symlink_metadata`) describes a link that must never be
+/// traversed or copied: a symlink on Unix; on Windows a symlink, junction, or other
+/// name-surrogate reparse point (see [`reparse_tag_is_link`]).
+///
+/// Non-surrogate reparse points (OneDrive placeholders, dedup) report as regular
+/// files/directories here and are copied normally. The standard library classifies
+/// them with exactly the [`reparse_tag_is_link`] rule; it does not expose the raw tag.
 pub fn is_link_like(metadata: &fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return true;
-        }
-    }
-    false
+    metadata.file_type().is_symlink()
 }
 
 #[cfg(test)]
@@ -123,5 +136,26 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(entries, vec![std::ffi::OsString::from("file.json")]);
+    }
+
+    #[test]
+    fn only_name_surrogate_reparse_tags_are_links() {
+        // Links: never followed.
+        assert!(reparse_tag_is_link(IO_REPARSE_TAG_SYMLINK));
+        assert!(reparse_tag_is_link(IO_REPARSE_TAG_MOUNT_POINT));
+        assert!(reparse_tag_is_link(0xA000_001D)); // IO_REPARSE_TAG_LX_SYMLINK (WSL)
+        // Any tag with the name-surrogate bit counts, even ones we don't know.
+        assert!(reparse_tag_is_link(0x2000_1234));
+        // Data reparse points: read and copied normally.
+        for tag in [
+            0x9000_001A_u32, // IO_REPARSE_TAG_CLOUD (OneDrive Files On-Demand)
+            0x9000_101A,     // IO_REPARSE_TAG_CLOUD_1
+            0x9000_F01A,     // IO_REPARSE_TAG_CLOUD_F
+            0x8000_0013,     // IO_REPARSE_TAG_DEDUP
+            0x8000_0017,     // IO_REPARSE_TAG_WOF (compressed system files)
+            0x8000_001B,     // IO_REPARSE_TAG_APPEXECLINK
+        ] {
+            assert!(!reparse_tag_is_link(tag), "{tag:#x}");
+        }
     }
 }

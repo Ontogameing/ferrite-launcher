@@ -1262,6 +1262,7 @@ dependencies = [
  "egui",
  "hex",
  "image",
+ "libc",
  "reqwest",
  "rfd",
  "semver",

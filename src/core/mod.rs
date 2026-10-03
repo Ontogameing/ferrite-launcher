@@ -4,7 +4,7 @@
 //! Nothing under `core` may depend on egui/eframe or any other frontend crate; the
 //! frontend calls into this module and renders its plain data types.
 
-mod fsutil;
+pub mod fsutil;
 pub mod instances;
 pub mod manifest;
 pub mod migration;
