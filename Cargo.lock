@@ -1269,6 +1269,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2",
+ "tempfile",
  "toml",
  "zip",
 ]

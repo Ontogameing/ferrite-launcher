@@ -22,3 +22,6 @@ directories = "6.0"
 toml = "0.8"
 rfd = "0.15"
 semver = "1"
+
+[dev-dependencies]
+tempfile = "3"
