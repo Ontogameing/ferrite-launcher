@@ -73,6 +73,8 @@ pub(super) struct DeleteDialog {
     scan: ScanJob,
     /// Give the safe button keyboard focus on the next frame.
     focus_safe_button: bool,
+    /// The last trash-failed screen, where [Back] from the permanent step returns.
+    trash_failure: Option<DeleteStep>,
 }
 
 /// What the app must do after [`DeleteDialog::apply_outcome`].
@@ -111,6 +113,7 @@ impl DeleteDialog {
             notice: None,
             scan,
             focus_safe_button: true,
+            trash_failure: None,
         }
     }
 
@@ -150,11 +153,8 @@ impl DeleteDialog {
 
     /// Goes back from the permanent step to the trash-failed choices.
     fn back_from_permanent(&mut self) {
-        self.step = if matches!(self.return_step, DeleteStep::TrashFailed { .. }) {
-            self.return_step.clone()
-        } else {
-            DeleteStep::Confirm
-        };
+        self.notice = None;
+        self.step = self.trash_failure.clone().unwrap_or(DeleteStep::Confirm);
         self.focus_safe_button = true;
     }
 
@@ -235,6 +235,7 @@ impl DeleteDialog {
             }
             RemoveOutcome::TrashFailed { kind, error, .. } => {
                 self.step = DeleteStep::TrashFailed { kind, error };
+                self.trash_failure = Some(self.step.clone());
                 self.notice = None;
                 self.focus_safe_button = true;
                 DeleteEffect::default()
@@ -993,7 +994,14 @@ mod tests {
             "This can't be undone. 1.0 GiB and 1 world will be deleted for good."
         );
 
-        // [Back] returns to the trash-failed choices.
+        // Refused at the moment of deleting: stay on the permanent step...
+        dialog.begin_work(RemoveMode::Permanent);
+        dialog.apply_outcome(RemoveOutcome::NowRunning);
+        assert_eq!(
+            dialog.step,
+            DeleteStep::ConfirmPermanent { acknowledged: true }
+        );
+        // ...and [Back] still returns to the trash-failed choices.
         dialog.back_from_permanent();
         assert!(matches!(dialog.step, DeleteStep::TrashFailed { .. }));
     }
