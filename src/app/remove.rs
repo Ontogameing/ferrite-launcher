@@ -680,11 +680,13 @@ fn delete_dialog_ui(
                 "Remove from Ferrite, keep the files.",
             );
             ui.indent("keep-files-help", |ui| {
-                muted(
-                    ui,
-                    "The folder stays where it is. Ferrite won't list it anymore.",
-                    muted_color,
-                );
+                // With the folder missing there's nothing to "stay where it is".
+                let help = if dialog.missing {
+                    "Ferrite won't list it anymore."
+                } else {
+                    "The folder stays where it is. Ferrite won't list it anymore."
+                };
+                muted(ui, help, muted_color);
             });
             if !trash_allowed {
                 dialog.choice = RemoveMode::KeepFiles;
