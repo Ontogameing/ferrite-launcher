@@ -255,7 +255,26 @@ impl Ferrite {
             .name("pack-import".to_owned())
             .spawn(move || {
                 let result = (|| -> Result<PackImportOutcome, String> {
-                    let info = crate::packs::inspect(&source).map_err(|error| error.to_string())?;
+                    let preview = crate::packs::preview(&source, curseforge_api_key.as_deref())
+                        .map_err(|error| error.to_string())?;
+                    if let Some(crate::packs::ImportBlocker::NeedsCurseForgeKey { mods }) =
+                        preview.blocker
+                    {
+                        return Err(format!(
+                            "This CurseForge pack lists {mods} mods that have to be downloaded \
+                             from CurseForge, which needs an API key Ferrite doesn't have. \
+                             Ferrite can't import it yet."
+                        ));
+                    }
+                    eprintln!(
+                        "Ferrite: importing {} ({} files, {} mods, {} optional files, worlds: {})",
+                        source.display(),
+                        preview.archive_files,
+                        preview.mod_count,
+                        preview.optional_files,
+                        preview.has_worlds
+                    );
+                    let info = preview.info;
                     let target = info.target.clone().unwrap_or(generic_target);
                     let base_name = if requested_name.is_empty() {
                         info.name.trim().to_owned()

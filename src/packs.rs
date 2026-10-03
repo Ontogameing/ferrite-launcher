@@ -589,6 +589,132 @@ pub fn export(
     )
 }
 
+/// Why a pack can be inspected but not imported as things stand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportBlocker {
+    /// A CurseForge pack lists `mods` required project files that can only be
+    /// downloaded through the CurseForge API, and no API key is configured.
+    NeedsCurseForgeKey { mods: usize },
+}
+
+/// Everything the import preview shows, gathered without network access or
+/// extraction. Counts are best effort and only cover what the archive declares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackPreview {
+    pub info: PackInfo,
+    /// Regular files stored in the archive (including metadata files).
+    pub archive_files: usize,
+    /// Mods: `.jar` files in the pack's game `mods/` folder plus listed mod downloads
+    /// that will be installed by default.
+    pub mod_count: usize,
+    /// Whether the archive contains world folders (`saves/<world>/...`) in its game
+    /// directory.
+    pub has_worlds: bool,
+    /// Modrinth files marked optional for the client (installed only when
+    /// [`ImportOptions::include_optional_modrinth_files`] is set).
+    pub optional_files: usize,
+    pub blocker: Option<ImportBlocker>,
+}
+
+/// [`inspect`] plus the counts and blockers the import preview needs. Reads only
+/// metadata; `curseforge_api_key` is only checked for presence.
+pub fn preview(path: impl AsRef<Path>, curseforge_api_key: Option<&str>) -> Result<PackPreview> {
+    let path = path.as_ref();
+    let info = inspect(path)?;
+    // Re-reads the ZIP central directory only (no payloads).
+    let catalog = scan_archive(path, ArchiveLimits::default())?;
+    let roots: Vec<String> = match info.format {
+        PackFormat::Ferrite => vec!["overrides/".to_owned()],
+        PackFormat::Modrinth => vec!["overrides/".to_owned(), "client-overrides/".to_owned()],
+        PackFormat::CurseForge => {
+            let manifest = read_json(path, &catalog, "manifest.json")?;
+            let overrides = manifest
+                .get("overrides")
+                .and_then(|v| v.as_str())
+                .unwrap_or("overrides");
+            vec![format!("{}/", overrides.trim_end_matches('/'))]
+        }
+        PackFormat::Prism => vec!["minecraft/".to_owned(), ".minecraft/".to_owned()],
+        PackFormat::GenericZip => vec![String::new()],
+        // inspect_catalog already refuses .lcpack.
+        PackFormat::Lunar => return Err(lunar_error()),
+    };
+    let files = catalog.entries.iter().filter(|entry| !entry.is_dir);
+    let archive_files = files.clone().count();
+    let in_game_dir = |name: &str, folder: &str| {
+        roots
+            .iter()
+            .find_map(|root| name.strip_prefix(root.as_str())?.strip_prefix(folder))
+            .map(str::to_owned)
+    };
+    let mut mod_count = files
+        .clone()
+        .filter_map(|entry| in_game_dir(&entry.name, "mods/"))
+        .filter(|rest| !rest.contains('/') && rest.to_ascii_lowercase().ends_with(".jar"))
+        .count();
+    let has_worlds = catalog.entries.iter().any(|entry| {
+        in_game_dir(&entry.name, "saves/").is_some_and(|rest| {
+            rest.split('/')
+                .next()
+                .is_some_and(|world| !world.is_empty())
+                && rest.contains('/')
+        })
+    });
+    let mut optional_files = 0;
+    let mut blocker = None;
+    match info.format {
+        PackFormat::Modrinth => {
+            let index = read_json(path, &catalog, "modrinth.index.json")?;
+            for file in index
+                .get("files")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+            {
+                let client = file
+                    .get("env")
+                    .and_then(|v| v.get("client"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("required");
+                let is_mod = file
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|path| path.starts_with("mods/"));
+                match client {
+                    "optional" => optional_files += 1,
+                    "unsupported" => {}
+                    _ if is_mod => mod_count += 1,
+                    _ => {}
+                }
+            }
+        }
+        PackFormat::CurseForge => {
+            let manifest = read_json(path, &catalog, "manifest.json")?;
+            let required = manifest
+                .get("files")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .filter(|item| item.get("required").and_then(|v| v.as_bool()) != Some(false))
+                .count();
+            mod_count += required;
+            let has_key = curseforge_api_key.is_some_and(|key| !key.trim().is_empty());
+            if required > 0 && !has_key {
+                blocker = Some(ImportBlocker::NeedsCurseForgeKey { mods: required });
+            }
+        }
+        _ => {}
+    }
+    Ok(PackPreview {
+        info,
+        archive_files,
+        mod_count,
+        has_worlds,
+        optional_files,
+        blocker,
+    })
+}
+
 fn inspect_with_limits(path: &Path, limits: ArchiveLimits) -> Result<PackInfo> {
     let catalog = scan_archive(path, limits)?;
     inspect_catalog(path, &catalog)
@@ -2211,6 +2337,77 @@ mod tests {
             loader: ModLoader::Fabric,
             loader_version: Some("0.15.0".to_owned()),
         }
+    }
+
+    #[test]
+    fn preview_counts_mods_worlds_optional_files_and_curseforge_blockers() {
+        let temp = TempDir::new("preview");
+        let modrinth = temp.0.join("pack.mrpack");
+        let index = br#"{"formatVersion":1,"game":"minecraft","versionId":"1","name":"MR",
+            "dependencies":{"minecraft":"1.20.1","fabric-loader":"0.15.0"},
+            "files":[
+              {"path":"mods/a.jar","hashes":{},"downloads":["https://cdn.modrinth.com/a.jar"],"fileSize":1},
+              {"path":"mods/b.jar","env":{"client":"optional","server":"required"},"hashes":{},"downloads":["https://cdn.modrinth.com/b.jar"],"fileSize":1},
+              {"path":"mods/c.jar","env":{"client":"unsupported","server":"required"},"hashes":{},"downloads":["https://cdn.modrinth.com/c.jar"],"fileSize":1},
+              {"path":"resourcepacks/r.zip","hashes":{},"downloads":["https://cdn.modrinth.com/r.zip"],"fileSize":1}
+            ]}"#;
+        make_zip(
+            &modrinth,
+            &[
+                ("modrinth.index.json", index.as_slice()),
+                ("overrides/mods/local.jar", b"jar"),
+                ("overrides/mods/notes.txt", b"txt"),
+                ("overrides/config/x.toml", b"x"),
+            ],
+        );
+        let preview = super::preview(&modrinth, None).unwrap();
+        assert_eq!(preview.info.format, PackFormat::Modrinth);
+        assert_eq!(preview.archive_files, 4);
+        assert_eq!(preview.mod_count, 2); // a.jar + local.jar
+        assert_eq!(preview.optional_files, 1);
+        assert!(!preview.has_worlds);
+        assert_eq!(preview.blocker, None);
+
+        let curse = temp.0.join("curse.zip");
+        let manifest = br#"{"manifestType":"minecraftModpack","manifestVersion":1,"name":"CF",
+            "version":"1","author":"x","overrides":"overrides",
+            "minecraft":{"version":"1.20.1","modLoaders":[{"id":"forge-47.2.0","primary":true}]},
+            "files":[{"projectID":1,"fileID":2,"required":true},
+                     {"projectID":3,"fileID":4,"required":false},
+                     {"projectID":5,"fileID":6}]}"#;
+        make_zip(
+            &curse,
+            &[
+                ("manifest.json", manifest.as_slice()),
+                ("overrides/saves/World/level.dat", b"lvl"),
+            ],
+        );
+        let preview = super::preview(&curse, None).unwrap();
+        assert_eq!(preview.info.format, PackFormat::CurseForge);
+        assert!(preview.has_worlds);
+        assert_eq!(preview.mod_count, 2);
+        assert_eq!(
+            preview.blocker,
+            Some(ImportBlocker::NeedsCurseForgeKey { mods: 2 })
+        );
+        assert_eq!(super::preview(&curse, Some("key")).unwrap().blocker, None);
+        assert!(
+            super::preview(&curse, Some("  "))
+                .unwrap()
+                .blocker
+                .is_some()
+        );
+
+        let generic = temp.0.join("world-backup.zip");
+        make_zip(
+            &generic,
+            &[("saves/My World/level.dat", b"lvl"), ("mods/x.jar", b"j")],
+        );
+        let preview = super::preview(&generic, None).unwrap();
+        assert_eq!(preview.info.format, PackFormat::GenericZip);
+        assert!(preview.info.target.is_none());
+        assert!(preview.has_worlds);
+        assert_eq!(preview.mod_count, 1);
     }
 
     #[test]
