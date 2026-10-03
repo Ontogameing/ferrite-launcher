@@ -75,17 +75,131 @@ pub fn write_atomic(target: &Path, contents: &[u8]) -> io::Result<()> {
     result
 }
 
-/// Flushes directory metadata (new entries/renames) to stable storage on Unix.
+/// Flushes directory metadata (new entries/renames) with a plain `fsync` on Unix.
 /// Windows has no portable directory fsync; NTFS journals renames itself.
 pub fn sync_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
-        File::open(dir)?.sync_all()
+        sync_file_data(&File::open(dir)?)
     }
     #[cfg(not(unix))]
     {
         let _ = dir;
         Ok(())
+    }
+}
+
+/// Per-file durability for bulk copies: a plain `fsync`.
+///
+/// On macOS Rust's `sync_all`/`sync_data` issue `F_FULLFSYNC` (a full drive-cache
+/// flush) every time, which is far too slow per file; `libc::fsync` is used there
+/// and a single [`full_flush`] is done once before committing. Elsewhere
+/// `sync_data` is a plain `fdatasync`/`FlushFileBuffers`.
+pub fn sync_file_data(file: &File) -> io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: the descriptor is owned by `file` and valid for this call.
+        if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        file.sync_data()
+    }
+}
+
+/// One full flush of everything written under `dir`'s filesystem, done once before
+/// a commit point:
+/// - macOS: `F_FULLFSYNC` on `dir` (flushes the drive's write cache);
+/// - Linux/Android: `syncfs` on `dir` (flushes the whole filesystem);
+/// - other Unix: `fsync` on `dir`;
+/// - Windows: best effort `FlushFileBuffers` on a directory handle (files were already
+///   flushed individually); failure to open the handle is ignored.
+pub fn full_flush(dir: &Path) -> io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::fd::AsRawFd;
+        let handle = File::open(dir)?;
+        // SAFETY: valid descriptor owned by `handle`; F_FULLFSYNC takes no argument.
+        if unsafe { libc::fcntl(handle.as_raw_fd(), libc::F_FULLFSYNC) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::fd::AsRawFd;
+        let handle = File::open(dir)?;
+        // SAFETY: valid descriptor owned by `handle`.
+        if unsafe { libc::syncfs(handle.as_raw_fd()) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(all(
+        unix,
+        not(target_vendor = "apple"),
+        not(any(target_os = "linux", target_os = "android"))
+    ))]
+    {
+        File::open(dir)?.sync_all()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        if let Ok(handle) = OpenOptions::new()
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir)
+        {
+            let _ = handle.sync_all();
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
+/// Opens a source file for copying without following a final-component link, and
+/// confirms the opened handle is the regular file that was inspected.
+///
+/// On Unix this uses `O_NOFOLLOW | O_NONBLOCK` (so a FIFO swapped in cannot block)
+/// and compares the handle's device/inode with `expected`. On Windows the file is
+/// opened normally: `FILE_FLAG_OPEN_REPARSE_POINT` would bypass the cloud-files and
+/// dedup filters and read placeholder stubs instead of contents, and the standard
+/// library does not expose a stable file ID to compare; the pre-open link check
+/// remains the guard there.
+pub fn open_regular_no_follow(path: &Path, expected: &fs::Metadata) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)?;
+        let opened = file.metadata()?;
+        if !opened.is_file() || opened.dev() != expected.dev() || opened.ino() != expected.ino() {
+            return Err(io::Error::other(
+                "the file was replaced while Ferrite was copying it",
+            ));
+        }
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    {
+        let file = File::open(path)?;
+        if !file.metadata()?.is_file() || !expected.is_file() {
+            return Err(io::Error::other("not a regular file"));
+        }
+        Ok(file)
     }
 }
 
@@ -136,6 +250,35 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(entries, vec![std::ffi::OsString::from("file.json")]);
+    }
+
+    #[test]
+    fn flush_helpers_work_on_real_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        fs::write(&path, b"data").unwrap();
+        sync_file_data(&File::options().write(true).open(&path).unwrap()).unwrap();
+        sync_dir(dir.path()).unwrap();
+        full_flush(dir.path()).unwrap();
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        open_regular_no_follow(&path, &metadata).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_regular_no_follow_rejects_links_and_swaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let other = dir.path().join("other");
+        fs::write(&real, b"real").unwrap();
+        fs::write(&other, b"other").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let real_meta = fs::symlink_metadata(&real).unwrap();
+        // A link at the final component is never followed.
+        assert!(open_regular_no_follow(&link, &real_meta).is_err());
+        // A different file than the one inspected is refused.
+        assert!(open_regular_no_follow(&other, &real_meta).is_err());
     }
 
     #[test]

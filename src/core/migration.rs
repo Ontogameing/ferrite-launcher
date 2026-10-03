@@ -20,8 +20,10 @@
 //!   Anything else that cannot be copied (special files, unreadable files or folders)
 //!   **blocks the commit** with [`MigrationError::UncopyableFiles`] listing the paths,
 //!   so a migration can never "succeed" with files missing. Every file is written to a
-//!   `.ferrite-partial` name, fsynced, then renamed, so a staged file with its final
-//!   name is always complete.
+//!   `.ferrite-partial` name, given its original timestamp, fsynced (plain `fsync`,
+//!   not `F_FULLFSYNC`), then renamed, so a staged file with its final name is always
+//!   complete. Staged directories are synced after copying, and one full flush
+//!   ([`fsutil::full_flush`]) happens right before the `verified` state is written.
 //! * **Verification** compares the staged tree against the source scan (the exact
 //!   set of relative paths and every file size) and the manifest bytes. On failure
 //!   only the staging directory is deleted.
@@ -994,6 +996,8 @@ fn run_with_hooks(
         write_state(paths, &failed)?;
         return Err(MigrationError::VerificationFailed(detail));
     }
+    // One full flush of the staged tree before recording Verified and committing.
+    fsutil::full_flush(&staged).map_err(io_ctx(format!("flush {}", staged.display())))?;
     state.phase = MigrationPhase::Verified;
     write_state(paths, &state)?;
 
@@ -1009,7 +1013,9 @@ fn run_with_hooks(
         staged.display(),
         dest.display()
     )))?;
+    // Persist the commit rename in both parent directories.
     fsutil::sync_dir(data_dir).map_err(io_ctx(format!("sync {}", data_dir.display())))?;
+    fsutil::sync_dir(&staging_root).map_err(io_ctx(format!("sync {}", staging_root.display())))?;
     if let Some(hook) = hooks.after_rename {
         hook().map_err(interrupted)?;
     }
@@ -1133,6 +1139,11 @@ fn copy_tree(
     if !uncopyable.is_empty() {
         return Err(MigrationError::UncopyableFiles(uncopyable));
     }
+    // Persist the partial->final renames: sync every staged directory.
+    for dir in scan.dirs.iter().rev() {
+        let target = staged.join(dir);
+        fsutil::sync_dir(&target).map_err(io_ctx(format!("sync {}", target.display())))?;
+    }
     fsutil::sync_dir(staged).map_err(io_ctx(format!("sync {}", staged.display())))?;
     Ok(())
 }
@@ -1171,7 +1182,7 @@ fn copy_one(
     if let Some(hook) = hooks.before_open {
         hook(from).map_err(|error| CopyError::Source(format!("could not be opened: {error}")))?;
     }
-    let mut input = File::open(from)
+    let mut input = fsutil::open_regular_no_follow(from, &metadata)
         .map_err(|error| CopyError::Source(format!("could not be opened: {error}")))?;
     let partial = partial_name(to);
     let mut output =
@@ -1197,12 +1208,12 @@ fn copy_one(
         let _ = fs::remove_file(&partial);
         return Err(error);
     }
-    output
-        .sync_all()
-        .map_err(io_ctx(format!("sync {}", partial.display())))?;
+    // Set the timestamp before the flush so it is part of what gets synced.
     if let Some(modified) = info.modified {
         let _ = output.set_modified(modified);
     }
+    // Plain per-file fsync; one full flush happens before the commit.
+    fsutil::sync_file_data(&output).map_err(io_ctx(format!("sync {}", partial.display())))?;
     drop(output);
     fs::rename(&partial, to).map_err(io_ctx(format!("finish {}", to.display())))?;
     Ok(())
