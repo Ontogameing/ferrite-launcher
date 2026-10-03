@@ -5,6 +5,7 @@ use super::*;
 use crate::core::paths::StorageMode;
 use crate::core::paths::test_support::paths_in;
 use std::cell::Cell;
+use std::time::Duration;
 
 const V0: &str =
     r#"[{"name":"Survival","version":"1.21.1","loader":"Fabric","directory":"survival"}]"#;
@@ -247,6 +248,42 @@ fn interrupted_copy_resumes_and_keeps_completed_files() {
     assert_eq!(
         read_state(&paths).unwrap().unwrap().phase,
         MigrationPhase::Completed
+    );
+}
+
+#[test]
+fn resume_recopies_source_files_changed_between_attempts() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = legacy_tree(&dir.path().join("old"));
+    let paths = paths_in(&dir.path().join("ferrite"));
+    // Interrupt after every file has been staged but before verification.
+    let fail = |_: &Path| crash("simulated crash before verify");
+    let hooks = Hooks {
+        before_verify: Some(&fail),
+        ..Hooks::default()
+    };
+    assert!(run_with_hooks(&paths, &source, &MigrationControl::default(), &hooks).is_err());
+
+    // The source changes in between with the same size but different content/mtime.
+    let level = source.join("instances/survival/saves/world/level.dat");
+    fs::write(&level, b"WORLD-DATA").unwrap();
+    let later = SystemTime::now() + Duration::from_secs(3600);
+    File::options()
+        .write(true)
+        .open(&level)
+        .unwrap()
+        .set_modified(later)
+        .unwrap();
+
+    run_migration(&paths, &source, &MigrationControl::default()).unwrap();
+    assert_eq!(
+        fs::read(
+            paths
+                .storage_root()
+                .join("instances/survival/saves/world/level.dat")
+        )
+        .unwrap(),
+        b"WORLD-DATA"
     );
 }
 

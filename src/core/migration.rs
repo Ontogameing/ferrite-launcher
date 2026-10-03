@@ -1013,10 +1013,15 @@ fn copy_tree(
         control.check_cancel()?;
         let from = source.join(relative);
         let to = staged.join(relative);
-        // Resume: a final-named staged file is complete by construction; the size
-        // check additionally catches a source that changed in between.
-        let already = fs::symlink_metadata(&to)
-            .is_ok_and(|metadata| metadata.is_file() && metadata.len() == info.len);
+        // Resume: a final-named staged file is complete by construction. Size and
+        // modification time (preserved on copy) must still match the source scan, so a
+        // source file that changed between attempts is copied again.
+        let already = fs::symlink_metadata(&to).is_ok_and(|metadata| {
+            metadata.is_file()
+                && metadata.len() == info.len
+                && info.modified.is_some()
+                && metadata.modified().ok() == info.modified
+        });
         if already {
             control.update(|progress| progress.bytes_done += info.len);
         } else {
