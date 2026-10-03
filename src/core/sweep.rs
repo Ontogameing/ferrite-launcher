@@ -305,21 +305,19 @@ mod tests {
         let root = paths.instances_dir();
         let staging = root.join(".pack.duplicate.4000001.1.tmp");
         fs::create_dir_all(staging.join("saves/world")).unwrap();
-        let old = SystemTime::now() - LATER;
         let file = staging.join("saves/world/level.dat");
         fs::write(&file, b"x").unwrap();
-        for path in [&staging, &staging.join("saves")] {
-            fs::File::open(path).unwrap().set_modified(old).unwrap();
-        }
-        // Only the deepest folder and file are recent.
-        let report = sweep_with(
-            &paths,
-            DEFAULT_MIN_AGE,
-            SystemTime::now(),
-            &|_| false,
-            &HashSet::new(),
-        )
-        .unwrap();
+        // Run the sweep "later" so every folder looks old, and make only the
+        // deepest file recent. (Setting a folder's mtime needs special open
+        // flags on Windows, so the test moves the clock instead.)
+        let now = SystemTime::now() + LATER;
+        fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(now)
+            .unwrap();
+        let report = sweep_with(&paths, DEFAULT_MIN_AGE, now, &|_| false, &HashSet::new()).unwrap();
         assert_eq!(report.kept, std::slice::from_ref(&staging));
         assert!(file.exists());
     }
