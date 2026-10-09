@@ -16,7 +16,8 @@ fn configuration_and_local_mods_are_available_to_library_callers() {
     .unwrap();
     let loaded = config::load_or_create(&paths).unwrap();
     assert_eq!(config::load(&paths).unwrap(), loaded.config);
-    let game_dir = temp.path().join("game with spaces");
+    // macOS temporary roots can cross /var's symlink; mods require a physical path.
+    let game_dir = temp.path().canonicalize().unwrap().join("game with spaces");
     assert!(instance_mods::list(&game_dir).unwrap().is_empty());
 }
 
