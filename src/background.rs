@@ -487,7 +487,7 @@ fn finite_or(value: f32, default: f32) -> f32 {
 
 fn parse_rgb(value: &str) -> Option<egui::Color32> {
     let rgb = value.trim().strip_prefix('#')?;
-    if rgb.len() != 6 {
+    if rgb.len() != 6 || !rgb.is_ascii() {
         return None;
     }
     Some(egui::Color32::from_rgb(
@@ -637,6 +637,17 @@ fn unit_uv() -> egui::Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlay_colors_reject_unicode_and_preserve_trimmed_hex() {
+        for value in ["#aébcd", "#abcé0", " #１２ "] {
+            assert!(parse_rgb(value).is_none(), "{value}");
+        }
+        assert_eq!(
+            parse_rgb(" #aB12EF "),
+            Some(egui::Color32::from_rgb(171, 18, 239))
+        );
+    }
 
     #[test]
     fn default_settings_disable_all_background_painting() {

@@ -13,7 +13,7 @@ use super::dialogs::{
 use super::startup::{Segment, details, sentence};
 use crate::instances::InstanceProfile;
 use eframe::egui::{self, RichText};
-use ferrite_launcher::core::activity::BusyOperation;
+use ferrite_launcher::core::activity::{BusyOperation, InstanceAction, OperationId};
 use ferrite_launcher::core::instances::{InstanceDirName, InstanceError};
 use ferrite_launcher::core::migration::format_size;
 use ferrite_launcher::core::remove::{
@@ -317,6 +317,7 @@ pub(super) fn permanent_checkbox(name: &str, has_worlds: bool) -> String {
 
 /// The worker's result for the slow file step.
 pub(super) struct RemoveTask {
+    operation: OperationId,
     target: RemovalTarget,
     result: Receiver<Result<(), RemoveOutcome>>,
 }
@@ -399,65 +400,66 @@ impl Ferrite {
                 return;
             }
         };
-        if mode == RemoveMode::KeepFiles {
-            let outcome = match remove::commit_removal(
-                &self.paths,
-                &mut self.instances,
-                &self.skipped_instances,
-                &target,
-                &is_running,
-            ) {
-                Ok(outcome) | Err(outcome) => outcome,
-            };
-            self.apply_remove_outcome(outcome);
-            return;
-        }
-        if mode == RemoveMode::Permanent {
-            // Save the list first; the worker then deletes the folder.
-            if let Err(outcome) = remove::commit_removal(
-                &self.paths,
-                &mut self.instances,
-                &self.skipped_instances,
-                &target,
-                &is_running,
-            ) {
-                self.apply_remove_outcome(outcome);
+        let status = self.instance_status(target.profile());
+        let action = if mode == RemoveMode::KeepFiles {
+            InstanceAction::RemoveFromList
+        } else {
+            InstanceAction::Delete
+        };
+        let operation = match self.activity.begin_instance(
+            action,
+            target.profile(),
+            &status,
+            BusyOperation::Deleting,
+        ) {
+            Ok(operation) => operation,
+            Err(reason) => {
+                if let Some(dialog) = self.remove_dialog.as_mut() {
+                    dialog.notice = Some(reason);
+                }
                 return;
             }
-            self.after_instance_removed(&directory);
-        }
+        };
         let paths = self.paths.clone();
         let worker_target = target.clone();
         let (sender, result) = mpsc::channel();
-        let spawned = std::thread::Builder::new()
-            .name("instance-remove".into())
-            .spawn(move || {
-                let outcome = match worker_target.mode() {
-                    RemoveMode::Trash => {
-                        remove::trash_target(&paths, &worker_target, &SystemTrash, &is_running)
-                    }
-                    _ => match remove::delete_target(&paths, &worker_target) {
-                        RemoveOutcome::Deleted { .. } => Ok(()),
-                        other => Err(other),
-                    },
-                };
-                let _ = sender.send(outcome);
-            });
-        match spawned {
-            Ok(_) => {
-                self.activity
-                    .begin(directory.as_str(), BusyOperation::Deleting);
-                self.remove_task = Some(RemoveTask { target, result });
+        let started = remove::start_prepared_removal(
+            &self.paths,
+            &mut self.instances,
+            &self.skipped_instances,
+            &target,
+            &is_running,
+            || {
+                std::thread::Builder::new()
+                    .name("instance-remove".into())
+                    .spawn(move || {
+                        let outcome = remove::run_removal_files(
+                            &paths,
+                            &worker_target,
+                            &SystemTrash,
+                            &is_running,
+                        );
+                        let _ = sender.send(outcome);
+                    })
+                    .map(|_| ())
+            },
+        );
+        match started {
+            Ok(remove::RemovalStart::Completed(outcome)) | Err(outcome) => {
+                self.apply_remove_outcome(outcome);
+                self.activity.complete(operation);
+            }
+            Ok(remove::RemovalStart::Scheduled) => {
+                if mode == RemoveMode::Permanent {
+                    self.after_instance_removed(&directory);
+                }
+                self.remove_task = Some(RemoveTask {
+                    operation,
+                    target,
+                    result,
+                });
                 if let Some(dialog) = self.remove_dialog.as_mut() {
                     dialog.begin_work(mode);
-                }
-            }
-            Err(error) => {
-                let message = format!("Could not start removal: {error}");
-                if let Some(dialog) = self.remove_dialog.as_mut() {
-                    dialog.notice = Some(message);
-                } else {
-                    self.running_text = message;
                 }
             }
         }
@@ -479,21 +481,16 @@ impl Ferrite {
             ))),
         };
         let task = self.remove_task.take().expect("checked above");
-        self.activity
-            .end(task.target.profile().directory().as_str());
-        let outcome = match (task.target.mode(), result) {
-            (RemoveMode::Trash, Ok(())) => remove::finish_trash(
-                &self.paths,
-                &mut self.instances,
-                &self.skipped_instances,
-                task.target,
-            ),
-            (_, Ok(())) => RemoveOutcome::Deleted {
-                profile: task.target.profile().clone(),
-            },
-            (_, Err(outcome)) => outcome,
-        };
+        let operation = task.operation;
+        let outcome = remove::finish_removal(
+            &self.paths,
+            &mut self.instances,
+            &self.skipped_instances,
+            task.target,
+            result,
+        );
         self.apply_remove_outcome(outcome);
+        self.activity.complete(operation);
         if self.close_after_remove {
             self.close_requested = true;
         }
@@ -876,6 +873,24 @@ fn delete_dialog_ui(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blocked_remove_from_list_preserves_manifest_and_existing_owner() {
+        let mut app = crate::app::tests::app();
+        let profile = profile();
+        app.instances.push(profile.clone());
+        app.remove_dialog = Some(dialog(false, true));
+        let owner = app.activity.begin_create().unwrap();
+        app.start_removal(RemoveMode::KeepFiles);
+        assert_eq!(app.instances, vec![profile]);
+        assert!(app.remove_task.is_none());
+        assert!(app.activity.is_active(owner));
+        assert!(app.remove_dialog.as_ref().unwrap().notice.is_some());
+        assert_eq!(
+            app.activity.busy(app.instances[0].directory().as_str()),
+            None
+        );
+    }
 
     fn profile() -> InstanceProfile {
         InstanceProfile::new("Survival".into(), "1.21.1".into(), "Fabric".into(), &[])

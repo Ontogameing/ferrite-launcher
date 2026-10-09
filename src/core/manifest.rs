@@ -541,8 +541,8 @@ pub fn parse_manifest(text: &str) -> Result<InstanceManifest, ManifestError> {
             });
             continue;
         }
-        // Compare case-insensitively: Windows and macOS folders are case-insensitive.
-        if !seen.insert(shaped.directory.to_ascii_lowercase()) {
+        // Use allocation's portable identity so aliases cannot claim the same folder.
+        if !seen.insert(directory_key(&shaped.directory)) {
             manifest.skipped.push(SkippedEntry {
                 index,
                 name: Some(shaped.name),
@@ -618,6 +618,32 @@ mod tests {
             directory_key(&format!("{decomposed}."))
         );
         assert_ne!(name_key("Cafe"), name_key(composed));
+    }
+
+    #[test]
+    fn manifest_rejects_unicode_folder_aliases_and_preserves_entries() {
+        for (first, alias) in [("Ä", "ä"), ("Café", "cafe\u{301}")] {
+            let entries = serde_json::json!([
+                {"name": "First", "version": "1", "loader": "Vanilla", "directory": first},
+                {"name": "Alias", "version": "1", "loader": "Vanilla", "directory": alias}
+            ]);
+            for text in [
+                entries.to_string(),
+                serde_json::json!({"schema_version": 1, "instances": entries}).to_string(),
+            ] {
+                let manifest = parse_manifest(&text).unwrap();
+                assert_eq!(manifest.instances.len(), 1, "{first:?} and {alias:?}");
+                assert_eq!(manifest.instances[0].directory().as_str(), first);
+                assert_eq!(manifest.skipped.len(), 1);
+                assert!(matches!(
+                    &manifest.skipped[0].reason,
+                    SkipReason::DuplicateDirectory(directory) if directory == alias
+                ));
+                let saved = serialize_manifest(&manifest.instances, &manifest.skipped).unwrap();
+                let saved: Value = serde_json::from_str(&saved).unwrap();
+                assert_eq!(saved["instances"][1], entries[1]);
+            }
+        }
     }
 
     const V0: &str = r#"[

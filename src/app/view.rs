@@ -12,7 +12,7 @@ impl Ferrite {
     pub(super) fn top_bar(&mut self, ui: &mut egui::Ui) {
         let account_label = if self.auth.offline_mode {
             "Offline".to_owned()
-        } else if let Some(account) = &self.auth.account {
+        } else if let Some(account) = self.auth.session.account() {
             account.name.clone()
         } else {
             "Account".to_owned()
@@ -250,8 +250,8 @@ impl Ferrite {
                                 "Offline mode".to_owned()
                             } else {
                                 self.auth
-                                    .account
-                                    .as_ref()
+                                    .session
+                                    .account()
                                     .map(|account| format!("Signed in as {}", account.name))
                                     .unwrap_or_else(|| "Microsoft account required".to_owned())
                             };

@@ -35,8 +35,8 @@
 //! partial files, but dispatch will treat the loader as uninstalled until that
 //! marker commits the composite id.
 
+use crate::core::paths::AppPaths;
 use crate::minecraft::{self, FerriteError, Result};
-use ferrite_launcher::core::paths::AppPaths;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::fs;
@@ -189,7 +189,7 @@ fn merge_metadata(
     let mut libraries = vanilla["libraries"].as_array().cloned().unwrap_or_default();
     if let Some(fabric_libs) = fabric_profile["libraries"].as_array() {
         for lib in fabric_libs {
-            if let Some(converted) = convert_fabric_library(lib) {
+            if let Some(converted) = super::metadata::convert_profile_library(lib) {
                 libraries.push(converted);
             }
         }
@@ -211,54 +211,6 @@ fn merge_metadata(
     merged
 }
 
-/// Converts a Fabric-meta library entry
-/// (`{"name": "group:artifact:version", "url": "https://repo/"}`) into
-/// the `downloads.artifact.{path,url,size}` shape
-/// `crate::minecraft`'s deserializer expects for every library.
-fn convert_fabric_library(lib: &serde_json::Value) -> Option<serde_json::Value> {
-    let name = lib.get("name")?.as_str()?;
-    let repo = lib.get("url")?.as_str()?;
-    let path = maven_coordinate_to_path(name)?;
-    let url = format!("{}/{path}", repo.trim_end_matches('/'));
-
-    Some(serde_json::json!({
-        "name": name,
-        "downloads": {
-            "artifact": {
-                "path": path,
-                "url": url,
-                // Fabric's meta API doesn't publish a size/sha1 for
-                // these the way Mojang's own metadata does.
-                // `download_file` only warns (never fails) on a size
-                // mismatch, so 0 here just disables that sanity check
-                // for Fabric's own libraries.
-                "size": 0
-            }
-        },
-        "rules": []
-    }))
-}
-
-/// Maps `group:artifact:version[:classifier]` to the standard repository path.
-/// Missing required components return `None`; components after the optional
-/// classifier are ignored because loader profiles use this four-part maximum.
-fn maven_coordinate_to_path(coordinate: &str) -> Option<String> {
-    // "group.id:artifact:version[:classifier]" ->
-    // "group/id/artifact/version/artifact-version[-classifier].jar"
-    let mut parts = coordinate.split(':');
-    let group = parts.next()?;
-    let artifact = parts.next()?;
-    let version = parts.next()?;
-    let classifier = parts.next();
-
-    let group_path = group.replace('.', "/");
-    let file_name = match classifier {
-        Some(c) => format!("{artifact}-{version}-{c}.jar"),
-        None => format!("{artifact}-{version}.jar"),
-    };
-    Some(format!("{group_path}/{artifact}/{version}/{file_name}"))
-}
-
 // ---------------------------------------------------------------------
 // Library download
 // ---------------------------------------------------------------------
@@ -273,36 +225,85 @@ fn download_fabric_libraries(
     client: &Client,
     profile: &serde_json::Value,
 ) -> Result<()> {
-    let libs_dir = paths.libraries_dir();
-    fs::create_dir_all(&libs_dir)?;
+    super::metadata::download_profile_libraries(paths, client, profile, "fabric")
+}
 
-    let Some(libraries) = profile["libraries"].as_array() else {
-        return Ok(());
-    };
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
 
-    for lib in libraries {
-        let (Some(name), Some(repo)) = (
-            lib.get("name").and_then(|v| v.as_str()),
-            lib.get("url").and_then(|v| v.as_str()),
-        ) else {
-            continue;
-        };
-        let Some(path) = maven_coordinate_to_path(name) else {
-            continue;
-        };
-
-        let dest = libs_dir.join(&path);
-        if dest.exists() {
-            continue;
-        }
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let url = format!("{}/{path}", repo.trim_end_matches('/'));
-        minecraft::download_file(client, &url, &dest, None)?;
-        println!("  fabric library: {name}");
+    #[test]
+    fn library_download_rejects_cached_absolute_maven_group() {
+        let temp = tempfile::Builder::new()
+            .prefix("ferrite-maven-")
+            .tempdir()
+            .unwrap();
+        let paths = AppPaths::from_base_dirs(crate::core::paths::BaseDirs {
+            config: temp.path().join("config"),
+            data_local: temp.path().join("data"),
+            cache: temp.path().join("cache"),
+        })
+        .unwrap();
+        let outside = temp.path().join("loader/1/loader-1.jar");
+        fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        fs::write(&outside, b"cached outside library").unwrap();
+        // Keep the rooted path without a Windows drive prefix, whose colon would
+        // otherwise be interpreted as a Maven coordinate separator.
+        let group: PathBuf = temp
+            .path()
+            .components()
+            .filter(|component| !matches!(component, std::path::Component::Prefix(_)))
+            .collect();
+        let profile = json!({"libraries": [{
+            "name": format!("{}:loader:1", group.display()),
+            "url": "https://example.invalid/"
+        }]});
+        assert!(matches!(
+            download_fabric_libraries(&paths, &Client::new(), &profile),
+            Err(minecraft::FerriteError::Io(ref error)) if error.kind() == std::io::ErrorKind::InvalidData
+        ));
+        assert_eq!(fs::read(outside).unwrap(), b"cached outside library");
     }
 
-    Ok(())
+    #[test]
+    fn merged_metadata_preserves_vanilla_launch_data_and_loader_order() {
+        let vanilla = json!({
+            "id": "1.21.1", "mainClass": "net.minecraft.client.main.Main",
+            "assets": "17", "assetIndex": {"id": "17", "url": "https://example.invalid/assets"},
+            "downloads": {"client": {"url": "https://example.invalid/client.jar", "size": 42}},
+            "libraries": [{"name": "org.example:vanilla:1", "downloads": {
+                "artifact": {"path": "vanilla.jar", "url": "https://example.invalid/vanilla.jar", "size": 12}
+            }}],
+            "arguments": {"game": ["--username", "${auth_player_name}"], "jvm": ["-Dvanilla=true"]}
+        });
+        let loader = json!({
+            "mainClass": "org.example.Loader",
+            "libraries": [{"name": "org.example:loader:2:universal", "url": "https://maven.fabricmc.net/"}],
+            "arguments": {"game": ["--loader", "enabled"], "jvm": ["--add-opens=java.base/java.lang=ALL-UNNAMED"]}
+        });
+
+        let merged = merge_metadata("composite", &vanilla, &loader);
+
+        assert_eq!(merged["id"], "composite");
+        assert_eq!(merged["mainClass"], "org.example.Loader");
+        for field in ["assets", "assetIndex", "downloads"] {
+            assert_eq!(merged[field], vanilla[field], "{field}");
+        }
+        assert_eq!(
+            merged["arguments"]["game"],
+            json!(["--username", "${auth_player_name}", "--loader", "enabled"])
+        );
+        assert_eq!(merged["arguments"]["jvm"], json!(["-Dvanilla=true"]));
+        assert_eq!(merged["libraries"].as_array().unwrap().len(), 2);
+        assert_eq!(merged["libraries"][0], vanilla["libraries"][0]);
+        assert_eq!(
+            merged["libraries"][1]["downloads"]["artifact"],
+            json!({
+                "path": "org/example/loader/2/loader-2-universal.jar",
+                "url": "https://maven.fabricmc.net/org/example/loader/2/loader-2-universal.jar",
+                "size": 0
+            })
+        );
+    }
 }

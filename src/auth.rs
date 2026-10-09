@@ -24,6 +24,9 @@
 //! `&AtomicBool`. Setting it stops polling promptly, but cannot abort a blocking
 //! HTTP request already in progress; request timeouts bound that delay.
 
+mod session;
+pub use session::{LoginWorker, Session, SessionUpdate};
+
 use std::{
     io::Read,
     sync::atomic::{AtomicBool, Ordering},
@@ -649,6 +652,52 @@ pub fn complete_login(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authenticated_launch_wrappers_preserve_expiry_and_install_checks() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = crate::core::paths::AppPaths::from_base_dirs(crate::core::paths::BaseDirs {
+            config: temp.path().join("config"),
+            data_local: temp.path().join("data"),
+            cache: temp.path().join("cache"),
+        })
+        .unwrap();
+        let game_dir = temp.path().join("game");
+        for expired in [true, false] {
+            let account = Account {
+                name: "TestPlayer".into(),
+                uuid: "test-uuid".into(),
+                access_token: "synthetic-token".into(),
+                xuid: "test-xuid".into(),
+                client_id: "public-client".into(),
+                expires: Instant::now()
+                    + if expired {
+                        Duration::ZERO
+                    } else {
+                        Duration::from_secs(3600)
+                    },
+            };
+            for result in [
+                crate::minecraft::launch_authenticated(&paths, "missing", &game_dir, &account),
+                crate::minecraft::launch_authenticated_with_memory(
+                    &paths, "missing", &game_dir, &account, 4096,
+                ),
+            ] {
+                if expired {
+                    assert!(matches!(
+                        result,
+                        Err(crate::minecraft::FerriteError::AuthenticationExpired)
+                    ));
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(crate::minecraft::FerriteError::NotInstalled)
+                    ));
+                }
+            }
+            assert!(!game_dir.exists());
+        }
+    }
 
     #[test]
     fn validates_client_id() {

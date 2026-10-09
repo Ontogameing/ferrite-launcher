@@ -1,7 +1,7 @@
 //! Best-effort Discord Rich Presence over the local Discord IPC transport.
 //!
 //! [`DiscordPresence`] owns one connected IPC client. Constructing it connects and
-//! publishes an initial activity; subsequent calls replace or clear that activity.
+//! publishes an initial activity; disabling presence clears that activity.
 //! Dropping the value clears presence and closes the connection, which makes storing
 //! it in an `Option` a convenient way to tie the IPC lifecycle to an enable setting.
 //!
@@ -25,7 +25,7 @@ impl DiscordPresence {
     ///
     /// Returns `None` if the local IPC connection cannot be established, after writing
     /// a diagnostic to standard error. Failure to publish the initial activity is also
-    /// logged, but the live connection is still returned so later updates can retry.
+    /// logged, but the live connection is still returned for cleanup.
     pub fn new() -> Option<Self> {
         let mut client = DiscordIpcClient::new("1548778248069054584");
 
@@ -48,26 +48,6 @@ impl DiscordPresence {
         }
 
         Some(Self { client })
-    }
-
-    /// Replaces the displayed activity with caller-provided state and details.
-    ///
-    /// The strings are sent to the local Discord client. Transport or Discord errors
-    /// are logged to standard error and otherwise ignored so presence cannot interrupt
-    /// launcher operation.
-    pub fn set_activity(&mut self, state: &str, details: &str) {
-        let activity = activity::Activity::new()
-            .state(state)
-            .details(details)
-            .assets(
-                activity::Assets::new()
-                    .large_image("pixil-frame-0_4_")
-                    .large_text("Ferrite Launcher"),
-            );
-
-        if let Err(err) = self.client.set_activity(activity) {
-            eprintln!("Could not update Discord activity: {err}");
-        }
     }
 
     /// Requests removal of the current activity without closing the IPC connection.

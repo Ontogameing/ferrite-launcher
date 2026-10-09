@@ -6,7 +6,7 @@
 //! through Serde's `default` handling, while known values are semantically validated.
 //!
 //! Appearance and layout preferences are frontend-owned and live in `ui.toml`
-//! (see [`crate::ui_settings`]). Older builds stored them as `[appearance]` and
+//! (see the frontend’s `ui_settings` module). Older builds stored them as `[appearance]` and
 //! `[layout]` tables in `config.toml`; this module ignores those tables when parsing,
 //! but [`save`] carries them forward verbatim until `ui.toml` exists so that values
 //! are never lost before the one-time migration has succeeded.
@@ -21,7 +21,7 @@
 //! This module stores preferences only. Credentials and access tokens do not belong in
 //! [`Config`] or in raw TOML supplied to [`save_toml`].
 
-use ferrite_launcher::core::paths::AppPaths;
+use crate::core::paths::AppPaths;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs;
@@ -263,7 +263,7 @@ pub fn save(paths: &AppPaths, config: &Config) -> Result<(), ConfigError> {
         text.push('\n');
         text.push_str(&toml::to_string_pretty(&legacy)?);
     }
-    ferrite_launcher::core::write_atomic(&config_path(paths), text.as_bytes())?;
+    crate::core::write_atomic(&config_path(paths), text.as_bytes())?;
     Ok(())
 }
 
@@ -326,7 +326,7 @@ pub fn config_path(paths: &AppPaths) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrite_launcher::core::paths::BaseDirs;
+    use crate::core::paths::BaseDirs;
 
     /// Paths under a temporary root; tests never touch the real config directory.
     fn temp_paths(root: &std::path::Path) -> AppPaths {

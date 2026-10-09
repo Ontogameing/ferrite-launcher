@@ -19,7 +19,7 @@ mod settings;
 mod startup;
 mod view;
 
-use crate::auth::Account;
+use crate::auth::Session;
 use crate::background::BackgroundRenderer;
 use crate::config::Config;
 use crate::discord::DiscordPresence;
@@ -32,8 +32,6 @@ use crate::ui_settings::{BackgroundSource, UiSettings};
 use crate::updates::{UpdateCheck, UpdateInfo};
 use eframe::egui::{self, Color32};
 use ferrite_launcher::core::paths::AppPaths;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 use view::page_heading;
@@ -123,7 +121,22 @@ impl InstanceCreationStage {
 enum InstanceCreationEvent {
     Stage(InstanceCreationStage),
     DownloadProgress(String),
-    Finished(Result<InstanceProfile, String>),
+    Finished(Result<crate::instances::PreparedCreate, String>),
+}
+
+impl From<crate::loaders::InstallProgress> for InstanceCreationEvent {
+    fn from(progress: crate::loaders::InstallProgress) -> Self {
+        use crate::loaders::InstallProgress;
+        match progress {
+            InstallProgress::DownloadingMinecraft => {
+                Self::Stage(InstanceCreationStage::DownloadingMinecraft)
+            }
+            InstallProgress::InstallingLoader => {
+                Self::Stage(InstanceCreationStage::InstallingLoader)
+            }
+            InstallProgress::DownloadProgress(message) => Self::DownloadProgress(message),
+        }
+    }
 }
 
 /// Progress and terminal results from the serialized import/export worker.
@@ -132,66 +145,19 @@ enum InstanceCreationEvent {
 /// [`Ferrite::instances`] and its on-disk index are committed together.
 enum PackTaskEvent {
     Progress(String),
-    Imported(Result<Box<PackImportOutcome>, String>),
+    Imported(Result<Box<crate::packs::PreparedImport>, String>),
     /// The written file, or (plain-words reason, raw error).
     Exported(Result<std::path::PathBuf, (String, String)>),
-}
-
-/// Imported files awaiting the UI thread's final profile-list commit.
-///
-/// The pack subsystem has already published the files at the profile's final game
-/// directory. `committed` tracks whether the separate instance-index save succeeded.
-struct PackImportOutcome {
-    /// Storage locations used to roll back the published files.
-    paths: AppPaths,
-    profile: InstanceProfile,
-    files: u64,
-    bytes: u64,
-    warnings: Vec<String>,
-    committed: bool,
-}
-
-impl Drop for PackImportOutcome {
-    /// Removes published files unless the UI persisted and accepted the profile metadata.
-    fn drop(&mut self) {
-        if !self.committed {
-            let _ = crate::instances::delete_game_dir(&self.paths, &self.profile);
-        }
-    }
-}
-
-/// Messages from one sign-in attempt; only public device instructions reach the UI.
-enum AuthEvent {
-    Progress(String),
-    Device {
-        user_code: String,
-        verification_uri: String,
-    },
-    Account(Result<Account, String>),
-}
-
-/// One cancellable worker. Dropping its receiver discards even queued credentials.
-struct AuthTask {
-    events: Receiver<AuthEvent>,
-    cancel: Arc<AtomicBool>,
-}
-
-impl Drop for AuthTask {
-    /// Signals cancellation without blocking the UI on an in-flight HTTP request.
-    fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Relaxed);
-    }
 }
 
 /// Memory-only account and sign-in state; never serialized or logged.
 #[derive(Default)]
 struct AccountSession {
-    account: Option<Account>,
+    session: Session,
     client_id: String,
     /// Explicit opt-in to placeholder credentials for single-player/offline servers.
     offline_mode: bool,
     open: bool,
-    task: Option<AuthTask>,
     device: Option<(String, String)>,
     status: String,
 }
@@ -245,6 +211,7 @@ struct Ferrite {
     instance_name: String,
     /// Receives creation progress/results; its presence prevents another creation.
     instance_creation_task: Option<Receiver<InstanceCreationEvent>>,
+    creation_owner: Option<ferrite_launcher::core::activity::OperationId>,
     /// Creation progress or failure retained independently of other UI messages.
     instance_creation_status: Option<String>,
     /// The Minecraft version selected for the instance being created.
@@ -261,6 +228,7 @@ struct Ferrite {
     pack_loader_version: String,
     pack_include_worlds: bool,
     pack_task: Option<Receiver<PackTaskEvent>>,
+    pack_owner: Option<ferrite_launcher::core::activity::OperationId>,
     pack_status: Option<String>,
     /// Which step the Import window shows (choose, reading, preview, ...).
     import_step: packs_ui::ImportStep,
@@ -291,12 +259,13 @@ struct Ferrite {
     pending_uninstall: Option<(InstanceProfile, String)>,
     /// Receives the active search or installation result without blocking egui.
     mod_task: Option<Receiver<ModTaskResult>>,
+    mod_owner: Option<ferrite_launcher::core::activity::OperationId>,
     /// Bounded asynchronous icon decoding shared by browser and installed mods.
     icons: IconCache,
     /// Live IPC connection governed by `config.discord.rich_presence`.
     discord: Option<DiscordPresence>,
     /// Which instance is owned by which background operation (delete, ...).
-    activity: ferrite_launcher::core::activity::ActivityTracker,
+    activity: ferrite_launcher::core::activity::WorkflowCoordinator,
     /// The open delete dialog, if any.
     remove_dialog: Option<remove::DeleteDialog>,
     /// The trash/delete worker; its presence also defers closing the window.
@@ -444,6 +413,7 @@ impl Ferrite {
             create_instance_open: false,
             instance_name: String::new(),
             instance_creation_task: None,
+            creation_owner: None,
             instance_creation_status: None,
             selected_version: versions
                 .first()
@@ -459,6 +429,7 @@ impl Ferrite {
             pack_loader_version: String::new(),
             pack_include_worlds: true,
             pack_task: None,
+            pack_owner: None,
             pack_status: None,
             import_step: Default::default(),
             export_result: None,
@@ -477,6 +448,7 @@ impl Ferrite {
             show_installed: false,
             pending_uninstall: None,
             mod_task: None,
+            mod_owner: None,
             discord,
             activity: Default::default(),
             remove_dialog: None,
@@ -600,11 +572,11 @@ impl eframe::App for Ferrite {
             || self.edit_busy()
             || self.import_reading()
             || self.mod_task.is_some()
-            || self.auth.task.is_some()
+            || self.auth.session.is_pending()
             || self.update_task.is_some()
         {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
-        } else if self.auth.account.is_some() {
+        } else if self.auth.session.account().is_some() {
             ui.ctx().request_repaint_after(Duration::from_secs(1));
         }
 
@@ -615,8 +587,34 @@ impl eframe::App for Ferrite {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+
+    #[test]
+    fn backend_install_progress_keeps_frontend_stages_and_messages() {
+        use crate::loaders::InstallProgress;
+        for (progress, expected) in [
+            (
+                InstallProgress::DownloadingMinecraft,
+                "Downloading Minecraft (reusing cached files)...",
+            ),
+            (
+                InstallProgress::InstallingLoader,
+                "Installing mod loader...",
+            ),
+            (
+                InstallProgress::DownloadProgress("Fetching metadata...".into()),
+                "Fetching metadata...",
+            ),
+        ] {
+            let actual = match InstanceCreationEvent::from(progress) {
+                InstanceCreationEvent::Stage(stage) => stage.label().to_owned(),
+                InstanceCreationEvent::DownloadProgress(message) => message,
+                InstanceCreationEvent::Finished(_) => panic!("progress became a terminal result"),
+            };
+            assert_eq!(actual, expected);
+        }
+    }
 
     /// Avoids the startup network request while testing UI state transitions.
     /// Paths under a never-created temp directory; tests must not touch real user dirs.
@@ -630,7 +628,7 @@ mod tests {
         .unwrap()
     }
 
-    fn app() -> Ferrite {
+    pub(super) fn app() -> Ferrite {
         Ferrite {
             paths: test_paths(),
             config: Config::default(),
@@ -656,6 +654,7 @@ mod tests {
             create_instance_open: false,
             instance_name: String::new(),
             instance_creation_task: None,
+            creation_owner: None,
             instance_creation_status: None,
             selected_version: "1.21.1".into(),
             selected_loader: "Fabric".into(),
@@ -668,6 +667,7 @@ mod tests {
             pack_loader_version: String::new(),
             pack_include_worlds: true,
             pack_task: None,
+            pack_owner: None,
             pack_status: None,
             import_step: Default::default(),
             export_result: None,
@@ -686,6 +686,7 @@ mod tests {
             show_installed: false,
             pending_uninstall: None,
             mod_task: None,
+            mod_owner: None,
             discord: None,
             activity: Default::default(),
             remove_dialog: None,
@@ -752,17 +753,6 @@ mod tests {
         assert!(parse_hex_color("#12345").is_none());
     }
 
-    /// Installs a fake worker channel without contacting Microsoft.
-    fn auth_worker(app: &mut Ferrite) -> (mpsc::Sender<AuthEvent>, Arc<AtomicBool>) {
-        let (sender, events) = mpsc::channel();
-        let cancel = Arc::new(AtomicBool::new(false));
-        app.auth.task = Some(AuthTask {
-            events,
-            cancel: Arc::clone(&cancel),
-        });
-        (sender, cancel)
-    }
-
     #[test]
     fn launch_requires_account_and_opens_sign_in() {
         let mut app = app();
@@ -772,7 +762,7 @@ mod tests {
         assert!(app.auth.open);
         assert!(app.running_text.contains("Sign in with Microsoft"));
         assert!(app.running_text.contains("Offline mode"));
-        assert!(app.auth.task.is_none());
+        assert!(!app.auth.session.is_pending());
     }
 
     #[test]
@@ -784,85 +774,99 @@ mod tests {
     }
 
     #[test]
-    fn empty_client_id_never_starts_worker() {
-        let mut app = app();
-        app.auth.client_id = "  ".into();
-        app.start_sign_in();
-        assert!(app.auth.task.is_none());
-        assert!(app.auth.status.contains("application ID"));
-    }
+    fn launch_action_rechecks_instance_activity_before_backend_launch() {
+        use ferrite_launcher::core::activity::BusyOperation;
 
-    #[test]
-    fn auth_events_are_polled_on_other_pages_and_errors_clear_device() {
-        let mut app = app();
-        let (sender, cancel) = auth_worker(&mut app);
-        sender
-            .send(AuthEvent::Device {
-                user_code: "TEST-CODE".into(),
-                verification_uri: "https://microsoft.com/link".into(),
-            })
-            .unwrap();
-        sender
-            .send(AuthEvent::Progress("Waiting for Microsoft".into()))
-            .unwrap();
-        app.poll_auth();
-        assert!(app.auth.device.is_some());
-        assert_eq!(app.auth.status, "Waiting for Microsoft");
-        assert_eq!(app.running_text, app.auth.status);
-        sender
-            .send(AuthEvent::Account(Err("Access denied".into())))
-            .unwrap();
-        app.poll_auth();
-        assert!(app.auth.device.is_none());
-        assert!(app.auth.task.is_none());
-        assert!(cancel.load(Ordering::Relaxed));
-        assert!(app.auth.status.contains("Access denied"));
-    }
-
-    #[test]
-    fn cancel_and_sign_out_discard_queued_and_late_results() {
-        let mut app = app();
-        for sign_out in [false, true] {
-            let (sender, cancel) = auth_worker(&mut app);
-            sender
-                .send(AuthEvent::Progress("Stale progress".into()))
+        for (operation, message) in [
+            (
+                BusyOperation::Updating,
+                "Ferrite is updating this instance.",
+            ),
+            (BusyOperation::Duplicating, "Wait for the copy to finish."),
+            (
+                BusyOperation::Deleting,
+                "Ferrite is removing this instance.",
+            ),
+        ] {
+            let mut app = app();
+            app.auth.offline_mode = true;
+            let instance = profile("Busy launch target");
+            let action = match operation {
+                BusyOperation::Updating => {
+                    ferrite_launcher::core::activity::InstanceAction::ChangeVersion
+                }
+                BusyOperation::Duplicating => {
+                    ferrite_launcher::core::activity::InstanceAction::Duplicate
+                }
+                BusyOperation::Deleting => ferrite_launcher::core::activity::InstanceAction::Delete,
+            };
+            let status = ferrite_launcher::core::activity::InstanceStatus {
+                activity: ferrite_launcher::core::activity::InstanceActivity::Idle,
+                folder_missing: false,
+                global: Default::default(),
+            };
+            app.activity
+                .begin_instance(action, &instance, &status, operation)
                 .unwrap();
-            sender
-                .send(AuthEvent::Account(Err("Stale result".into())))
-                .unwrap();
-            app.auth.device = Some(("TEST".into(), "https://microsoft.com/link".into()));
-            if sign_out {
-                app.sign_out();
-            } else {
-                app.cancel_sign_in();
-            }
-            assert!(cancel.load(Ordering::Relaxed));
-            assert!(app.auth.device.is_none());
-            assert!(
-                sender
-                    .send(AuthEvent::Progress("Late progress".into()))
-                    .is_err()
-            );
-            let status = app.auth.status.clone();
-            let (_new_sender, _) = auth_worker(&mut app);
-            app.poll_auth();
-            assert_eq!(app.auth.status, status);
-            assert!(app.auth.account.is_none());
+            app.instances.push(instance);
+            app.selected_instance = Some(0);
+            app.launch_selected();
+            assert_eq!(app.running_text, message);
+            assert!(!app.close_requested);
         }
     }
 
     #[test]
-    fn dropped_app_cancels_worker_and_disconnect_is_reported() {
+    fn launch_action_rejects_missing_instance_folder() {
         let mut app = app();
-        let (sender, cancel) = auth_worker(&mut app);
-        drop(sender);
+        app.auth.offline_mode = true;
+        app.instances.push(profile("Missing launch target"));
+        app.selected_instance = Some(0);
+        app.launch_selected();
+        assert_eq!(app.running_text, "This instance's folder is missing.");
+        assert!(!app.close_requested);
+    }
+
+    #[test]
+    fn auth_session_completion_updates_ui_on_other_pages() {
+        let mut app = app();
+        let worker = app
+            .auth
+            .session
+            .begin_login("test-client")
+            .unwrap()
+            .unwrap();
+        app.auth.device = Some(("TEST-CODE".into(), "https://microsoft.com/link".into()));
+        drop(worker);
         app.poll_auth();
-        assert!(app.auth.status.contains("stopped unexpectedly"));
-        assert!(cancel.load(Ordering::Relaxed));
-        let (sender, cancel) = auth_worker(&mut app);
-        drop(app);
-        assert!(cancel.load(Ordering::Relaxed));
-        assert!(sender.send(AuthEvent::Progress("Late".into())).is_err());
+        assert!(app.auth.device.is_none());
+        assert!(!app.auth.session.is_pending());
+        assert_eq!(
+            app.auth.status,
+            "Sign-in worker stopped unexpectedly. Try again."
+        );
+        assert_eq!(app.running_text, app.auth.status);
+        let _worker = app
+            .auth
+            .session
+            .begin_login("test-client")
+            .unwrap()
+            .unwrap();
+        app.cancel_sign_in();
+        assert_eq!(app.auth.status, "Sign-in cancelled.");
+        assert!(!app.auth.session.is_pending());
+        app.sign_out();
+        assert_eq!(app.auth.status, "Signed out.");
+        assert_eq!(app.running_text, "Signed out.");
+    }
+
+    #[test]
+    fn empty_client_id_never_starts_worker() {
+        let mut app = app();
+        app.auth.client_id = "  ".into();
+        app.start_sign_in();
+        assert!(!app.auth.session.is_pending());
+        assert!(app.auth.status.contains("application ID"));
     }
 
     fn profile(name: &str) -> InstanceProfile {
@@ -873,8 +877,11 @@ mod tests {
     fn instance_progress_and_failure_preserve_form_inputs() {
         let mut app = app();
         app.instance_name = "My new instance".into();
+        let owner = app.activity.begin_create().unwrap();
+        app.creation_owner = Some(owner);
         let (sender, receiver) = mpsc::channel();
         app.instance_creation_task = Some(receiver);
+        assert!(app.activity.is_active(owner));
         sender
             .send(InstanceCreationEvent::DownloadProgress(
                 "Downloading assets".into(),
@@ -897,13 +904,17 @@ mod tests {
         assert_eq!(app.instance_name, "My new instance");
         assert!(app.running_text.contains("Network interrupted"));
         assert!(app.instances.is_empty());
+        assert!(!app.activity.is_active(owner));
     }
 
     #[test]
     fn pack_worker_progress_and_failure_are_polled_globally() {
         let mut app = app();
+        let owner = app.activity.begin_import(false).unwrap();
+        app.pack_owner = Some(owner);
         let (sender, receiver) = mpsc::channel();
         app.pack_task = Some(receiver);
+        assert!(app.activity.is_active(owner));
         sender
             .send(PackTaskEvent::Progress("Validating archive".into()))
             .unwrap();
@@ -923,6 +934,37 @@ mod tests {
             app.export_result,
             Some(packs_ui::ExportResult::Failed { ref error, .. }) if error == "disk full"
         ));
+        assert!(!app.activity.is_active(owner));
+    }
+
+    #[test]
+    fn disconnected_workers_release_only_their_admission() {
+        let mut app = app();
+        let creation = app.activity.begin_create().unwrap();
+        app.creation_owner = Some(creation);
+        let (sender, receiver) = mpsc::channel();
+        app.instance_creation_task = Some(receiver);
+        drop(sender);
+        app.poll_instance_creation();
+        assert!(!app.activity.is_active(creation));
+        assert!(app.create_instance_open);
+
+        let pack = app.activity.begin_import(false).unwrap();
+        app.pack_owner = Some(pack);
+        let (sender, receiver) = mpsc::channel();
+        app.pack_task = Some(receiver);
+        drop(sender);
+        app.poll_pack_task();
+        assert!(!app.activity.is_active(pack));
+
+        let mods = app.activity.begin_mod(false).unwrap();
+        app.mod_owner = Some(mods);
+        let (sender, receiver) = mpsc::channel();
+        app.mod_task = Some(receiver);
+        drop(sender);
+        app.poll_mod_task();
+        assert!(!app.activity.is_active(mods));
+        assert!(app.running_text.contains("stopped unexpectedly"));
     }
 
     #[test]
@@ -930,6 +972,7 @@ mod tests {
         let mut app = app();
         app.set_mod_target(profile("first"));
         let (sender, receiver) = mpsc::channel();
+        app.mod_owner = Some(app.activity.begin_mod(false).unwrap());
         app.mod_task = Some(receiver);
         app.set_mod_target(profile("second"));
         app.start_mod_task(|| panic!("must not start another worker"));

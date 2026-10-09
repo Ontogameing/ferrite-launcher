@@ -28,9 +28,11 @@ impl Ferrite {
     /// `work` must own its inputs because the detached worker is `'static`; only its
     /// terminal [`ModTaskResult`] crosses back to UI-owned state.
     pub(super) fn start_mod_task(&mut self, work: impl FnOnce() -> ModTaskResult + Send + 'static) {
-        if self.mod_task.is_some() || self.pending_uninstall.is_some() || self.pack_busy() {
-            return;
-        }
+        let owner = match self.activity.begin_mod(self.pending_uninstall.is_some()) {
+            Ok(owner) => owner,
+            Err(_) => return,
+        };
+        self.mod_owner = Some(owner);
         let (sender, receiver) = mpsc::channel();
         match std::thread::Builder::new()
             .name("mods".into())
@@ -41,7 +43,12 @@ impl Ferrite {
                 self.mod_task = Some(receiver);
                 self.running_text = "Working on mods…".into();
             }
-            Err(error) => self.running_text = format!("Failed to start mod worker: {error}"),
+            Err(error) => {
+                if let Some(owner) = self.mod_owner.take() {
+                    self.activity.complete(owner);
+                }
+                self.running_text = format!("Failed to start mod worker: {error}");
+            }
         }
     }
 
@@ -60,9 +67,7 @@ impl Ferrite {
 
     /// Checks the captured target still belongs to the live profile list.
     pub(super) fn target_exists(&self, target: &InstanceProfile) -> bool {
-        self.instances
-            .iter()
-            .any(|profile| profile.directory() == target.directory())
+        crate::instance_mods::workflows::target_exists(&self.instances, target)
     }
 
     /// Downloads a mod and dependencies into an immutable, explicitly chosen target.
@@ -73,39 +78,15 @@ impl Ferrite {
         let Some(target) = self.mod_target.clone() else {
             return;
         };
-        if !is_mod
-            || !self.target_exists(&target)
-            || !matches!(
-                target.loader.to_ascii_lowercase().as_str(),
-                "fabric" | "forge" | "neoforge" | "quilt"
-            )
-            || crate::minecraft::is_running()
-        {
-            return;
-        }
         self.installed_mods = None;
-        let game_dir = target.game_dir(&self.paths);
+        let paths = self.paths.clone();
         self.start_mod_task(move || {
-            let result = if crate::minecraft::is_running() {
-                Err("Stop Minecraft before installing mods.".into())
-            } else {
-                crate::modrinth::install(
-                    &project_id,
-                    &target.version,
-                    &target.loader.to_ascii_lowercase(),
-                    &game_dir,
-                )
-                .map(|paths| paths.len())
-            };
-            let message = match result {
-                Ok(count) => format!("Installed {title} ({count} files) into '{}'.", target.name),
-                Err(error) => format!("Install into '{}' failed: {error}", target.name),
-            };
-            let result = crate::instance_mods::list(&game_dir);
+            let local =
+                crate::instance_mods::workflows::install(&paths, target, &project_id, &title);
             ModTaskResult::Local {
-                target,
-                message,
-                result,
+                target: local.target,
+                message: local.message,
+                result: local.result,
             }
         });
     }
@@ -123,28 +104,13 @@ impl Ferrite {
             return;
         }
         self.installed_mods = None;
-        let game_dir = target.game_dir(&self.paths);
+        let paths = self.paths.clone();
         self.start_mod_task(move || {
-            let operation = if crate::minecraft::is_running() {
-                Err("Stop Minecraft before managing mods.".into())
-            } else {
-                match action {
-                    Some((filename, Some(enabled))) => {
-                        crate::instance_mods::set_enabled(&game_dir, &filename, enabled).map(|_| ())
-                    }
-                    Some((filename, None)) => crate::instance_mods::uninstall(&game_dir, &filename),
-                    None => Ok(()),
-                }
-            };
-            let message = match operation {
-                Ok(()) => format!("Refreshed mods for '{}'.", target.name),
-                Err(error) => format!("Mods for '{}': {error}", target.name),
-            };
-            let result = crate::instance_mods::list(&game_dir);
+            let local = crate::instance_mods::workflows::manage(&paths, target, action);
             ModTaskResult::Local {
-                target,
-                message,
-                result,
+                target: local.target,
+                message: local.message,
+                result: local.result,
             }
         });
     }
@@ -162,6 +128,9 @@ impl Ferrite {
             Err(TryRecvError::Empty) => return,
             Err(TryRecvError::Disconnected) => {
                 self.mod_task = None;
+                if let Some(owner) = self.mod_owner.take() {
+                    self.activity.complete(owner);
+                }
                 self.running_text =
                     "The mod worker stopped unexpectedly; refresh before retrying.".into();
                 return;
@@ -191,12 +160,11 @@ impl Ferrite {
                 result,
             } => {
                 self.running_text = message;
-                if self.target_exists(&target)
-                    && self
-                        .mod_target
-                        .as_ref()
-                        .is_some_and(|current| current.directory() == target.directory())
-                {
+                if crate::instance_mods::workflows::accepts_result(
+                    &self.instances,
+                    self.mod_target.as_ref(),
+                    &target,
+                ) {
                     match result {
                         Ok(mods) => self.installed_mods = Some(mods),
                         Err(error) => {
@@ -207,6 +175,9 @@ impl Ferrite {
                     }
                 }
             }
+        }
+        if let Some(owner) = self.mod_owner.take() {
+            self.activity.complete(owner);
         }
     }
 
@@ -567,16 +538,15 @@ impl Ferrite {
 
     /// Installation eligibility is based on result provenance, not editable filters.
     pub(super) fn can_install(&self, is_mod: bool) -> bool {
-        is_mod
-            && self.mod_task.is_none()
+        self.mod_task.is_none()
             && self.pending_uninstall.is_none()
-            && !crate::minecraft::is_running()
             && self.mod_target.as_ref().is_some_and(|target| {
-                self.target_exists(target)
-                    && matches!(
-                        target.loader.to_ascii_lowercase().as_str(),
-                        "fabric" | "forge" | "neoforge" | "quilt"
-                    )
+                crate::instance_mods::workflows::can_install(
+                    &self.instances,
+                    target,
+                    is_mod,
+                    crate::minecraft::is_running(),
+                )
             })
     }
 

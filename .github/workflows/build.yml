@@ -34,10 +34,19 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: clippy
-        run: cargo clippy --all-targets
+        run: cargo clippy --locked --all-targets
 
       - name: test
-        run: cargo test --all-targets --no-fail-fast
+        run: cargo test --locked --all-targets --no-fail-fast
+
+      - name: Headless clippy
+        run: cargo clippy --locked --no-default-features --all-targets
+
+      - name: Headless test
+        run: cargo test --locked --no-default-features --all-targets --no-fail-fast
+
+      - name: Headless build
+        run: cargo build --locked --no-default-features --lib
 
   build:
     name: Release build (${{ matrix.os }})
@@ -62,13 +71,17 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build release
-        run: cargo build --release
+        run: cargo build --locked --release
 
       # Ubuntu tests run in the check job; also run them on Windows/macOS so
       # platform-specific code (fsutil no-replace rename, trash, cfg(unix) link tests) is exercised.
       - name: Test (Windows/macOS)
         if: runner.os != 'Linux'
-        run: cargo test --all-targets --no-fail-fast
+        run: cargo test --locked --all-targets --no-fail-fast
+
+      - name: Headless test (Windows/macOS)
+        if: runner.os != 'Linux'
+        run: cargo test --locked --no-default-features --all-targets --no-fail-fast
 
       # Rename binaries so upload-artifact names match softprops/action-gh-release paths.
       - name: Package Linux artifact

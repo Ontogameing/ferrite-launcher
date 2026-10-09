@@ -40,9 +40,7 @@ impl UiSettings {
                 "appearance.theme must be 'dark' or 'light'".to_owned(),
             ));
         }
-        let accent = self.appearance.accent.as_bytes();
-        if accent.len() != 7 || accent[0] != b'#' || !accent[1..].iter().all(u8::is_ascii_hexdigit)
-        {
+        if !is_rgb_color(&self.appearance.accent) {
             return Err(ConfigError::Validation(
                 "appearance.accent must be a color in #RRGGBB format".to_owned(),
             ));

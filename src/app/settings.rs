@@ -952,7 +952,7 @@ fn vertical_alignment_label(alignment: &VerticalAlignment) -> &'static str {
 /// Parses strict `#RRGGBB` input; invalid text leaves the active accent unchanged.
 pub(super) fn parse_hex_color(value: &str) -> Option<Color32> {
     let hex = value.strip_prefix('#')?;
-    if hex.len() != 6 {
+    if hex.len() != 6 || !hex.is_ascii() {
         return None;
     }
     let red = u8::from_str_radix(&hex[0..2], 16).ok()?;
@@ -964,4 +964,20 @@ pub(super) fn parse_hex_color(value: &str) -> Option<Color32> {
 /// Serializes an egui color to the configuration's lowercase `#rrggbb` form.
 pub(super) fn color_to_hex(color: Color32) -> String {
     format!("#{:02x}{:02x}{:02x}", color.r(), color.g(), color.b())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_colors_reject_non_ascii_without_panicking() {
+        for value in ["#aébcd", "#abcé0", "#abcdeé", "#１２"] {
+            assert!(parse_hex_color(value).is_none(), "{value}");
+        }
+        assert_eq!(
+            parse_hex_color("#aB12EF"),
+            Some(Color32::from_rgb(171, 18, 239))
+        );
+    }
 }

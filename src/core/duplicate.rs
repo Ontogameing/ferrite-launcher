@@ -239,14 +239,31 @@ impl DuplicatePlan {
     }
 }
 
-/// A finished copy, already in its final folder but not yet in the list.
-#[derive(Debug, Clone)]
+/// A finished copy, removed on drop until its manifest commit takes ownership.
+#[derive(Debug)]
 pub struct CopiedDuplicate {
+    paths: AppPaths,
+    cleanup: Option<PathBuf>,
     pub profile: InstanceProfile,
     pub files_copied: u64,
     pub bytes_copied: u64,
     /// Links in the source (relative paths) that were not copied.
     pub skipped_links: Vec<PathBuf>,
+}
+
+impl Drop for CopiedDuplicate {
+    fn drop(&mut self) {
+        if let Some(path) = &self.cleanup
+            && instances::ensure_game_dir_contained(&self.paths, path).is_ok()
+            && let Err(error) = fs::remove_dir_all(path)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "Ferrite: could not remove uncommitted duplicate {}: {error}",
+                path.display()
+            );
+        }
+    }
 }
 
 /// A committed duplicate.
@@ -457,7 +474,7 @@ fn copy_with_hooks(
         hook();
     }
     match fsutil::rename_no_replace_with_retry(&staging, &target) {
-        Ok(()) => guard.disarm(),
+        Ok(()) => guard.path = Some(target.clone()),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             return Err(DuplicateError::TargetExists(target));
         }
@@ -473,12 +490,16 @@ fn copy_with_hooks(
         progress.files_done = progress.files_total;
         progress.bytes_done = progress.bytes_total;
     });
-    Ok(CopiedDuplicate {
+    let copied = CopiedDuplicate {
+        paths: paths.clone(),
+        cleanup: Some(target),
         profile: plan.profile.clone(),
         files_copied: scan.files.len() as u64,
         bytes_copied: scan.total_bytes,
         skipped_links: scan.links,
-    })
+    };
+    guard.disarm();
+    Ok(copied)
 }
 
 fn check_free_space(
@@ -527,19 +548,21 @@ pub fn commit_duplicate(
     paths: &AppPaths,
     profiles: &mut Vec<InstanceProfile>,
     skipped: &[SkippedEntry],
-    copied: CopiedDuplicate,
+    mut copied: CopiedDuplicate,
     control: Option<&DuplicateControl>,
 ) -> Result<DuplicateReport, DuplicateError> {
-    let index = instances::commit_new_instance(paths, profiles, skipped, copied.profile.clone())?;
+    let result = instances::commit_new_instance(paths, profiles, skipped, copied.profile.clone());
+    copied.cleanup = None;
+    let index = result?;
     if let Some(control) = control {
         control.update(|progress| progress.step = DuplicateStep::Done);
     }
     Ok(DuplicateReport {
         index,
-        profile: copied.profile,
+        profile: copied.profile.clone(),
         files_copied: copied.files_copied,
         bytes_copied: copied.bytes_copied,
-        skipped_links: copied.skipped_links,
+        skipped_links: std::mem::take(&mut copied.skipped_links),
     })
 }
 

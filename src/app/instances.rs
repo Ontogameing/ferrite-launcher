@@ -10,17 +10,12 @@ use crate::loaders::ModLoader;
 use crate::packs::PackFormat;
 use eframe::egui::{self, Color32, RichText};
 use ferrite_launcher::core::activity::{
-    BusyOperation, GlobalBusy, InstanceAction, InstanceStatus, disabled_reason,
+    BusyOperation, InstanceAction, InstanceStatus, disabled_reason,
 };
 use std::path::PathBuf;
 use std::sync::mpsc::{self, TryRecvError};
 
 impl Ferrite {
-    /// Parses the form's display label into the loader backend used by workers.
-    pub(super) fn selected_loader(&self) -> Option<ModLoader> {
-        ModLoader::from_label(&self.selected_loader)
-    }
-
     /// Resolves the selected index defensively because removals can invalidate it.
     pub(super) fn selected_instance(&self) -> Option<&InstanceProfile> {
         self.selected_instance
@@ -52,7 +47,7 @@ impl Ferrite {
             return;
         }
 
-        let Some(loader) = self.selected_loader() else {
+        let Some(loader) = ModLoader::from_label(&self.selected_loader) else {
             self.running_text = format!("Unknown mod loader: {}", self.selected_loader);
             return;
         };
@@ -81,20 +76,33 @@ impl Ferrite {
                 return;
             }
         };
+        let owner = match self.activity.begin_create() {
+            Ok(owner) => owner,
+            Err(reason) => {
+                self.running_text = reason;
+                return;
+            }
+        };
+        self.creation_owner = Some(owner);
         let paths = self.paths.clone();
         let (sender, receiver) = mpsc::channel();
         let worker = std::thread::Builder::new()
             .name("instance-creation".to_owned())
             .spawn(move || {
-                let result = (|| -> Result<InstanceProfile, String> {
+                let result = (|| -> Result<crate::instances::PreparedCreate, String> {
                     let _ = sender.send(InstanceCreationEvent::Stage(
                         InstanceCreationStage::Preparing,
                     ));
                     // A failed install removes the folder this call created.
-                    crate::instances::create_instance_files(&paths, &profile, || {
-                        install_game_files(&paths, &profile.version, loader, &|event| {
-                            let _ = sender.send(event);
-                        })
+                    let prepared = crate::instances::prepare_create(&paths, &profile, || {
+                        crate::loaders::install_game_files(
+                            &paths,
+                            &profile.version,
+                            loader,
+                            &|progress| {
+                                let _ = sender.send(progress.into());
+                            },
+                        )
                     })
                     .map_err(|error| match error {
                         crate::instances::InstanceError::Install(detail) => detail,
@@ -103,7 +111,7 @@ impl Ferrite {
                     let _ = sender.send(InstanceCreationEvent::Stage(
                         InstanceCreationStage::Finalizing,
                     ));
-                    Ok(profile)
+                    Ok(prepared)
                 })();
                 let _ = sender.send(InstanceCreationEvent::Finished(result));
             });
@@ -139,15 +147,12 @@ impl Ferrite {
                     self.instance_creation_task = None;
                     match result {
                         Ok(profile) => {
-                            let name = profile.name.clone();
+                            let name = profile.profile().name.clone();
                             // On failure the profile is not kept and its new folder is
                             // removed, so memory, manifest, and disk stay consistent.
-                            let index = match crate::instances::commit_new_instance(
-                                &self.paths,
-                                &mut self.instances,
-                                &self.skipped_instances,
-                                profile,
-                            ) {
+                            let index = match profile
+                                .commit(&mut self.instances, &self.skipped_instances)
+                            {
                                 Ok(index) => index,
                                 Err(error) => {
                                     self.instance_creation_failed(format!(
@@ -163,6 +168,9 @@ impl Ferrite {
                             self.create_instance_open = false;
                         }
                         Err(error) => self.instance_creation_failed(error),
+                    }
+                    if let Some(owner) = self.creation_owner.take() {
+                        self.activity.complete(owner);
                     }
                     return;
                 }
@@ -180,6 +188,9 @@ impl Ferrite {
     /// Clears the busy lock while preserving form input and reopening the failed dialog.
     pub(super) fn instance_creation_failed(&mut self, message: String) {
         self.instance_creation_task = None;
+        if let Some(owner) = self.creation_owner.take() {
+            self.activity.complete(owner);
+        }
         self.running_text = message.clone();
         self.instance_creation_status = Some(message);
         self.create_instance_open = true;
@@ -192,16 +203,10 @@ impl Ferrite {
 
     /// Returns the user-actionable reason authenticated launch is currently unavailable.
     pub(super) fn launch_auth_error(&self) -> Option<&'static str> {
-        if self.auth.offline_mode {
-            return None;
-        }
-        match self.auth.account.as_ref() {
-            None => Some("Sign in with Microsoft before launching, or select Offline mode."),
-            Some(account) if account.is_expired() => {
-                Some("Session expired. Please sign in again before launching.")
-            }
-            Some(_) => None,
-        }
+        ferrite_launcher::core::activity::WorkflowCoordinator::launch_auth_error(
+            self.auth.session.account(),
+            self.auth.offline_mode,
+        )
     }
 
     /// Validates cross-subsystem locks and launches the selected profile.
@@ -215,50 +220,19 @@ impl Ferrite {
             self.auth.open = true;
             return;
         }
-        if self.mod_task.is_some() || self.pending_uninstall.is_some() || self.pack_busy() {
-            self.running_text =
-                "Wait for mod or instance import/export work to finish before launching.".into();
-            return;
-        }
-        let Some(instance) = self.selected_instance() else {
-            self.running_text = "Select an instance before launching.".to_owned();
-            return;
-        };
-        let name = instance.name.clone();
-        let version = instance.version.clone();
-        let loader_name = instance.loader.clone();
-        let game_dir = instance.game_dir(&self.paths);
-
-        let Some(loader) = ModLoader::from_label(&loader_name) else {
-            self.running_text = format!("Unknown mod loader: {loader_name}");
-            return;
-        };
-
-        let memory_mb = self.config.minecraft.default_memory_mb;
-        let result = if self.auth.offline_mode {
-            crate::loaders::launch_in_directory_with_memory(
-                &self.paths,
-                &version,
-                loader,
-                &game_dir,
-                memory_mb,
-            )
-        } else {
-            crate::loaders::launch_authenticated_with_memory(
-                &self.paths,
-                &version,
-                loader,
-                &game_dir,
-                self.auth.account.as_ref().expect("account checked above"),
-                memory_mb,
-            )
-        };
+        let result = self.activity.launch(
+            &self.paths,
+            self.selected_instance(),
+            self.auth.session.account(),
+            self.auth.offline_mode,
+            self.config.minecraft.default_memory_mb,
+            self.pending_uninstall.is_some(),
+        );
         let launched = result.is_ok();
         self.running_text = match result {
-            Ok(()) if self.auth.offline_mode => format!("Launched '{name}' in offline mode."),
-            Ok(()) => format!("Launched '{name}'."),
-            Err(error) => format!("Failed to launch '{name}': {error}"),
+            Ok(message) | Err(message) => message,
         };
+
         if launched && self.config.launcher.close_on_launch {
             self.close_requested = true;
         }
@@ -266,15 +240,7 @@ impl Ferrite {
 
     /// Why Create and Import are unavailable right now, if they are.
     pub(super) fn create_import_lock(&self) -> Option<String> {
-        if self.pack_busy() {
-            return Some("Wait for the import or export to finish.".into());
-        }
-        if let Some(task) = &self.edit_task
-            && task.installing().is_some()
-        {
-            return Some("Wait for Ferrite to finish updating the instance.".into());
-        }
-        None
+        self.activity.create_import_lock()
     }
 
     /// Draws profile cards and executes at most one deferred card action afterward.
@@ -498,17 +464,12 @@ impl Ferrite {
     /// and one `symlink_metadata` call).
     pub(super) fn instance_status(&self, instance: &InstanceProfile) -> InstanceStatus {
         let running = crate::minecraft::is_instance_running(instance.directory().as_str());
-        InstanceStatus {
-            activity: self
-                .activity
-                .activity(instance.directory().as_str(), running),
-            folder_missing: crate::instances::folder_missing(&self.paths, instance),
-            global: GlobalBusy {
-                pack_task: self.pack_busy(),
-                mod_task: self.mod_task.is_some() || self.pending_uninstall.is_some(),
-                creation_task: self.instance_creation_task.is_some(),
-            },
-        }
+        self.activity.status(
+            &self.paths,
+            instance,
+            running,
+            self.pending_uninstall.is_some(),
+        )
     }
 
     /// Keeps creation input visible during progress and preserves it when work fails.
@@ -790,33 +751,6 @@ fn card_menu(
         CardAction::Delete(index),
     );
     action
-}
-
-/// Installs the shared Minecraft files for `version` and, unless Vanilla, the loader:
-/// the same steps Create runs, reused by Edit's "Save and install". Never touches an
-/// instance folder. Progress goes to `events` as creation stages and messages.
-pub(super) fn install_game_files(
-    paths: &ferrite_launcher::core::paths::AppPaths,
-    version: &str,
-    loader: ModLoader,
-    events: &dyn Fn(InstanceCreationEvent),
-) -> Result<(), String> {
-    events(InstanceCreationEvent::Stage(
-        InstanceCreationStage::DownloadingMinecraft,
-    ));
-    crate::minecraft::install_version_with_progress(paths, version, |message| {
-        events(InstanceCreationEvent::DownloadProgress(message.into()));
-    })
-    .map_err(|error| format!("Failed to download Minecraft: {error}"))?;
-    if loader != ModLoader::Vanilla {
-        events(InstanceCreationEvent::Stage(
-            InstanceCreationStage::InstallingLoader,
-        ));
-        // Loader backends repeat the vanilla install, reusing cached downloads.
-        crate::loaders::install(paths, version, loader)
-            .map_err(|error| format!("Failed to install {}: {error}", loader.label()))?;
-    }
-    Ok(())
 }
 
 /// The "Mod loader" ComboBox used by Create and generic Import. Quilt reads

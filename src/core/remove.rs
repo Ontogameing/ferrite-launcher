@@ -26,7 +26,7 @@
 //! use the split steps instead: [`prepare_removal`] and [`finish_trash`] /
 //! [`commit_removal`] on the UI thread (they touch the profile list), and
 //! [`trash_target`] / [`delete_target`] on a worker thread while showing
-//! "Moving to <Trash>…".
+//! `Moving to <Trash>…`.
 
 // Refusals are returned as a full `RemoveOutcome` so the UI matches one type; these are
 // produced once per user action, so their size does not matter.
@@ -198,7 +198,7 @@ pub enum RemoveOutcome {
     PartiallyDeleted {
         profile: InstanceProfile,
         folder: PathBuf,
-        /// Paths still on disk (at most [`MAX_LEFTOVERS`]).
+        /// Paths still on disk (at most `MAX_LEFTOVERS`).
         failed: Vec<PathBuf>,
         error: String,
     },
@@ -409,6 +409,87 @@ pub fn commit_removal(
     })
 }
 
+/// Whether removal finished synchronously or its file worker was scheduled.
+#[derive(Debug)]
+pub enum RemovalStart {
+    Completed(RemoveOutcome),
+    Scheduled,
+}
+
+/// Orders the manifest step around frontend-owned worker scheduling.
+/// A failed permanent-delete spawn restores the entry before returning.
+pub fn start_prepared_removal(
+    paths: &AppPaths,
+    profiles: &mut Vec<InstanceProfile>,
+    skipped: &[SkippedEntry],
+    target: &RemovalTarget,
+    is_running: &dyn Fn(&InstanceDirName) -> bool,
+    schedule: impl FnOnce() -> io::Result<()>,
+) -> Result<RemovalStart, RemoveOutcome> {
+    if target.mode == RemoveMode::KeepFiles {
+        return commit_removal(paths, profiles, skipped, target, is_running)
+            .map(RemovalStart::Completed);
+    }
+    let removed = if target.mode == RemoveMode::Permanent {
+        let index = instances::find_profile(profiles, target.profile.directory())
+            .map_err(RemoveOutcome::Failed)?;
+        let profile = profiles[index].clone();
+        commit_removal(paths, profiles, skipped, target, is_running)?;
+        Some((index, profile))
+    } else {
+        None
+    };
+    if let Err(error) = schedule() {
+        if let Some((index, profile)) = removed {
+            profiles.insert(index, profile);
+            if let Err(restore_error) = instances::save(paths, profiles, skipped) {
+                return Err(RemoveOutcome::Failed(InstanceError::Install(format!(
+                    "could not start removal: {error}; restored the instance in memory, but could not restore its manifest: {restore_error}"
+                ))));
+            }
+        }
+        return Err(RemoveOutcome::Failed(InstanceError::Io(io::Error::new(
+            error.kind(),
+            format!("could not start removal: {error}"),
+        ))));
+    }
+    Ok(RemovalStart::Scheduled)
+}
+
+/// Runs the file step selected by a checked removal target.
+pub fn run_removal_files(
+    paths: &AppPaths,
+    target: &RemovalTarget,
+    trasher: &dyn Trasher,
+    is_running: &dyn Fn(&InstanceDirName) -> bool,
+) -> Result<(), RemoveOutcome> {
+    match target.mode {
+        RemoveMode::Trash => trash_target(paths, target, trasher, is_running),
+        RemoveMode::Permanent => match delete_target(paths, target) {
+            RemoveOutcome::Deleted { .. } => Ok(()),
+            outcome => Err(outcome),
+        },
+        RemoveMode::KeepFiles => Ok(()),
+    }
+}
+
+/// Accepts a file worker result and performs any remaining manifest commit.
+pub fn finish_removal(
+    paths: &AppPaths,
+    profiles: &mut Vec<InstanceProfile>,
+    skipped: &[SkippedEntry],
+    target: RemovalTarget,
+    result: Result<(), RemoveOutcome>,
+) -> RemoveOutcome {
+    match (target.mode, result) {
+        (RemoveMode::Trash, Ok(())) => finish_trash(paths, profiles, skipped, target),
+        (_, Ok(())) => RemoveOutcome::Deleted {
+            profile: target.profile,
+        },
+        (_, Err(outcome)) => outcome,
+    }
+}
+
 /// Step 3 for [`RemoveMode::Permanent`] (worker thread, after [`commit_removal`]):
 /// deletes the folder. `remove_dir_all` does not follow links (a link at the folder
 /// path is removed as the link). On failure, lists what is left.
@@ -436,7 +517,7 @@ pub fn delete_target(paths: &AppPaths, target: &RemovalTarget) -> RemoveOutcome 
 }
 
 /// Read-only listing of what is left under `root` (no links followed), deepest
-/// entries first, capped at [`MAX_LEFTOVERS`].
+/// entries first, capped at `MAX_LEFTOVERS`.
 fn leftovers(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let mut pending = vec![root.to_path_buf()];
@@ -503,3 +584,125 @@ pub fn remove_instance(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod workflow_tests {
+    use super::*;
+    use crate::core::paths::test_support::paths_in;
+    use std::cell::Cell;
+
+    #[test]
+    fn permanent_spawn_failure_restores_original_manifest_position() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths_in(temp.path());
+        let mut profiles = Vec::new();
+        for name in ["Before", "Delete", "After"] {
+            let profile =
+                instances::new_instance_profile(&paths, name, "1", "Vanilla", &profiles, &[])
+                    .unwrap();
+            instances::create_new_game_dir(&paths, &profile).unwrap();
+            profiles.push(profile);
+        }
+        instances::save(&paths, &profiles, &[]).unwrap();
+        let before = profiles.clone();
+        let target = prepare_removal(
+            &paths,
+            &profiles,
+            &[],
+            before[1].directory(),
+            RemoveMode::Permanent,
+            &|_| false,
+        )
+        .unwrap();
+        let called = Cell::new(false);
+        let started =
+            start_prepared_removal(&paths, &mut profiles, &[], &target, &|_| false, || {
+                called.set(true);
+                assert_eq!(
+                    instances::load(&paths).unwrap().profiles,
+                    vec![before[0].clone(), before[2].clone()]
+                );
+                assert!(before[1].game_dir(&paths).is_dir());
+                Err(io::Error::other("spawn failed"))
+            });
+        assert!(called.get());
+        assert!(matches!(started, Err(RemoveOutcome::Failed(_))));
+        assert_eq!(profiles, before);
+        assert_eq!(instances::load(&paths).unwrap().profiles, before);
+        assert!(before[1].game_dir(&paths).is_dir());
+    }
+    #[test]
+    fn scheduling_preserves_trash_permanent_and_keep_files_ordering() {
+        for mode in [
+            RemoveMode::Trash,
+            RemoveMode::Permanent,
+            RemoveMode::KeepFiles,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths_in(temp.path());
+            let profile =
+                instances::new_instance_profile(&paths, "Delete", "1", "Vanilla", &[], &[])
+                    .unwrap();
+            instances::create_new_game_dir(&paths, &profile).unwrap();
+            let mut profiles = vec![profile.clone()];
+            instances::save(&paths, &profiles, &[]).unwrap();
+            let target =
+                prepare_removal(&paths, &profiles, &[], profile.directory(), mode, &|_| {
+                    false
+                })
+                .unwrap();
+            let scheduled = Cell::new(false);
+            let result =
+                start_prepared_removal(&paths, &mut profiles, &[], &target, &|_| false, || {
+                    scheduled.set(true);
+                    assert!(profile.game_dir(&paths).is_dir());
+                    let loaded = instances::load(&paths).unwrap();
+                    assert_eq!(loaded.profiles.is_empty(), mode == RemoveMode::Permanent);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(scheduled.get(), mode != RemoveMode::KeepFiles);
+            assert_eq!(profiles.is_empty(), mode != RemoveMode::Trash);
+            assert_eq!(
+                matches!(result, RemovalStart::Completed(_)),
+                mode == RemoveMode::KeepFiles
+            );
+            assert!(profile.game_dir(&paths).is_dir());
+        }
+    }
+
+    #[test]
+    fn failed_spawn_reports_manifest_restoration_failure_without_overwriting_corruption() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths_in(temp.path());
+        let profile =
+            instances::new_instance_profile(&paths, "Delete", "1", "Vanilla", &[], &[]).unwrap();
+        instances::create_new_game_dir(&paths, &profile).unwrap();
+        let mut profiles = vec![profile.clone()];
+        instances::save(&paths, &profiles, &[]).unwrap();
+        let target = prepare_removal(
+            &paths,
+            &profiles,
+            &[],
+            profile.directory(),
+            RemoveMode::Permanent,
+            &|_| false,
+        )
+        .unwrap();
+        let result =
+            start_prepared_removal(&paths, &mut profiles, &[], &target, &|_| false, || {
+                fs::write(paths.instances_manifest(), "{ corrupt").unwrap();
+                Err(io::Error::other("spawn failed"))
+            });
+        assert!(
+            matches!(result, Err(RemoveOutcome::Failed(InstanceError::Install(ref message)))
+            if message.contains("could not restore its manifest"))
+        );
+        assert_eq!(profiles, vec![profile.clone()]);
+        assert!(profile.game_dir(&paths).is_dir());
+        assert_eq!(
+            fs::read_to_string(paths.instances_manifest()).unwrap(),
+            "{ corrupt"
+        );
+    }
+}

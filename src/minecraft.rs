@@ -54,7 +54,7 @@
 //! that module can reuse this one's download logic instead of duplicating it;
 //! the filesystem layout itself comes from [`AppPaths`].
 
-use ferrite_launcher::core::paths::AppPaths;
+use crate::core::paths::AppPaths;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -91,8 +91,6 @@ pub enum FerriteError {
     AlreadyRunning,
     /// The authenticated session expired and requires a fresh sign-in.
     AuthenticationExpired,
-    /// A mod loader (Forge/NeoForge/Quilt) that isn't implemented yet.
-    LoaderNotImplemented(&'static str),
     /// `crate::loaders` was asked to launch/check a mod-loader version
     /// for a Minecraft version that hasn't had that loader installed.
     LoaderNotInstalled(String),
@@ -132,9 +130,6 @@ impl fmt::Display for FerriteError {
                     f,
                     "authentication expired — sign in again before launching Minecraft"
                 )
-            }
-            FerriteError::LoaderNotImplemented(name) => {
-                write!(f, "{name} support isn't implemented yet")
             }
             FerriteError::LoaderNotInstalled(mc_version) => write!(
                 f,
@@ -180,14 +175,6 @@ pub type Result<T> = std::result::Result<T, FerriteError>;
 // =====================================================================
 // PUBLIC API — this is the only part `app.rs` should ever touch.
 // =====================================================================
-
-/// Fetches release ids from Mojang's current version manifest.
-///
-/// Results preserve manifest order (normally newest first). This always performs
-/// a network request and does not inspect which versions are installed locally.
-pub fn get_versions() -> Result<Vec<String>> {
-    get_versions_with_snapshots(false)
-}
 
 /// Fetches selectable ids from Mojang's current version manifest.
 ///
@@ -299,7 +286,7 @@ pub fn install_version_with_progress(
 /// Explicit offline compatibility wrapper: uses placeholder credentials for
 /// singleplayer, not online-mode servers. Account-aware callers should use
 /// `launch_authenticated` instead.
-pub fn launch_version(paths: &AppPaths, version: &str) -> Result<()> {
+pub(crate) fn launch_version(paths: &AppPaths, version: &str) -> Result<()> {
     launch_version_in_directory(paths, version, paths.storage_root())
 }
 
@@ -311,7 +298,11 @@ pub fn launch_version(paths: &AppPaths, version: &str) -> Result<()> {
 /// Assets, libraries, version files, and natives remain in shared storage.
 /// Authentication, Java checks, and the single-running-process limit are the
 /// same as in `launch_version`; this does not install or copy game content.
-pub fn launch_version_in_directory(paths: &AppPaths, version: &str, game_dir: &Path) -> Result<()> {
+pub(crate) fn launch_version_in_directory(
+    paths: &AppPaths,
+    version: &str,
+    game_dir: &Path,
+) -> Result<()> {
     launch_with_auth(
         paths,
         version,
@@ -343,24 +334,20 @@ pub fn launch_version_in_directory_with_memory(
 /// account. Rejects expired sessions; the caller must sign in again (no refresh
 /// or offline fallback). Directory, Java, and process handling match the offline
 /// compatibility wrapper `launch_version_in_directory`.
-pub fn launch_authenticated(
+pub(crate) fn launch_authenticated(
     paths: &AppPaths,
     version: &str,
     game_dir: &Path,
     account: &crate::auth::Account,
 ) -> Result<()> {
-    if account.is_expired() {
-        return Err(FerriteError::AuthenticationExpired);
-    }
-    let placeholders = auth_placeholders(
-        &account.name,
-        &account.uuid,
-        &account.access_token,
-        &account.client_id,
-        &account.xuid,
-        "msa",
-    );
-    launch_with_auth(paths, version, game_dir, placeholders, false, None)
+    launch_with_auth(
+        paths,
+        version,
+        game_dir,
+        account_auth_placeholders(account)?,
+        false,
+        None,
+    )
 }
 
 /// Authenticated launch using an explicit maximum Java heap size.
@@ -371,25 +358,28 @@ pub fn launch_authenticated_with_memory(
     account: &crate::auth::Account,
     memory_mb: u32,
 ) -> Result<()> {
+    launch_with_auth(
+        paths,
+        version,
+        game_dir,
+        account_auth_placeholders(account)?,
+        false,
+        Some(memory_mb),
+    )
+}
+
+fn account_auth_placeholders(account: &crate::auth::Account) -> Result<HashMap<String, String>> {
     if account.is_expired() {
         return Err(FerriteError::AuthenticationExpired);
     }
-    let placeholders = auth_placeholders(
+    Ok(auth_placeholders(
         &account.name,
         &account.uuid,
         &account.access_token,
         &account.client_id,
         &account.xuid,
         "msa",
-    );
-    launch_with_auth(
-        paths,
-        version,
-        game_dir,
-        placeholders,
-        false,
-        Some(memory_mb),
-    )
+    ))
 }
 
 // Launch preparation is deliberately centralized so authenticated and offline
@@ -447,8 +437,8 @@ fn launch_with_auth(
         .iter()
         .filter(|lib| rules_allow(&lib.rules))
         .filter_map(|lib| lib.downloads.artifact.as_ref())
-        .map(|artifact| libs_dir.join(&artifact.path))
-        .collect();
+        .map(|artifact| metadata_path(&libs_dir, &artifact.path))
+        .collect::<Result<Vec<_>>>()?;
     classpath_paths.push(client_jar);
 
     let mut classpath_absolute = Vec::with_capacity(classpath_paths.len());
@@ -515,13 +505,11 @@ fn launch_with_auth(
     // Never log the command, resolved arguments, or placeholders: both modern
     // access tokens and legacy sessions contain credentials (including JVM args).
     println!("Launching Minecraft {}...", metadata.id);
-    let child = command.spawn()?;
-
-    *process_slot().lock().unwrap() = Some(RunningGame {
-        child,
-        instance: instance_folder_of(paths, game_dir),
-    });
-    Ok(())
+    spawn_game(
+        &mut command,
+        instance_folder_of(paths, game_dir),
+        process_slot(),
+    )
 }
 
 /// The instance folder name when `game_dir` is directly inside the instances root
@@ -537,10 +525,10 @@ fn instance_folder_of(paths: &AppPaths, game_dir: &Path) -> Option<String> {
 }
 
 /// Whether `running` (the folder recorded at launch) names the instance `directory`.
-/// Compared case-insensitively so a case-only alias of a folder also counts as running,
-/// which errs on the side of blocking destructive actions.
+/// Uses the same portable folder identity as storage and activity tracking so a
+/// Unicode or case alias cannot bypass destructive-action guards.
 fn same_instance_folder(running: &str, directory: &str) -> bool {
-    running.to_lowercase() == directory.to_lowercase()
+    crate::instances::directory_key(running) == crate::instances::directory_key(directory)
 }
 
 // Keep argument substitution and the child's working directory tied to the
@@ -570,9 +558,8 @@ fn game_command(
 // `OnceLock` lazily creates one slot for the whole process. `Mutex` is sufficient
 // because the slot itself has static shared ownership; an `Arc` is unnecessary
 // unless the slot must be passed outside this module. Lock poisoning currently
-// propagates as a panic through `unwrap`. The check in `launch_with_auth` and the
-// later store are separate lock acquisitions, so this is process management for
-// normal launcher use rather than a claim of atomic concurrent launch admission.
+// propagates as a panic through `unwrap`. Admission is checked again under this
+// lock immediately before spawning, so concurrent preparation cannot replace a child.
 static RUNNING_PROCESS: OnceLock<Mutex<Option<RunningGame>>> = OnceLock::new();
 
 /// The child process plus the instance folder it was launched in.
@@ -586,6 +573,20 @@ fn process_slot() -> &'static Mutex<Option<RunningGame>> {
     RUNNING_PROCESS.get_or_init(|| Mutex::new(None))
 }
 
+fn spawn_game(
+    command: &mut Command,
+    instance: Option<String>,
+    slot: &Mutex<Option<RunningGame>>,
+) -> Result<()> {
+    let mut slot = slot.lock().unwrap();
+    if poll_running(&mut slot).is_some() {
+        return Err(FerriteError::AlreadyRunning);
+    }
+    let child = command.spawn()?;
+    *slot = Some(RunningGame { child, instance });
+    Ok(())
+}
+
 /// Polls the stored child (clearing the slot if it exited) and returns the folder of
 /// the instance it was launched in. See [`is_running`] for the polling rules.
 fn poll_running(slot: &mut Option<RunningGame>) -> Option<Option<String>> {
@@ -596,7 +597,9 @@ fn poll_running(slot: &mut Option<RunningGame>) -> Option<Option<String>> {
                 None
             }
             Ok(None) => Some(game.instance.clone()),
-            Err(_) => None,
+            // An OS error does not prove the game exited. Keep destructive
+            // instance actions blocked while retaining the owned handle.
+            Err(_) => Some(game.instance.clone()),
         },
         None => None,
     }
@@ -605,8 +608,8 @@ fn poll_running(slot: &mut Option<RunningGame>) -> Option<Option<String>> {
 /// Returns whether this Ferrite process owns a child that has not exited.
 ///
 /// `try_wait` is non-blocking. An observed exit clears and drops the stored
-/// handle. A polling error is treated as “not running” but leaves the handle in
-/// the slot so [`kill`] can still attempt cleanup. This does not detect games
+/// handle. A polling error conservatively counts as running and leaves the handle
+/// in the slot so [`kill`] can still attempt cleanup. This does not detect games
 /// launched by another launcher process.
 pub fn is_running() -> bool {
     poll_running(&mut process_slot().lock().unwrap()).is_some()
@@ -628,14 +631,17 @@ pub fn is_instance_running(directory: &str) -> bool {
 
 /// Forcibly kills and reaps the child owned by this launcher, if any.
 ///
-/// The handle is removed from the global slot before signaling it. A kill error
-/// is returned with the slot already empty; errors from the subsequent blocking
-/// `wait` are intentionally ignored. Calling this with no stored child succeeds.
+/// The handle is retained if signaling or reaping fails, so a failed stop cannot
+/// silently release the instance guard. Calling this with no stored child succeeds.
 pub fn kill() -> Result<()> {
-    let mut slot = process_slot().lock().unwrap();
-    if let Some(mut game) = slot.take() {
+    kill_running(&mut process_slot().lock().unwrap())
+}
+
+fn kill_running(slot: &mut Option<RunningGame>) -> Result<()> {
+    if let Some(game) = slot.as_mut() {
         game.child.kill()?;
-        let _ = game.child.wait(); // reap it so it doesn't linger as a zombie
+        game.child.wait()?;
+        *slot = None;
     }
     Ok(())
 }
@@ -911,6 +917,13 @@ pub(crate) fn download_file(
     Ok(())
 }
 
+/// Resolves a portable relative metadata path before any cache or download access.
+pub(crate) fn metadata_path(root: &Path, relative: &str) -> Result<PathBuf> {
+    let relative = crate::packs::validate_zip_name(relative, false)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    Ok(root.join(relative))
+}
+
 // Walk metadata in order, applying Mojang's rules before touching a library.
 // Regular artifacts are cached in the shared Maven tree. Legacy classifier-based
 // native jars are cached there too, then extracted on every install so a missing
@@ -933,7 +946,7 @@ fn download_libraries(
         // Regular classpath jar — this includes 1.19+ `…:natives-<os>` jars.
         // Those stay packed; LWJGL 3 / jtracy unpack them at runtime.
         if let Some(artifact) = &lib.downloads.artifact {
-            let dest = libs_dir.join(&artifact.path);
+            let dest = metadata_path(libs_dir, &artifact.path)?;
             if let Some(parent) = dest.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -952,7 +965,7 @@ fn download_libraries(
                 .as_ref()
                 .and_then(|c| c.get(&classifier_key))
             {
-                let dest = libs_dir.join(&artifact.path);
+                let dest = metadata_path(libs_dir, &artifact.path)?;
                 if let Some(parent) = dest.parent() {
                     fs::create_dir_all(parent)?;
                 }
@@ -1001,6 +1014,10 @@ fn native_classifier_for_current_os(lib: &LibraryEntry) -> Option<String> {
 fn extract_natives(jar_path: &Path, dest_dir: &Path, exclude: &[String]) -> Result<()> {
     let file = fs::File::open(jar_path)?;
     let mut archive = ZipArchive::new(file)?;
+    fs::create_dir_all(dest_dir)?;
+    if fs::symlink_metadata(dest_dir)?.file_type().is_symlink() {
+        return Err(std::io::Error::other("native destination is a symlink").into());
+    }
 
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
@@ -1015,11 +1032,51 @@ fn extract_natives(jar_path: &Path, dest_dir: &Path, exclude: &[String]) -> Resu
             continue;
         }
 
+        // Native JARs are an archive trust boundary just like imported packs.
+        crate::packs::validate_zip_name(&name, false)
+            .and_then(|_| crate::packs::validate_unix_mode(entry.unix_mode(), false, &name))
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         let out_path = dest_dir.join(&name);
-        if let Some(parent) = out_path.parent() {
-            fs::create_dir_all(parent)?;
+        let mut parent = dest_dir.to_path_buf();
+        for component in Path::new(&name).parent().unwrap().components() {
+            parent.push(component);
+            match fs::create_dir(&parent) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+            let metadata = fs::symlink_metadata(&parent)?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(
+                    std::io::Error::other("native parent is not a regular directory").into(),
+                );
+            }
         }
-        let mut out_file = fs::File::create(&out_path)?;
+        // Open without truncation: inspect the handle before replacing bytes, and
+        // reject final-component links rather than writing through them.
+        match fs::symlink_metadata(&out_path) {
+            Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
+                return Err(std::io::Error::other("native output is not a regular file").into());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        // Windows uses normal opens after the link check, matching core copies:
+        // OPEN_REPARSE_POINT would bypass cloud-file/dedup filter processing.
+        let mut out_file = options.open(&out_path)?;
+        let metadata = out_file.metadata()?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(std::io::Error::other("native output is not a regular file").into());
+        }
+        out_file.set_len(0)?;
         std::io::copy(&mut entry, &mut out_file)?;
     }
 
@@ -1053,11 +1110,21 @@ fn download_assets(
 ) -> Result<()> {
     let indexes_dir = assets_dir.join("indexes");
     fs::create_dir_all(&indexes_dir)?;
+    let index_path = metadata_path(&indexes_dir, &format!("{index_name}.json"))?;
 
     let text = client.get(index_url).send()?.error_for_status()?.text()?;
-    fs::write(indexes_dir.join(format!("{index_name}.json")), &text)?;
+    fs::write(index_path, &text)?;
 
     let index: AssetIndexFile = serde_json::from_str(&text)?;
+    download_asset_objects(client, &index, index_name, assets_dir)
+}
+
+fn download_asset_objects(
+    client: &Client,
+    index: &AssetIndexFile,
+    index_name: &str,
+    assets_dir: &Path,
+) -> Result<()> {
     let objects_dir = assets_dir.join("objects");
     fs::create_dir_all(&objects_dir)?;
 
@@ -1066,7 +1133,7 @@ fn download_assets(
     // real filename instead of its hash — that's how pre-1.7-ish clients
     // expect to find them. Modern clients never look here.
     let virtual_dir = if index.is_virtual {
-        let dir = assets_dir.join("virtual").join(index_name);
+        let dir = metadata_path(&assets_dir.join("virtual"), index_name)?;
         fs::create_dir_all(&dir)?;
         Some(dir)
     } else {
@@ -1075,6 +1142,17 @@ fn download_assets(
 
     let total = index.objects.len();
     for (i, (path, object)) in index.objects.iter().enumerate() {
+        if object.hash.len() != 40 || !object.hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "asset hash must contain exactly 40 ASCII hexadecimal digits",
+            )
+            .into());
+        }
+        let virtual_dest = virtual_dir
+            .as_ref()
+            .map(|root| metadata_path(root, path))
+            .transpose()?;
         let prefix = &object.hash[0..2];
         let dir = objects_dir.join(prefix);
         fs::create_dir_all(&dir)?;
@@ -1088,14 +1166,13 @@ fn download_assets(
             download_file(client, &url, &dest, Some(object.size))?;
         }
 
-        if let Some(virtual_root) = &virtual_dir {
-            let virtual_dest = virtual_root.join(path);
-            if !virtual_dest.exists() {
-                if let Some(parent) = virtual_dest.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::copy(&dest, &virtual_dest)?;
+        if let Some(virtual_dest) = virtual_dest
+            && !virtual_dest.exists()
+        {
+            if let Some(parent) = virtual_dest.parent() {
+                fs::create_dir_all(parent)?;
             }
+            fs::copy(&dest, &virtual_dest)?;
         }
 
         if (i + 1) % 200 == 0 {
@@ -1329,6 +1406,232 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn native_jar(path: &Path, names: &[&str]) {
+        use std::io::Write;
+        let mut writer = zip::ZipWriter::new(fs::File::create(path).unwrap());
+        for name in names {
+            writer
+                .start_file(*name, zip::write::FileOptions::default())
+                .unwrap();
+            writer.write_all(b"native library").unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    #[test]
+    fn library_metadata_cannot_escape_the_cache_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let libraries: Vec<LibraryEntry> = serde_json::from_value(serde_json::json!([
+            {"name": "example:unsafe:1", "downloads": {"artifact": {
+                "path": "../outside.jar", "url": "https://example.invalid/unused", "size": 0
+            }}}
+        ]))
+        .unwrap();
+        fs::write(temp.path().join("outside.jar"), b"untouched").unwrap();
+        let result = download_libraries(
+            &Client::new(),
+            &libraries,
+            &temp.path().join("libraries"),
+            &temp.path().join("natives"),
+        );
+        assert!(
+            matches!(result, Err(FerriteError::Io(ref error)) if error.kind() == std::io::ErrorKind::InvalidData)
+        );
+        assert_eq!(
+            fs::read(temp.path().join("outside.jar")).unwrap(),
+            b"untouched"
+        );
+    }
+
+    #[test]
+    fn asset_metadata_rejects_malformed_hashes_before_slicing_or_downloading() {
+        let temp = tempfile::tempdir().unwrap();
+        for hash in [
+            "",
+            "é",
+            "abc",
+            "../../outside",
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        ] {
+            let index: AssetIndexFile = serde_json::from_value(serde_json::json!({
+                "objects": {"sound.ogg": {"hash": hash, "size": 0}}
+            }))
+            .unwrap();
+            let result = download_asset_objects(&Client::new(), &index, "test", temp.path());
+            assert!(
+                matches!(result, Err(FerriteError::Io(ref error)) if error.kind() == std::io::ErrorKind::InvalidData),
+                "{hash}"
+            );
+        }
+    }
+
+    #[test]
+    fn virtual_assets_reject_paths_outside_the_virtual_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        fs::create_dir_all(temp.path().join("objects/01")).unwrap();
+        fs::write(temp.path().join("objects/01").join(hash), b"cached sound").unwrap();
+        let index: AssetIndexFile = serde_json::from_value(serde_json::json!({
+            "virtual": true, "objects": {"../../outside.ogg": {"hash": hash, "size": 12}}
+        }))
+        .unwrap();
+        assert!(download_asset_objects(&Client::new(), &index, "test", temp.path()).is_err());
+        assert!(!temp.path().join("outside.ogg").exists());
+    }
+
+    #[test]
+    fn cached_virtual_assets_keep_their_original_nested_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        fs::create_dir_all(temp.path().join("objects/01")).unwrap();
+        fs::write(temp.path().join("objects/01").join(hash), b"cached sound").unwrap();
+        let index: AssetIndexFile = serde_json::from_value(serde_json::json!({
+            "virtual": true, "objects": {"sound/music.ogg": {"hash": hash, "size": 12}}
+        }))
+        .unwrap();
+        download_asset_objects(&Client::new(), &index, "test", temp.path()).unwrap();
+        assert_eq!(
+            fs::read(temp.path().join("virtual/test/sound/music.ogg")).unwrap(),
+            b"cached sound"
+        );
+    }
+
+    #[test]
+    fn native_extraction_rejects_unsafe_archive_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let jar = temp.path().join("natives.jar");
+        let dest = temp.path().join("natives");
+        fs::create_dir(&dest).unwrap();
+        let sentinel = temp.path().join("outside.dll");
+        fs::write(&sentinel, b"untouched").unwrap();
+        for name in [
+            "../outside.dll",
+            "/absolute.dll",
+            "C:/outside.dll",
+            "..\\outside.dll",
+            "native.dll:stream",
+        ] {
+            native_jar(&jar, &[name]);
+            assert!(
+                extract_natives(&jar, &dest, &[]).is_err(),
+                "accepted {name}"
+            );
+            assert_eq!(fs::read(&sentinel).unwrap(), b"untouched");
+        }
+    }
+
+    #[test]
+    fn native_extraction_rejects_archive_symlink_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let jar = temp.path().join("natives.jar");
+        let mut writer = zip::ZipWriter::new(fs::File::create(&jar).unwrap());
+        writer
+            .add_symlink(
+                "library.dll",
+                "../outside.dll",
+                zip::write::FileOptions::default(),
+            )
+            .unwrap();
+        writer.finish().unwrap();
+        let dest = temp.path().join("natives");
+        assert!(extract_natives(&jar, &dest, &[]).is_err());
+        assert!(!dest.join("library.dll").exists());
+    }
+
+    #[test]
+    fn native_extraction_preserves_nested_files_exclusions_and_repair() {
+        let temp = tempfile::tempdir().unwrap();
+        let jar = temp.path().join("natives.jar");
+        let dest = temp.path().join("natives");
+        fs::create_dir_all(dest.join("nested")).unwrap();
+        fs::write(dest.join("nested/library.dll"), b"old").unwrap();
+        native_jar(
+            &jar,
+            &[
+                "nested/library.dll",
+                "META-INF/signature",
+                "excluded/library.dll",
+            ],
+        );
+        extract_natives(&jar, &dest, &["excluded/".into()]).unwrap();
+        assert_eq!(
+            fs::read(dest.join("nested/library.dll")).unwrap(),
+            b"native library"
+        );
+        assert!(!dest.join("META-INF").exists());
+        assert!(!dest.join("excluded").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_extraction_does_not_follow_destination_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let jar = temp.path().join("natives.jar");
+        let dest = temp.path().join("natives");
+        fs::create_dir(&dest).unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("library.dll"), b"untouched").unwrap();
+        std::os::unix::fs::symlink(&outside, dest.join("linked")).unwrap();
+        native_jar(&jar, &["linked/library.dll"]);
+        assert!(extract_natives(&jar, &dest, &[]).is_err());
+        std::os::unix::fs::symlink(outside.join("library.dll"), dest.join("library.dll")).unwrap();
+        native_jar(&jar, &["library.dll"]);
+        assert!(extract_natives(&jar, &dest, &[]).is_err());
+        assert_eq!(fs::read(outside.join("library.dll")).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn metadata_rules_apply_the_last_matching_action() {
+        let rules: Vec<Rule> = serde_json::from_value(serde_json::json!([
+            {"action": "allow"},
+            {"action": "disallow", "os": {"name": current_os_name()}},
+            {"action": "allow", "os": {"name": "unsupported-os"}}
+        ]))
+        .unwrap();
+        assert!(rules_allow(&[]));
+        assert!(rules_allow(&rules[..1]));
+        assert!(!rules_allow(&rules));
+        let mut reversed = rules;
+        reversed.reverse();
+        assert!(rules_allow(&reversed));
+        assert!(!rules_allow(&reversed[..1]));
+    }
+
+    #[test]
+    fn conditional_arguments_preserve_order_and_argument_boundaries() {
+        let entries: Vec<ArgumentEntry> = serde_json::from_value(serde_json::json!([
+            "first",
+            {"rules": [{"action": "allow"}], "value": ["--directory", "${directory}"]},
+            {"rules": [{"action": "disallow"}], "value": "omitted"},
+            {"rules": [{"action": "allow"}], "value": "${unknown}"},
+            "last"
+        ]))
+        .unwrap();
+        let placeholders = HashMap::from([("directory".into(), "path with spaces".into())]);
+        assert_eq!(
+            resolve_arguments(&entries, &placeholders),
+            [
+                "first",
+                "--directory",
+                "path with spaces",
+                "${unknown}",
+                "last"
+            ]
+        );
+    }
+
+    #[test]
+    fn optional_feature_arguments_are_currently_omitted() {
+        let entries: Vec<ArgumentEntry> = serde_json::from_value(serde_json::json!([
+            {"rules": [{"action": "allow", "features": {"is_demo_user": true}}], "value": "--demo"},
+            {"rules": [{"action": "allow", "features": {"has_custom_resolution": false}}], "value": "--width"},
+            "--ordinary"
+        ]))
+        .unwrap();
+        assert_eq!(resolve_arguments(&entries, &HashMap::new()), ["--ordinary"]);
+    }
+
     fn metadata_with_game_dir_argument() -> VersionMetadata {
         serde_json::from_str(
             r#"{
@@ -1543,12 +1846,77 @@ mod tests {
     }
 
     fn temp_paths(root: &Path) -> AppPaths {
-        AppPaths::from_base_dirs(ferrite_launcher::core::paths::BaseDirs {
+        AppPaths::from_base_dirs(crate::core::paths::BaseDirs {
             config: root.join("config"),
             data_local: root.join("data"),
             cache: root.join("cache"),
         })
         .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_admission_rejects_an_existing_child_before_spawning() {
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let slot = Mutex::new(Some(RunningGame {
+            child,
+            instance: Some("survival".into()),
+        }));
+        let temp = tempfile::tempdir().unwrap();
+        let result = spawn_game(
+            &mut Command::new(temp.path().join("nonexistent-java")),
+            Some("other".into()),
+            &slot,
+        );
+        let instance = slot.lock().unwrap().as_ref().unwrap().instance.clone();
+        kill_running(&mut slot.lock().unwrap()).unwrap();
+        assert!(matches!(result, Err(FerriteError::AlreadyRunning)));
+        assert_eq!(instance.as_deref(), Some("survival"));
+    }
+
+    #[cfg(unix)]
+    fn externally_reaped_game() -> RunningGame {
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        child.kill().unwrap();
+        let mut status = 0;
+        // Reap outside Child to reproduce OS polling/signaling errors without
+        // permissions changes, fake processes or touching the global game slot.
+        assert_eq!(
+            unsafe { libc::waitpid(child.id() as i32, &mut status, 0) },
+            child.id() as i32
+        );
+        RunningGame {
+            child,
+            instance: Some("survival".into()),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_poll_errors_keep_the_instance_guard_active() {
+        let mut slot = Some(externally_reaped_game());
+        assert_eq!(poll_running(&mut slot), Some(Some("survival".into())));
+        assert!(slot.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_stop_errors_retain_the_owned_handle() {
+        let mut slot = Some(externally_reaped_game());
+        assert!(kill_running(&mut slot).is_err());
+        assert_eq!(slot.as_ref().unwrap().instance.as_deref(), Some("survival"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_stop_reaps_and_clears_the_owned_child() {
+        let mut slot = Some(RunningGame {
+            child: Command::new("sleep").arg("30").spawn().unwrap(),
+            instance: Some("survival".into()),
+        });
+        kill_running(&mut slot).unwrap();
+        assert!(slot.is_none());
+        kill_running(&mut slot).unwrap();
     }
 
     #[test]
@@ -1570,6 +1938,7 @@ mod tests {
         assert_eq!(instance_folder_of(&paths, &instances), None);
         assert_eq!(instance_folder_of(&paths, &elsewhere), None);
         assert!(same_instance_folder("Survival", "survival"));
+        assert!(same_instance_folder("Café", "Cafe\u{301}"));
         assert!(!same_instance_folder("survival", "survival-2"));
     }
 

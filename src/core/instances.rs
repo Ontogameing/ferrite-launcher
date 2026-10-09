@@ -389,17 +389,66 @@ pub fn create_instance_files(
     profile: &InstanceProfile,
     install: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), InstanceError> {
-    create_new_game_dir(paths, profile)?;
-    if let Err(detail) = install() {
-        if let Err(error) = delete_game_dir(paths, profile) {
+    let mut prepared = prepare_create(paths, profile, install)?;
+    // Compatibility API transfers the successful folder to its caller.
+    prepared.cleanup = false;
+    Ok(())
+}
+
+/// A new instance's exclusively created files, removed if preparation is abandoned.
+#[derive(Debug)]
+pub struct PreparedCreate {
+    paths: AppPaths,
+    profile: InstanceProfile,
+    cleanup: bool,
+}
+
+impl PreparedCreate {
+    pub fn profile(&self) -> &InstanceProfile {
+        &self.profile
+    }
+
+    /// Transfers cleanup to the manifest commit, including its failure paths.
+    pub fn commit(
+        mut self,
+        profiles: &mut Vec<InstanceProfile>,
+        skipped: &[SkippedEntry],
+    ) -> Result<usize, InstanceError> {
+        let result = commit_new_instance(&self.paths, profiles, skipped, self.profile.clone());
+        self.cleanup = false;
+        result
+    }
+}
+
+impl Drop for PreparedCreate {
+    fn drop(&mut self) {
+        if self.cleanup
+            && let Err(error) = delete_game_dir(&self.paths, &self.profile)
+        {
             eprintln!(
-                "Ferrite: could not clean up {} after a failed create: {error}",
-                profile.game_dir(paths).display()
+                "Ferrite: could not remove uncommitted create {}: {error}",
+                self.profile.game_dir(&self.paths).display()
             );
         }
-        return Err(InstanceError::Install(detail));
     }
-    Ok(())
+}
+
+/// Creates a folder exclusively and installs files, retaining cleanup until commit.
+pub fn prepare_create(
+    paths: &AppPaths,
+    profile: &InstanceProfile,
+    install: impl FnOnce() -> Result<(), String>,
+) -> Result<PreparedCreate, InstanceError> {
+    let owned_paths = paths.clone();
+    let owned_profile = profile.clone();
+    create_new_game_dir(paths, profile)?;
+    let prepared = PreparedCreate {
+        paths: owned_paths,
+        profile: owned_profile,
+        cleanup: true,
+    };
+    install().map_err(InstanceError::Install)?;
+    Ok(prepared)
 }
 
 /// Adds a newly created instance (whose folder this launcher just created) to the
@@ -895,5 +944,53 @@ mod tests {
         assert!(matches!(error, InstanceError::Name(NameError::Taken(_))));
         assert_eq!(profiles.len(), 1);
         assert!(!new.game_dir(&paths).exists());
+    }
+    #[test]
+    fn prepared_create_cleans_abandonment_and_install_unwind() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths_in(temp.path());
+        let new = profile("Prepared", &[]);
+        let prepared = prepare_create(&paths, &new, || Ok(())).unwrap();
+        assert_eq!(prepared.profile(), &new);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(prepared).unwrap();
+        drop(receiver);
+        assert!(!new.game_dir(&paths).exists());
+        let error = prepare_create(&paths, &new, || Err("install failed".into())).unwrap_err();
+        assert!(matches!(error, InstanceError::Install(_)));
+        assert!(!new.game_dir(&paths).exists());
+        create_new_game_dir(&paths, &new).unwrap();
+        assert!(matches!(
+            prepare_create(&paths, &new, || panic!("must not install")),
+            Err(InstanceError::FolderExists(_))
+        ));
+        assert!(new.game_dir(&paths).is_dir());
+        delete_game_dir(&paths, &new).unwrap();
+        let panic = std::panic::catch_unwind(|| {
+            let _ = prepare_create(&paths, &new, || panic!("install panic"));
+        });
+        assert!(panic.is_err());
+        assert!(!new.game_dir(&paths).exists());
+    }
+
+    #[test]
+    fn prepared_create_commit_owns_rollback_and_preserves_shared_folder() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths_in(temp.path());
+        let new = profile("Prepared", &[]);
+        let prepared = prepare_create(&paths, &new, || Ok(())).unwrap();
+        fs::write(paths.instances_manifest(), "{ corrupt").unwrap();
+        let mut profiles = Vec::new();
+        assert!(prepared.commit(&mut profiles, &[]).is_err());
+        assert!(profiles.is_empty());
+        assert!(!new.game_dir(&paths).exists());
+        fs::remove_file(paths.instances_manifest()).unwrap();
+        let prepared = prepare_create(&paths, &new, || Ok(())).unwrap();
+        profiles.push(new.clone());
+        assert!(matches!(
+            prepared.commit(&mut profiles, &[]),
+            Err(InstanceError::FolderShared { .. })
+        ));
+        assert!(new.game_dir(&paths).is_dir());
     }
 }

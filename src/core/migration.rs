@@ -659,9 +659,18 @@ pub fn plan(paths: &AppPaths, candidate_dirs: &[PathBuf]) -> Result<StartupPlan,
         }),
         _ => {
             let (first, rest) = valid.split_first().expect("at least two candidates");
-            let identical = rest
-                .iter()
-                .all(|(_, scan, bytes)| bytes == &first.2 && scan.same_content_shape(&first.1));
+            let identical = rest.iter().all(|(candidate, scan, bytes)| {
+                bytes == &first.2
+                    && scan.same_content_shape(&first.1)
+                    && scan.dirs == first.1.dirs
+                    && scan.links == first.1.links
+                    && scan.blocked.is_empty()
+                    && first.1.blocked.is_empty()
+                    // An unreadable or changing tree cannot be proven identical;
+                    // let the user choose rather than silently selecting a world.
+                    && same_tree_contents(&first.0.path, &candidate.path, &first.1)
+                        .unwrap_or(false)
+            });
             if identical {
                 notes.push(format!(
                     "Found identical copies of old data; migrating {}.",
@@ -687,6 +696,46 @@ pub fn plan(paths: &AppPaths, candidate_dirs: &[PathBuf]) -> Result<StartupPlan,
             }
         }
     }
+}
+
+fn same_tree_contents(first: &Path, second: &Path, scan: &TreeScan) -> io::Result<bool> {
+    use std::io::Read;
+
+    if first == second {
+        return Ok(true);
+    }
+
+    let mut first_buffer = [0_u8; 8192];
+    let mut second_buffer = [0_u8; 8192];
+    for (relative, info) in &scan.files {
+        let open = |root: &Path| {
+            let path = root.join(relative);
+            let metadata = fs::symlink_metadata(&path)?;
+            if !metadata.is_file() || fsutil::is_link_like(&metadata) || metadata.len() != info.len
+            {
+                return Err(io::Error::other("candidate file changed during comparison"));
+            }
+            fsutil::open_regular_no_follow(&path, &metadata)
+        };
+        let mut first_file = open(first)?;
+        let mut second_file = open(second)?;
+        let mut remaining = info.len;
+        while remaining > 0 {
+            let length = remaining.min(first_buffer.len() as u64) as usize;
+            first_file.read_exact(&mut first_buffer[..length])?;
+            second_file.read_exact(&mut second_buffer[..length])?;
+            if first_buffer[..length] != second_buffer[..length] {
+                return Ok(false);
+            }
+            remaining -= length as u64;
+        }
+        if first_file.read(&mut first_buffer[..1])? != 0
+            || second_file.read(&mut second_buffer[..1])? != 0
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 // =====================================================================

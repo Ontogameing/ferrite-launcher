@@ -552,3 +552,6 @@ mod tests {
         assert_eq!(fs::read(outside.mod_path("real.jar")).unwrap(), b"safe");
     }
 }
+
+/// Workflow entry points for explicitly selected instance targets.
+pub mod workflows;

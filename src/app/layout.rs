@@ -267,7 +267,7 @@ impl Ferrite {
         summary_frame(self, ui, "ACCOUNT", |ui| {
             let status = if self.auth.offline_mode {
                 "Offline mode".to_owned()
-            } else if let Some(account) = &self.auth.account {
+            } else if let Some(account) = self.auth.session.account() {
                 if account.is_expired() {
                     format!("{} · session expired", account.name)
                 } else {

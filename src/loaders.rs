@@ -39,11 +39,12 @@
 
 mod fabric;
 mod forge;
+mod metadata;
 mod neoforge;
 mod quilt;
 
+use crate::core::paths::AppPaths;
 use crate::minecraft::{self, Result};
-use ferrite_launcher::core::paths::AppPaths;
 use std::path::Path;
 use std::process::Command;
 
@@ -157,11 +158,41 @@ pub fn install_version(
     }
 }
 
+/// Progress emitted synchronously while installing shared game files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallProgress {
+    DownloadingMinecraft,
+    InstallingLoader,
+    DownloadProgress(String),
+}
+
+/// Installs shared Minecraft files and the selected loader, without touching an
+/// instance folder. Call on a worker; progress runs on the calling thread.
+pub fn install_game_files(
+    paths: &AppPaths,
+    version: &str,
+    loader: ModLoader,
+    progress: &dyn Fn(InstallProgress),
+) -> std::result::Result<(), String> {
+    progress(InstallProgress::DownloadingMinecraft);
+    crate::minecraft::install_version_with_progress(paths, version, |message| {
+        progress(InstallProgress::DownloadProgress(message.into()));
+    })
+    .map_err(|error| format!("Failed to download Minecraft: {error}"))?;
+    if loader != ModLoader::Vanilla {
+        progress(InstallProgress::InstallingLoader);
+        // Loader backends repeat the vanilla install, reusing cached downloads.
+        crate::loaders::install(paths, version, loader)
+            .map_err(|error| format!("Failed to install {}: {error}", loader.label()))?;
+    }
+    Ok(())
+}
+
 /// Explicit offline compatibility wrapper using placeholder credentials.
 /// Account-aware callers should use `launch_authenticated`.
 /// Launches `mc_version` under the given loader using the shared Minecraft
 /// directory as the game's directory, preserving the original behavior.
-pub fn launch(paths: &AppPaths, mc_version: &str, loader: ModLoader) -> Result<()> {
+pub(crate) fn launch(paths: &AppPaths, mc_version: &str, loader: ModLoader) -> Result<()> {
     launch_in_directory(paths, mc_version, loader, paths.storage_root())
 }
 
@@ -169,7 +200,7 @@ pub fn launch(paths: &AppPaths, mc_version: &str, loader: ModLoader) -> Result<(
 /// Launches `mc_version` under the given loader with per-instance saves,
 /// configuration, mods, and logs rooted at `game_dir`. Installed versions,
 /// libraries, assets, and natives continue to come from shared storage.
-pub fn launch_in_directory(
+pub(crate) fn launch_in_directory(
     paths: &AppPaths,
     mc_version: &str,
     loader: ModLoader,
@@ -194,7 +225,7 @@ pub fn launch_in_directory_with_memory(
 /// Launches with an authenticated Microsoft account and per-instance game data.
 /// Expired sessions fail before loader preparation; there is no offline fallback.
 /// Installed versions, libraries, assets, and natives remain in shared storage.
-pub fn launch_authenticated(
+pub(crate) fn launch_authenticated(
     paths: &AppPaths,
     mc_version: &str,
     loader: ModLoader,
@@ -245,7 +276,7 @@ fn prepare_launch_version(paths: &AppPaths, mc_version: &str, loader: ModLoader)
 /// For loaders, a missing/unreadable marker and any loader-id lookup error are
 /// deliberately collapsed to `false`; this status probe never performs network
 /// I/O and cannot distinguish a partial install from no install.
-pub fn is_installed(paths: &AppPaths, mc_version: &str, loader: ModLoader) -> bool {
+pub(crate) fn is_installed(paths: &AppPaths, mc_version: &str, loader: ModLoader) -> bool {
     match loader {
         ModLoader::Vanilla => minecraft::is_version_installed(paths, mc_version),
         ModLoader::Fabric => fabric::installed_composite_id(paths, mc_version)
@@ -375,5 +406,38 @@ mod tests {
             loader_version_from_metadata("1.21.1", ModLoader::Fabric, &fabric).as_deref(),
             Some("0.16.10")
         );
+    }
+
+    #[test]
+    fn loader_pin_detection_handles_quilt_and_both_neoforge_coordinates() {
+        for (loader, coordinate, expected) in [
+            (
+                ModLoader::Quilt,
+                "org.quiltmc:quilt-loader:0.26.4",
+                "0.26.4",
+            ),
+            (
+                ModLoader::NeoForge,
+                "net.neoforged:neoforge:21.1.80",
+                "21.1.80",
+            ),
+            (
+                ModLoader::NeoForge,
+                "net.neoforged:forge:1.20.1-47.1.106:universal",
+                "47.1.106",
+            ),
+        ] {
+            let metadata = serde_json::json!({"libraries": [
+                {"name": "example:unrelated:9"}, {"name": coordinate}
+            ]});
+            assert_eq!(
+                loader_version_from_metadata("1.20.1", loader, &metadata).as_deref(),
+                Some(expected)
+            );
+            assert_eq!(
+                loader_version_from_metadata("1.20.1", loader, &serde_json::json!({})),
+                None
+            );
+        }
     }
 }

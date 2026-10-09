@@ -25,8 +25,8 @@
 //! failed installs can leave reusable artifacts but are not launchable through
 //! dispatch until the marker is committed.
 
+use crate::core::paths::AppPaths;
 use crate::minecraft::{self, FerriteError, Result};
-use ferrite_launcher::core::paths::AppPaths;
 use reqwest::blocking::Client;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -343,104 +343,70 @@ fn ensure_client_jar(
 fn merge_inherited_metadata(
     composite_id: &str,
     vanilla: &serde_json::Value,
-    neo: &serde_json::Value,
+    loader: &serde_json::Value,
 ) -> serde_json::Value {
-    let mut merged = vanilla.clone();
-    merged["id"] = serde_json::Value::String(composite_id.to_string());
-    merged.as_object_mut().map(|o| o.remove("inheritsFrom"));
+    super::metadata::merge_installer_metadata(
+        composite_id,
+        vanilla,
+        loader,
+        "https://maven.neoforged.net/releases/",
+    )
+}
 
-    if let Some(main_class) = neo.get("mainClass") {
-        merged["mainClass"] = main_class.clone();
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
 
-    let mut libraries = vanilla["libraries"].as_array().cloned().unwrap_or_default();
-    if let Some(neo_libs) = neo["libraries"].as_array() {
-        for lib in neo_libs {
-            libraries.push(normalize_library(lib));
+    #[test]
+    fn merged_metadata_preserves_vanilla_launch_data_and_loader_order() {
+        let vanilla = json!({
+            "id": "1.21.1", "mainClass": "net.minecraft.client.main.Main",
+            "assets": "17", "assetIndex": {"id": "17", "url": "https://example.invalid/assets"},
+            "downloads": {"client": {"url": "https://example.invalid/client.jar", "size": 42}},
+            "libraries": [{"name": "org.example:vanilla:1", "downloads": {
+                "artifact": {"path": "vanilla.jar", "url": "https://example.invalid/vanilla.jar", "size": 12}
+            }}],
+            "arguments": {"game": ["--username", "${auth_player_name}"], "jvm": ["-Dvanilla=true"]}
+        });
+        let loader = json!({
+            "mainClass": "org.example.Loader",
+            "libraries": [
+                {"name": "org.example:loader:2:universal"},
+                {"name": "org.example:prebuilt:3", "rules": [{"action": "allow", "os": {"name": "linux"}}],
+                 "downloads": {"artifact": {"path": "prebuilt.jar", "url": "https://example.invalid/prebuilt.jar", "size": 7, "sha1": "abc"}}}
+            ],
+            "arguments": {"game": ["--loader", "enabled"], "jvm": ["--add-opens=java.base/java.lang=ALL-UNNAMED"]}
+        });
+
+        let merged = merge_inherited_metadata("composite", &vanilla, &loader);
+
+        assert_eq!(merged["id"], "composite");
+        assert_eq!(merged["mainClass"], "org.example.Loader");
+        for field in ["assets", "assetIndex", "downloads"] {
+            assert_eq!(merged[field], vanilla[field], "{field}");
         }
+        assert_eq!(
+            merged["arguments"]["game"],
+            json!(["--username", "${auth_player_name}", "--loader", "enabled"])
+        );
+        assert_eq!(
+            merged["arguments"]["jvm"],
+            json!([
+                "-Dvanilla=true",
+                "--add-opens=java.base/java.lang=ALL-UNNAMED"
+            ])
+        );
+        assert_eq!(merged["libraries"].as_array().unwrap().len(), 3);
+        assert_eq!(merged["libraries"][0], vanilla["libraries"][0]);
+        assert_eq!(merged["libraries"][2], loader["libraries"][1]);
+        assert_eq!(
+            merged["libraries"][1]["downloads"]["artifact"],
+            json!({
+                "path": "org/example/loader/2/loader-2-universal.jar",
+                "url": "https://maven.neoforged.net/releases/org/example/loader/2/loader-2-universal.jar",
+                "size": 0
+            })
+        );
     }
-    merged["libraries"] = serde_json::Value::Array(libraries);
-
-    append_args(&mut merged, vanilla, neo, "game");
-    append_args(&mut merged, vanilla, neo, "jvm");
-
-    merged
-}
-
-/// Appends one argument category and avoids manufacturing an empty array.
-fn append_args(
-    merged: &mut serde_json::Value,
-    vanilla: &serde_json::Value,
-    neo: &serde_json::Value,
-    kind: &str,
-) {
-    let mut args = vanilla["arguments"][kind]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    if let Some(extra) = neo
-        .get("arguments")
-        .and_then(|a| a.get(kind))
-        .and_then(|g| g.as_array())
-    {
-        args.extend(extra.iter().cloned());
-    }
-    if !args.is_empty() {
-        merged["arguments"][kind] = serde_json::Value::Array(args);
-    }
-}
-
-/// Converts coordinate-only installer libraries into the artifact shape consumed
-/// by `minecraft.rs`. Already-normalized entries and unparseable coordinates are
-/// cloned unchanged; missing repositories fall back to NeoForge Maven.
-fn normalize_library(lib: &serde_json::Value) -> serde_json::Value {
-    if lib
-        .get("downloads")
-        .and_then(|d| d.get("artifact"))
-        .and_then(|a| a.get("path"))
-        .is_some()
-    {
-        return lib.clone();
-    }
-
-    let Some(name) = lib.get("name").and_then(|v| v.as_str()) else {
-        return lib.clone();
-    };
-    let Some(path) = maven_coordinate_to_path(name) else {
-        return lib.clone();
-    };
-    let repo = lib
-        .get("url")
-        .and_then(|v| v.as_str())
-        .unwrap_or("https://maven.neoforged.net/releases/");
-    let url = format!("{}/{path}", repo.trim_end_matches('/'));
-
-    let mut out = lib.clone();
-    out["downloads"] = serde_json::json!({
-        "artifact": {
-            "path": path,
-            "url": url,
-            "size": 0
-        }
-    });
-    if out.get("rules").is_none() {
-        out["rules"] = serde_json::json!([]);
-    }
-    out
-}
-
-/// Converts `group:artifact:version[:classifier]` to a Maven cache path.
-/// Missing required fields return `None`; later fields are ignored.
-fn maven_coordinate_to_path(coordinate: &str) -> Option<String> {
-    let mut parts = coordinate.split(':');
-    let group = parts.next()?;
-    let artifact = parts.next()?;
-    let version = parts.next()?;
-    let classifier = parts.next();
-    let group_path = group.replace('.', "/");
-    let file_name = match classifier {
-        Some(c) => format!("{artifact}-{version}-{c}.jar"),
-        None => format!("{artifact}-{version}.jar"),
-    };
-    Some(format!("{group_path}/{artifact}/{version}/{file_name}"))
 }

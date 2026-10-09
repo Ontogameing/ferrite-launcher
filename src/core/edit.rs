@@ -1,8 +1,9 @@
 //! Editing instances: rename (display name only) and changing the Minecraft version or
 //! loader, plus the version-order helper used to detect downgrades.
 //!
-//! Every edit is a manifest change only. The folder on disk never moves, and a failed
-//! save restores the previous in-memory values so memory and manifest stay in sync.
+//! Prepared updates install shared game files before manifest changes. The instance
+//! folder never moves; failed saves restore the previous in-memory values. Version/loader
+//! saves precede the separate rename, which can fail without undoing the version save.
 
 use crate::core::instances::{self, InstanceDirName, InstanceError, InstanceProfile, SkippedEntry};
 use crate::core::paths::AppPaths;
@@ -31,6 +32,94 @@ impl std::error::Error for EditError {}
 impl From<InstanceError> for EditError {
     fn from(error: InstanceError) -> Self {
         Self::Failed(error)
+    }
+}
+
+/// A selected update with stable instance identity, independent of UI/worker scheduling.
+pub struct PreparedUpdate {
+    original: InstanceProfile,
+    new_name: String,
+    version: String,
+    loader: crate::loaders::ModLoader,
+}
+
+/// Version/loader were saved. A separate rename may fail without undoing that save.
+pub struct UpdateOutcome {
+    pub name: String,
+    pub rename_error: Option<EditError>,
+}
+
+/// Captures the chosen target and rejects an already running instance before installation.
+pub fn prepare_update(
+    profiles: &[InstanceProfile],
+    directory: &InstanceDirName,
+    new_name: &str,
+    version: &str,
+    loader_label: &str,
+    is_running: &dyn Fn(&InstanceDirName) -> bool,
+) -> Result<PreparedUpdate, String> {
+    let profile = profiles
+        .iter()
+        .find(|profile| profile.directory() == directory)
+        .ok_or_else(|| "This instance is no longer in the list.".to_owned())?;
+    if is_running(directory) {
+        return Err(format!(
+            "{} started while this was open. Close Minecraft, then try again.",
+            profile.name
+        ));
+    }
+    let loader = crate::loaders::ModLoader::from_label(loader_label)
+        .ok_or_else(|| format!("Unknown mod loader: {loader_label}"))?;
+    Ok(PreparedUpdate {
+        original: profile.clone(),
+        new_name: new_name.to_owned(),
+        version: version.to_owned(),
+        loader,
+    })
+}
+
+impl PreparedUpdate {
+    /// Installs only shared game files; does not alter the target profile or its folder.
+    pub fn install(
+        self,
+        paths: &AppPaths,
+        progress: impl Fn(crate::loaders::InstallProgress),
+    ) -> Result<Self, String> {
+        crate::loaders::install_game_files(paths, &self.version, self.loader, &progress)?;
+        Ok(self)
+    }
+
+    /// Rechecks running state and saves version/loader before attempting the separate rename.
+    pub fn commit(
+        self,
+        paths: &AppPaths,
+        profiles: &mut [InstanceProfile],
+        skipped: &[SkippedEntry],
+        is_running: &dyn Fn(&InstanceDirName) -> bool,
+    ) -> Result<UpdateOutcome, EditError> {
+        let directory = self.original.directory();
+        commit_version_loader(
+            paths,
+            profiles,
+            skipped,
+            directory,
+            &self.version,
+            self.loader.label(),
+            is_running,
+        )?;
+        let mut outcome = UpdateOutcome {
+            name: self.original.name.clone(),
+            rename_error: None,
+        };
+        if self.new_name != self.original.name {
+            match rename_instance(paths, profiles, skipped, directory, &self.new_name, &|_| {
+                false
+            }) {
+                Ok(_) => outcome.name = self.new_name,
+                Err(error) => outcome.rename_error = Some(error),
+            }
+        }
+        Ok(outcome)
     }
 }
 
@@ -201,6 +290,61 @@ mod tests {
 
     fn not_running(_: &InstanceDirName) -> bool {
         false
+    }
+
+    #[test]
+    fn prepared_update_rechecks_running_before_commit() {
+        let (_dir, paths, mut profiles) = setup();
+        let folder = profiles[0].directory().clone();
+        let update =
+            prepare_update(&profiles, &folder, "New", "1.21.1", "Vanilla", &not_running).unwrap();
+        assert!(matches!(
+            update.commit(&paths, &mut profiles, &[], &|_| true),
+            Err(EditError::NowRunning)
+        ));
+        assert_eq!(profiles[0].version, "1.20.1");
+        assert_eq!(profiles[0].name, "Foo");
+    }
+
+    #[test]
+    fn prepared_update_keeps_saved_version_when_rename_fails() {
+        let (_dir, paths, mut profiles) = setup();
+        let folder = profiles[0].directory().clone();
+        let update =
+            prepare_update(&profiles, &folder, "Bar", "1.21.1", "Vanilla", &not_running).unwrap();
+        let outcome = update
+            .commit(&paths, &mut profiles, &[], &not_running)
+            .unwrap();
+        assert_eq!(outcome.name, "Foo");
+        assert!(outcome.rename_error.is_some());
+        let saved = load(&paths).unwrap().profiles;
+        assert_eq!(saved[0].name, "Foo");
+        assert_eq!(saved[0].version, "1.21.1");
+        assert_eq!(saved[0].loader, "Vanilla");
+    }
+
+    #[test]
+    fn prepared_update_saves_version_then_rename_and_rolls_back_failed_version_save() {
+        let (_dir, paths, mut profiles) = setup();
+        let folder = profiles[0].directory().clone();
+        let update =
+            prepare_update(&profiles, &folder, "New", "1.21.1", "Vanilla", &not_running).unwrap();
+        fs::write(paths.instances_manifest(), "{ corrupt").unwrap();
+        assert!(matches!(
+            update.commit(&paths, &mut profiles, &[], &not_running),
+            Err(EditError::Failed(_))
+        ));
+        assert_eq!(profiles[0].version, "1.20.1");
+        assert_eq!(profiles[0].name, "Foo");
+        fs::remove_file(paths.instances_manifest()).unwrap();
+        let update =
+            prepare_update(&profiles, &folder, "New", "1.21.1", "Vanilla", &not_running).unwrap();
+        let outcome = update
+            .commit(&paths, &mut profiles, &[], &not_running)
+            .unwrap();
+        assert_eq!(outcome.name, "New");
+        assert!(outcome.rename_error.is_none());
+        assert_eq!(load(&paths).unwrap().profiles[0].name, "New");
     }
 
     #[test]

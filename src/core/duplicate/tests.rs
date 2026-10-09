@@ -485,3 +485,51 @@ fn preflight_space_uses_the_same_margin() {
         Err(DuplicateError::NotEnoughSpace { .. })
     ));
 }
+
+#[test]
+fn abandoned_duplicate_result_cleans_final_folder() {
+    let f = fixture();
+    let plan = f.plan("Copy");
+    let copied = copy_duplicate(&f.paths, &plan, &DuplicateControl::default(), &|_| false).unwrap();
+    let folder = copied.profile.game_dir(&f.paths);
+    let (sender, receiver) = mpsc::channel();
+    sender.send(copied).unwrap();
+    drop(receiver);
+    assert!(!folder.exists());
+    assert_eq!(f.instances_entries(), vec!["alpha"]);
+}
+
+#[test]
+fn duplicate_install_staging_unwind_cleans_only_staging() {
+    let f = fixture();
+    let plan = f.plan("Copy");
+    let hook = |_| -> io::Result<()> { panic!("copy panic") };
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = copy_with_hooks(
+            &f.paths,
+            &plan,
+            &DuplicateControl::default(),
+            &|_| false,
+            &Hooks {
+                after_file: Some(&hook),
+                ..Hooks::default()
+            },
+        );
+    }));
+    assert!(panic.is_err());
+    assert_eq!(f.instances_entries(), vec!["alpha"]);
+}
+
+#[test]
+fn duplicate_commit_shared_folder_survives() {
+    let mut f = fixture();
+    let plan = f.plan("Copy");
+    let copied = copy_duplicate(&f.paths, &plan, &DuplicateControl::default(), &|_| false).unwrap();
+    let folder = copied.profile.game_dir(&f.paths);
+    f.profiles.push(copied.profile.clone());
+    assert!(matches!(
+        commit_duplicate(&f.paths, &mut f.profiles, &[], copied, None),
+        Err(DuplicateError::Failed(InstanceError::FolderShared { .. }))
+    ));
+    assert!(folder.is_dir());
+}

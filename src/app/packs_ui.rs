@@ -11,14 +11,12 @@ use super::dialogs::{
 };
 use super::instances::loader_picker;
 use super::startup::details;
-use super::{Ferrite, PackImportOutcome, PackTaskEvent};
+use super::{Ferrite, PackTaskEvent};
 use crate::instances::InstanceProfile;
 use crate::loaders::ModLoader;
-use crate::packs::{
-    ExportOptions, ImportBlocker, ImportOptions, PackError, PackFormat, PackPreview, PackTarget,
-};
+use crate::packs::PreparedImport;
+use crate::packs::{ExportOptions, ImportBlocker, PackError, PackFormat, PackPreview, PackTarget};
 use eframe::egui::{self, RichText};
-use ferrite_launcher::core::activity::{InstanceAction, disabled_reason};
 use ferrite_launcher::core::instances as core_instances;
 use ferrite_launcher::core::migration::format_size;
 use std::path::{Path, PathBuf};
@@ -132,10 +130,7 @@ pub(super) fn inspect_failure(path: &Path, error: &PackError) -> (String, Option
 
 /// The NeedsCurseForgeKey text (spec §7; never mentions the environment variable).
 pub(super) fn curseforge_key_text(mods: usize) -> String {
-    format!(
-        "This CurseForge pack lists {mods} mods that have to be downloaded from CurseForge, \
-         which needs an API key Ferrite doesn't have. Ferrite can't import it yet."
-    )
+    ImportBlocker::NeedsCurseForgeKey { mods }.to_string()
 }
 
 /// Plain-words export failure and the raw error for Details (spec §6.5).
@@ -298,27 +293,22 @@ impl Ferrite {
 
     /// Installs the previewed pack on the pack worker with the chosen name.
     fn start_pack_import(&mut self, choice: Box<ImportChoice>) {
-        let lock = self.create_import_lock().or_else(|| {
-            if self.instance_creation_task.is_some() {
-                Some("Wait for the new instance to finish installing.".to_owned())
-            } else if self.mod_task.is_some() || self.pending_uninstall.is_some() {
-                Some("Wait for mod changes to finish.".to_owned())
-            } else {
-                None
+        let owner = match self.activity.begin_import(self.pending_uninstall.is_some()) {
+            Ok(owner) => owner,
+            Err(reason) => {
+                self.import_step = ImportStep::Failed {
+                    choice,
+                    error: reason,
+                };
+                return;
             }
-        });
-        if let Some(reason) = lock {
-            self.import_step = ImportStep::Failed {
-                choice,
-                error: reason,
-            };
-            return;
-        }
+        };
         let Some(target) = choice.target() else {
             self.import_step = ImportStep::Failed {
                 choice,
                 error: "Choose a Minecraft version and loader.".into(),
             };
+            self.activity.complete(owner);
             return;
         };
         let name = match core_instances::validate_instance_name(&choice.name, &self.instances, None)
@@ -329,6 +319,7 @@ impl Ferrite {
                     error: name_error_text(&error),
                     choice,
                 };
+                self.activity.complete(owner);
                 return;
             }
         };
@@ -346,6 +337,7 @@ impl Ferrite {
                     choice,
                     error: format!("Cannot create instance: {error}"),
                 };
+                self.activity.complete(owner);
                 return;
             }
         };
@@ -358,7 +350,7 @@ impl Ferrite {
         let worker = std::thread::Builder::new()
             .name("pack-import".to_owned())
             .spawn(move || {
-                let result = import_worker(
+                let result = crate::packs::prepare_instance_import(
                     &paths,
                     &source,
                     profile,
@@ -374,6 +366,7 @@ impl Ferrite {
         match worker {
             Ok(_) => {
                 self.pack_task = Some(receiver);
+                self.pack_owner = Some(owner);
                 self.pack_status = Some(format!("Importing {}…", choice.pack_name()));
                 self.import_step = ImportStep::Installing(choice);
             }
@@ -381,13 +374,14 @@ impl Ferrite {
                 self.import_step = ImportStep::Failed {
                     choice,
                     error: format!("Failed to start import: {error}"),
-                }
+                };
+                self.activity.complete(owner);
             }
         }
     }
 
     /// Commits a finished import (UI thread) and moves the window to its result.
-    pub(super) fn finish_import(&mut self, result: Result<Box<PackImportOutcome>, String>) {
+    pub(super) fn finish_import(&mut self, result: Result<Box<PreparedImport>, String>) {
         let step = std::mem::take(&mut self.import_step);
         let ImportStep::Installing(choice) = step else {
             // No window state to update (should not happen); keep the status line.
@@ -397,7 +391,7 @@ impl Ferrite {
             }
             return;
         };
-        let mut outcome = match result {
+        let outcome = match result {
             Ok(outcome) => outcome,
             Err(error) => {
                 self.import_step = ImportStep::Failed { choice, error };
@@ -405,30 +399,21 @@ impl Ferrite {
                 return;
             }
         };
-        let name = outcome.profile.name.clone();
-        // commit_new_instance removes the folder itself when it can't keep it (and
-        // leaves it alone when another entry claims it), so the guard stands down.
-        let committed = core_instances::commit_new_instance(
-            &self.paths,
-            &mut self.instances,
-            &self.skipped_instances,
-            outcome.profile.clone(),
-        );
-        outcome.committed = true;
+        let name = outcome.profile().name.clone();
+        let directory = outcome.profile().directory().clone();
+        let warnings = outcome.report().warnings.clone();
+        let committed = outcome.commit(&mut self.instances, &self.skipped_instances);
         match committed {
             Ok(index) => {
                 self.selected_instance = Some(index);
-                self.scroll_to_instance = Some(outcome.profile.directory().clone());
+                self.scroll_to_instance = Some(directory);
                 self.running_text = format!("Imported {name}");
                 self.pack_status = None;
-                if outcome.warnings.is_empty() {
+                if warnings.is_empty() {
                     self.import_step = ImportStep::Choose;
                     self.import_pack_open = false;
                 } else {
-                    self.import_step = ImportStep::Done {
-                        name,
-                        warnings: std::mem::take(&mut outcome.warnings),
-                    };
+                    self.import_step = ImportStep::Done { name, warnings };
                     self.import_pack_open = true;
                 }
             }
@@ -593,12 +578,18 @@ impl Ferrite {
                 Ok(PackTaskEvent::Imported(result)) => {
                     self.pack_task = None;
                     self.finish_import(result);
+                    if let Some(owner) = self.pack_owner.take() {
+                        self.activity.complete(owner);
+                    }
                     return;
                 }
                 Ok(PackTaskEvent::Exported(result)) => {
                     self.pack_task = None;
                     self.pack_status = None;
                     self.finish_export(result);
+                    if let Some(owner) = self.pack_owner.take() {
+                        self.activity.complete(owner);
+                    }
                     return;
                 }
                 Err(TryRecvError::Disconnected) => {
@@ -608,6 +599,9 @@ impl Ferrite {
                         self.finish_import(Err(message));
                     } else {
                         self.finish_export(Err((message.clone(), message)));
+                    }
+                    if let Some(owner) = self.pack_owner.take() {
+                        self.activity.complete(owner);
                     }
                     return;
                 }
@@ -694,17 +688,17 @@ impl Ferrite {
             return;
         }
         // Only this instance's own state blocks its export (checked when it starts).
-        if let Some(reason) = disabled_reason(
-            InstanceAction::Export,
-            &profile.name,
-            &self.instance_status(&profile),
-        ) {
-            self.export_result = Some(ExportResult::Failed {
-                reason: reason.clone(),
-                error: reason,
-            });
-            return;
-        }
+        let status = self.instance_status(&profile);
+        let owner = match self.activity.begin_export(&profile, &status) {
+            Ok(owner) => owner,
+            Err(reason) => {
+                self.export_result = Some(ExportResult::Failed {
+                    reason: reason.clone(),
+                    error: reason,
+                });
+                return;
+            }
+        };
         let options = ExportOptions {
             format: self.pack_format,
             name: if self.pack_name.trim().is_empty() {
@@ -736,6 +730,7 @@ impl Ferrite {
         match worker {
             Ok(_) => {
                 self.export_result = None;
+                self.pack_owner = Some(owner);
                 self.pack_task = Some(receiver);
                 self.pack_status = Some("Preparing export…".into());
             }
@@ -743,7 +738,8 @@ impl Ferrite {
                 self.export_result = Some(ExportResult::Failed {
                     reason: "Ferrite couldn't start the export.".into(),
                     error: error.to_string(),
-                })
+                });
+                self.activity.complete(owner);
             }
         }
     }
@@ -1062,87 +1058,6 @@ fn preview_ui(
         action = Some(ImportAction::Install);
     }
     action
-}
-
-/// The import worker: re-checks the pack, extracts it into the new folder, installs
-/// the game files, and returns the uncommitted outcome. Any failure removes the
-/// folder (the outcome's guard does the same if the UI can't commit it).
-fn import_worker(
-    paths: &ferrite_launcher::core::paths::AppPaths,
-    source: &Path,
-    profile: InstanceProfile,
-    target: PackTarget,
-    include_optional: bool,
-    curseforge_api_key: Option<String>,
-    progress: &dyn Fn(&str),
-) -> Result<PackImportOutcome, String> {
-    let preview = crate::packs::preview(source, curseforge_api_key.as_deref())
-        .map_err(|error| error.to_string())?;
-    if let Some(ImportBlocker::NeedsCurseForgeKey { mods }) = preview.blocker {
-        return Err(curseforge_key_text(mods));
-    }
-    if preview.info.target.is_some() && preview.info.target.as_ref() != Some(&target) {
-        return Err("The pack changed after it was previewed; no instance was kept.".into());
-    }
-    std::fs::create_dir_all(paths.instances_dir())
-        .map_err(|error| format!("Failed to prepare instance storage: {error}"))?;
-    let options = ImportOptions {
-        generic_target: Some(target.clone()),
-        include_optional_modrinth_files: include_optional,
-        curseforge_api_key,
-        ..ImportOptions::default()
-    };
-    let report = crate::packs::import(source, profile.game_dir(paths), &options, progress)
-        .map_err(|error| error.to_string())?;
-    // From here on the folder exists; the guard removes it on any failure.
-    let mut outcome = PackImportOutcome {
-        paths: paths.clone(),
-        profile,
-        files: report.files_written,
-        bytes: report.bytes_written,
-        warnings: report.warnings.clone(),
-        committed: false,
-    };
-    if report.info.target.as_ref() != Some(&target) {
-        return Err("The pack changed while it was being imported; no instance was kept.".into());
-    }
-    progress("Installing Minecraft files…");
-    crate::minecraft::install_version_with_progress(paths, &target.minecraft_version, |message| {
-        progress(message)
-    })
-    .map_err(|error| format!("Failed to install Minecraft: {error}"))?;
-    if target.loader != ModLoader::Vanilla {
-        progress(&format!("Installing {}…", target.loader.label()));
-        crate::loaders::install_version(
-            paths,
-            &target.minecraft_version,
-            target.loader,
-            target.loader_version.as_deref(),
-        )
-        .map_err(|error| format!("Failed to install {}: {error}", target.loader.label()))?;
-        if let Some(requested) = target.loader_version.as_deref() {
-            let installed = crate::loaders::installed_loader_version(
-                paths,
-                &target.minecraft_version,
-                target.loader,
-            );
-            if installed.as_deref() != Some(requested) {
-                return Err(format!(
-                    "The pack needs {} {requested}, but Ferrite installed {}.",
-                    target.loader.label(),
-                    installed.as_deref().unwrap_or("an unknown version")
-                ));
-            }
-        }
-    }
-    eprintln!(
-        "Ferrite: imported {} ({} files, {})",
-        source.display(),
-        outcome.files,
-        format_size(outcome.bytes)
-    );
-    outcome.warnings.dedup();
-    Ok(outcome)
 }
 
 #[cfg(test)]

@@ -12,7 +12,7 @@ use super::dialogs::{
 use super::startup::{details, group_thousands, plural, size_pair};
 use crate::instances::InstanceProfile;
 use eframe::egui::{self, RichText};
-use ferrite_launcher::core::activity::BusyOperation;
+use ferrite_launcher::core::activity::{BusyOperation, InstanceAction, OperationId};
 use ferrite_launcher::core::duplicate::{
     self, DuplicateError, DuplicateProgress, DuplicateStep, DuplicateTask,
 };
@@ -60,6 +60,7 @@ pub(super) enum JobState {
 
 /// One duplicate started from the setup modal.
 pub(super) struct DuplicateJob {
+    operation: OperationId,
     id: u64,
     source: InstanceProfile,
     new_name: String,
@@ -309,15 +310,28 @@ impl Ferrite {
         })?;
         let source_profile = plan.source().clone();
         let new_name = plan.profile().name.clone();
+        let status = self.instance_status(&source_profile);
+        let operation = self.activity.begin_instance(
+            InstanceAction::Duplicate,
+            &source_profile,
+            &status,
+            BusyOperation::Duplicating,
+        )?;
         let task = DuplicateTask::spawn(self.paths.clone(), plan, |directory| {
             crate::minecraft::is_instance_running(directory.as_str())
         })
-        .map_err(|error| format!("Couldn't start the copy: {error}"))?;
-        self.activity
-            .begin(source.as_str(), BusyOperation::Duplicating);
+        .map_err(|error| format!("Couldn't start the copy: {error}"));
+        let task = match task {
+            Ok(task) => task,
+            Err(error) => {
+                self.activity.complete(operation);
+                return Err(error);
+            }
+        };
         self.next_job_id += 1;
         let id = self.next_job_id;
         self.duplicate_jobs.push(DuplicateJob {
+            operation,
             id,
             source: source_profile,
             new_name,
@@ -358,7 +372,7 @@ impl Ferrite {
                 .take()
                 .expect("checked above");
             let source = self.duplicate_jobs[index].source.clone();
-            self.activity.end(source.directory().as_str());
+            let operation = self.duplicate_jobs[index].operation;
             let committed = result.and_then(|copied| {
                 duplicate::commit_duplicate(
                     &self.paths,
@@ -368,6 +382,7 @@ impl Ferrite {
                     Some(task.control()),
                 )
             });
+            self.activity.complete(operation);
             let job = &mut self.duplicate_jobs[index];
             match committed {
                 Ok(report) => {
@@ -611,6 +626,23 @@ impl Ferrite {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blocked_duplicate_keeps_source_and_does_not_start_worker() {
+        let mut app = crate::app::tests::app();
+        let profile =
+            InstanceProfile::new("Survival".into(), "1.21.1".into(), "Vanilla".into(), &[]);
+        app.instances.push(profile.clone());
+        let owner = app.activity.begin_create().unwrap();
+        let error = app
+            .start_duplicate(profile.directory(), "Survival copy")
+            .unwrap_err();
+        assert_eq!(error, "Wait for the new instance to finish installing.");
+        assert!(app.duplicate_jobs.is_empty());
+        assert_eq!(app.instances, vec![profile]);
+        assert!(app.activity.is_active(owner));
+    }
+
     use ferrite_launcher::core::copy::UncopyableFile;
 
     #[test]

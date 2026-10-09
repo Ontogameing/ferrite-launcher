@@ -113,13 +113,6 @@ pub struct SearchResponse {
     pub total_hits: u64,
 }
 
-/// Search the first 20 mods matching the text, Minecraft version and loader.
-/// All filters are ANDed; values are JSON-serialized and URL-encoded, not interpolated.
-pub fn search(query: &str, version: &str, loader: &str) -> Result<SearchResponse, String> {
-    validate_target(version, loader)?;
-    Api::new()?.get("search", &search_params(query, version, loader))
-}
-
 /// Search one 20-hit page using the documented facet and pagination rules.
 /// Invalid Modrinth filter values are reported by the API, not silently changed.
 pub fn search_filtered(filters: &SearchFilters) -> Result<SearchResponse, String> {
@@ -297,15 +290,6 @@ fn validate_target(version: &str, loader: &str) -> Result<(), String> {
         return Err("Minecraft version and loader must not be empty".into());
     }
     Ok(())
-}
-
-fn search_params(query: &str, version: &str, loader: &str) -> Vec<(String, String)> {
-    filtered_search_params(&SearchFilters {
-        query: query.into(),
-        game_version: Some(version.into()),
-        loader: Some(loader.into()),
-        ..SearchFilters::default()
-    })
 }
 
 fn filtered_search_params(filters: &SearchFilters) -> Vec<(String, String)> {
@@ -763,7 +747,12 @@ mod tests {
         assert_eq!(result.hits[0].author, None);
         assert_eq!(result.hits[0].versions, None);
         assert_eq!(result.hits[0].categories, None);
-        let params = search_params("a & b", "1.21\"test", "fabric");
+        let params = filtered_search_params(&SearchFilters {
+            query: "a & b".into(),
+            game_version: Some("1.21\"test".into()),
+            loader: Some("fabric".into()),
+            ..SearchFilters::default()
+        });
         assert_eq!(params[0].1, "a & b");
         let facets: serde_json::Value = serde_json::from_str(&params[2].1).unwrap();
         assert_eq!(
@@ -828,15 +817,6 @@ mod tests {
             ..SearchFilters::default()
         });
         assert_eq!(unrestricted[2].1, "[]");
-        assert_eq!(
-            search_params("test", "1.21.1", "fabric"),
-            filtered_search_params(&SearchFilters {
-                query: "test".into(),
-                game_version: Some("1.21.1".into()),
-                loader: Some("fabric".into()),
-                ..SearchFilters::default()
-            })
-        );
     }
 
     #[test]

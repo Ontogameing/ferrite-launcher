@@ -29,12 +29,8 @@ Most Minecraft launchers did not fit how I play. I did not want to fork Prism �
 - Settings Appearance / Layout
 - `background.rs`
 
-**Orphaned but kept** (substantial prior work; not wired via `mod` — do not delete):
-
-- `config/customization.rs`
-- `app/customize.rs`
-- `app/theme.rs`
-- `app/widgets.rs`
+The unwired customization prototypes were removed during Stage 3 cleanup.
+The active appearance, layout and background systems above remain supported.
 
 ## Installation
 
@@ -104,3 +100,32 @@ Ferrite Launcher is licensed under the [GNU General Public License v3.0 only](LI
 ## Contributing
 
 Issues and pull requests are welcome. The project is early and the surface area changes often — prefer small, tested changes (especially around packs, instances, and auth).
+
+## Rust library
+
+The existing `ferrite_launcher` library exposes storage (`core`), authentication,
+configuration, Minecraft/loaders, Modrinth/local mods, packs, updates and Discord.
+Backend calls remain synchronous: run blocking operations on your own workers and
+adapt progress callbacks to your frontend. Callers own loaded profiles/configuration
+and worker scheduling. `auth::Session` owns account acceptance and cancellation;
+`core::activity::WorkflowCoordinator` owns admission and originating-operation
+completion. The library retains the single process-wide Minecraft child.
+
+`loaders::install_game_files` is the shared Create/Edit installation sequence.
+`packs::prepare_instance_import` returns a `PreparedImport`: drop it to discard the
+new files or consume it with `commit` to accept the profile. Commit delegates
+conflict-aware cleanup to the existing instance persistence operation, including
+failed commits. Unused compatibility wrappers remain internal.
+
+The GUI is enabled by default, so existing `cargo run` and build commands work.
+To build or test the library without GUI dependencies:
+
+```bash
+cargo build --locked --no-default-features --lib
+cargo test --locked --no-default-features --all-targets
+```
+
+Dependent crates can set `default-features = false` for `ferrite-launcher`.
+See the [core API guide](docs/core-api.md) for ownership and workflow calls,
+the [preservation baseline](docs/preservation-baseline.md) for behavior contracts,
+and [release verification](docs/release-verification.md) for checks and remaining gaps.

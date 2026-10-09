@@ -2,20 +2,21 @@
 //!
 //! A rename is a manifest change only (`core::edit::rename_instance`). A version or
 //! loader change installs the shared game files on a worker (the same installer
-//! Create uses), then commits on the UI thread with `core::edit::commit_version_loader`;
+//! Create uses), then commits on the UI thread with `core::edit::PreparedUpdate`;
 //! nothing is committed unless the install succeeds.
 
 use super::dialogs::{
     button_row, enter_pressed, escape_pressed, muted, name_error_text, name_field, primary_button,
     quilt_badge,
 };
-use super::instances::install_game_files;
 use super::startup::details;
-use super::{Ferrite, InstanceCreationEvent, InstanceCreationStage};
+use super::{Ferrite, InstanceCreationStage};
 use crate::instances::InstanceProfile;
 use crate::loaders::ModLoader;
 use eframe::egui::{self, Color32, RichText};
-use ferrite_launcher::core::activity::{BusyOperation, InstanceAction, disabled_reason};
+use ferrite_launcher::core::activity::{
+    BusyOperation, InstanceAction, OperationId, disabled_reason,
+};
 use ferrite_launcher::core::edit::{self, EditError, VersionDirection};
 use ferrite_launcher::core::instances::{self as core_instances, InstanceDirName};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -126,8 +127,14 @@ enum UpdateState {
     Failed { reason: String, error: String },
 }
 
+enum UpdateEvent {
+    Progress(crate::loaders::InstallProgress),
+    Finished(Result<edit::PreparedUpdate, String>),
+}
+
 /// The single version/loader update in progress (or failed and still shown).
 pub(super) struct EditTask {
+    operation: OperationId,
     directory: InstanceDirName,
     name: String,
     new_name: String,
@@ -135,16 +142,9 @@ pub(super) struct EditTask {
     old_loader: String,
     version: String,
     loader: String,
-    events: Option<Receiver<InstanceCreationEvent>>,
+    events: Option<Receiver<UpdateEvent>>,
     state: UpdateState,
     pub(super) window_open: bool,
-}
-
-impl EditTask {
-    /// The instance being updated while the install runs.
-    pub(super) fn installing(&self) -> Option<&InstanceDirName> {
-        self.events.as_ref().map(|_| &self.directory)
-    }
 }
 
 fn is_running(directory: &InstanceDirName) -> bool {
@@ -191,7 +191,7 @@ impl Ferrite {
     }
 
     /// Starts installing `version`/`loader` for the instance; the rename (if any) and
-    /// the version change are committed together when the install succeeds.
+    /// the version change are saved separately when the install succeeds.
     fn start_update(
         &mut self,
         directory: InstanceDirName,
@@ -202,44 +202,48 @@ impl Ferrite {
         if self.edit_busy() {
             return Err("Ferrite is already updating an instance.".into());
         }
-        let Some(profile) = self
+        let prepared = edit::prepare_update(
+            &self.instances,
+            &directory,
+            &new_name,
+            &version,
+            &loader_label,
+            &is_running,
+        )?;
+        let current = self
             .instances
             .iter()
             .find(|profile| profile.directory() == &directory)
-            .cloned()
-        else {
-            return Err("This instance is no longer in the list.".into());
-        };
-        if is_running(&directory) {
-            return Err(format!(
-                "{} started while this was open. Close Minecraft, then try again.",
-                profile.name
-            ));
-        }
-        let Some(loader) = ModLoader::from_label(&loader_label) else {
-            return Err(format!("Unknown mod loader: {loader_label}"));
-        };
+            .expect("checked above");
+        let status = self.instance_status(current);
+        let operation = self.activity.begin_instance(
+            InstanceAction::ChangeVersion,
+            current,
+            &status,
+            BusyOperation::Updating,
+        )?;
         let paths = self.paths.clone();
-        let worker_version = version.clone();
         let (sender, receiver) = mpsc::channel();
-        std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("instance-update".into())
             .spawn(move || {
-                let result = install_game_files(&paths, &worker_version, loader, &|event| {
-                    let _ = sender.send(event);
-                })
-                .map(|()| profile.clone());
-                let _ = sender.send(InstanceCreationEvent::Finished(result));
+                let result = prepared.install(&paths, |event| {
+                    let _ = sender.send(UpdateEvent::Progress(event));
+                });
+                let _ = sender.send(UpdateEvent::Finished(result));
             })
-            .map_err(|error| format!("Couldn't start the update: {error}"))?;
-        self.activity
-            .begin(directory.as_str(), BusyOperation::Updating);
+            .map_err(|error| format!("Couldn't start the update: {error}"));
+        if let Err(error) = spawned {
+            self.activity.complete(operation);
+            return Err(error);
+        }
         let current = self
             .instances
             .iter()
             .find(|profile| profile.directory() == &directory)
             .expect("checked above");
         self.edit_task = Some(EditTask {
+            operation,
             name: current.name.clone(),
             old_version: current.version.clone(),
             old_loader: current.loader.clone(),
@@ -266,79 +270,57 @@ impl Ferrite {
                 return;
             };
             let result = match events.try_recv() {
-                Ok(InstanceCreationEvent::Stage(stage)) => {
-                    task.state = UpdateState::Installing {
-                        status: stage.label().to_owned(),
+                Ok(UpdateEvent::Progress(progress)) => {
+                    let status = match progress {
+                        crate::loaders::InstallProgress::DownloadingMinecraft => {
+                            InstanceCreationStage::DownloadingMinecraft
+                                .label()
+                                .to_owned()
+                        }
+                        crate::loaders::InstallProgress::InstallingLoader => {
+                            InstanceCreationStage::InstallingLoader.label().to_owned()
+                        }
+                        crate::loaders::InstallProgress::DownloadProgress(message) => message,
                     };
+                    task.state = UpdateState::Installing { status };
                     continue;
                 }
-                Ok(InstanceCreationEvent::DownloadProgress(message)) => {
-                    task.state = UpdateState::Installing { status: message };
-                    continue;
-                }
-                Ok(InstanceCreationEvent::Finished(result)) => result.map(|_| ()),
+                Ok(UpdateEvent::Finished(result)) => result,
                 Err(TryRecvError::Empty) => return,
                 Err(TryRecvError::Disconnected) => {
                     Err("The update worker stopped unexpectedly.".to_owned())
                 }
             };
             task.events = None;
-            let directory = task.directory.clone();
-            self.activity.end(directory.as_str());
+            let operation = task.operation;
             let task = self.edit_task.as_ref().expect("checked above");
-            let (name, new_name) = (task.name.clone(), task.new_name.clone());
+            let name = task.name.clone();
             let (version, loader) = (task.version.clone(), task.loader.clone());
-            let failure = match result {
-                Err(error) => Some(error),
-                Ok(()) => match edit::commit_version_loader(
-                    &self.paths,
-                    &mut self.instances,
-                    &self.skipped_instances,
-                    &directory,
-                    &version,
-                    &loader,
-                    &is_running,
-                ) {
-                    Ok(_) => None,
-                    Err(EditError::NowRunning) => Some(format!(
-                        "{name} started while Ferrite was updating it. Close Minecraft, then \
-                         try again."
-                    )),
-                    Err(EditError::Failed(error)) => {
-                        Some(format!("Couldn't save the change: {error}"))
-                    }
-                },
-            };
-            match failure {
-                None => {
-                    let mut shown_name = name.clone();
-                    if new_name != name {
-                        match edit::rename_instance(
-                            &self.paths,
-                            &mut self.instances,
-                            &self.skipped_instances,
-                            &directory,
-                            &new_name,
-                            &|_| false,
-                        ) {
-                            Ok(_) => shown_name = new_name,
-                            Err(error) => {
-                                self.running_text = format!(
-                                    "Updated {name} to {}, but couldn't rename it: {error}",
-                                    version_label(&version, &loader)
-                                );
-                                self.edit_task = None;
-                                return;
-                            }
-                        }
-                    }
-                    self.running_text = format!(
-                        "Updated {shown_name} to {}.",
-                        version_label(&version, &loader)
-                    );
+            let outcome = result.and_then(|prepared| {
+                prepared.commit(&self.paths, &mut self.instances, &self.skipped_instances, &is_running)
+                    .map_err(|error| match error {
+                        EditError::NowRunning => format!("{name} started while Ferrite was updating it. Close Minecraft, then try again."),
+                        EditError::Failed(error) => format!("Couldn't save the change: {error}"),
+                    })
+            });
+            self.activity.complete(operation);
+            match outcome {
+                Ok(outcome) => {
+                    self.running_text = if let Some(error) = outcome.rename_error {
+                        format!(
+                            "Updated {name} to {}, but couldn't rename it: {error}",
+                            version_label(&version, &loader)
+                        )
+                    } else {
+                        format!(
+                            "Updated {} to {}.",
+                            outcome.name,
+                            version_label(&version, &loader)
+                        )
+                    };
                     self.edit_task = None;
                 }
-                Some(error) => {
+                Err(error) => {
                     let task = self.edit_task.as_mut().expect("checked above");
                     task.state = UpdateState::Failed {
                         reason: format!(
@@ -687,6 +669,55 @@ fn edit_loader_picker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disconnected_update_releases_only_its_owner_and_preserves_profile() {
+        let mut app = crate::app::tests::app();
+        let profile =
+            InstanceProfile::new("Survival".into(), "1.21.1".into(), "Vanilla".into(), &[]);
+        app.instances.push(profile.clone());
+        let status = ferrite_launcher::core::activity::InstanceStatus {
+            activity: ferrite_launcher::core::activity::InstanceActivity::Idle,
+            folder_missing: false,
+            global: Default::default(),
+        };
+        let operation = app
+            .activity
+            .begin_instance(
+                InstanceAction::ChangeVersion,
+                &profile,
+                &status,
+                BusyOperation::Updating,
+            )
+            .unwrap();
+        let (sender, events) = mpsc::channel();
+        drop(sender);
+        app.edit_task = Some(EditTask {
+            operation,
+            directory: profile.directory().clone(),
+            name: profile.name.clone(),
+            new_name: "New name".into(),
+            old_version: profile.version.clone(),
+            old_loader: profile.loader.clone(),
+            version: "1.21.2".into(),
+            loader: "Fabric".into(),
+            events: Some(events),
+            state: UpdateState::Installing {
+                status: "Preparing".into(),
+            },
+            window_open: false,
+        });
+        app.poll_edit_task();
+        assert!(!app.activity.is_active(operation));
+        assert_eq!(app.instances, vec![profile]);
+        assert!(matches!(
+            app.edit_task.as_ref().unwrap().state,
+            UpdateState::Failed { .. }
+        ));
+        assert!(app.edit_task.as_ref().unwrap().window_open);
+        app.poll_edit_task();
+        assert!(!app.activity.is_active(operation));
+    }
 
     fn versions() -> Vec<String> {
         ["1.21.1", "1.20.1", "1.19.4"].map(String::from).to_vec()

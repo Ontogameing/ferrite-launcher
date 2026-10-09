@@ -34,9 +34,9 @@
 //! Loader pins are metadata
 //! only in every format; installing the requested loader remains the caller's responsibility.
 
+use crate::core::paths::AppPaths;
 use crate::instances::InstanceProfile;
 use crate::loaders::ModLoader;
-use ferrite_launcher::core::paths::AppPaths;
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use sha2::{Digest, Sha512};
@@ -201,6 +201,132 @@ pub struct ImportReport {
     pub files_written: u64,
     pub bytes_written: u64,
     pub warnings: Vec<String>,
+}
+
+/// Imported files awaiting serialized acceptance into the instance manifest.
+/// Dropping this value removes the new game directory until [`Self::commit`]
+/// transfers cleanup responsibility to the existing instance commit operation.
+/// It does not cancel downloads or provide cross-process locking.
+pub struct PreparedImport {
+    paths: AppPaths,
+    profile: InstanceProfile,
+    report: ImportReport,
+    cleanup: bool,
+}
+
+impl PreparedImport {
+    pub fn profile(&self) -> &InstanceProfile {
+        &self.profile
+    }
+    pub fn report(&self) -> &ImportReport {
+        &self.report
+    }
+
+    /// Consumes this preparation on the caller's serialized commit thread.
+    /// The existing commit operation owns cleanup after any returned result:
+    /// notably, a shared-folder rejection must not trigger another deletion.
+    pub fn commit(
+        mut self,
+        profiles: &mut Vec<InstanceProfile>,
+        skipped: &[crate::instances::SkippedEntry],
+    ) -> std::result::Result<usize, crate::instances::InstanceError> {
+        let result = crate::instances::commit_new_instance(
+            &self.paths,
+            profiles,
+            skipped,
+            self.profile.clone(),
+        );
+        self.cleanup = false;
+        result
+    }
+}
+
+impl Drop for PreparedImport {
+    fn drop(&mut self) {
+        if self.cleanup {
+            let _ = crate::instances::delete_game_dir(&self.paths, &self.profile);
+        }
+    }
+}
+
+/// Prepares an instance import: revalidates the preview target, imports files,
+/// installs Minecraft and the requested loader pin, and verifies the installed pin.
+/// The returned guard must be committed or dropped. Blocking work and synchronous
+/// progress run on this thread; no profile list is mutated during preparation.
+pub fn prepare_instance_import(
+    paths: &AppPaths,
+    source: &Path,
+    profile: InstanceProfile,
+    target: PackTarget,
+    include_optional: bool,
+    curseforge_api_key: Option<String>,
+    progress: &dyn Fn(&str),
+) -> std::result::Result<PreparedImport, String> {
+    let preview = crate::packs::preview(source, curseforge_api_key.as_deref())
+        .map_err(|error| error.to_string())?;
+    if let Some(blocker) = preview.blocker {
+        return Err(blocker.to_string());
+    }
+    if preview.info.target.is_some() && preview.info.target.as_ref() != Some(&target) {
+        return Err("The pack changed after it was previewed; no instance was kept.".into());
+    }
+    std::fs::create_dir_all(paths.instances_dir())
+        .map_err(|error| format!("Failed to prepare instance storage: {error}"))?;
+    let options = ImportOptions {
+        generic_target: Some(target.clone()),
+        include_optional_modrinth_files: include_optional,
+        curseforge_api_key,
+        ..ImportOptions::default()
+    };
+    let report = crate::packs::import(source, profile.game_dir(paths), &options, progress)
+        .map_err(|error| error.to_string())?;
+    // From here on the folder exists; the guard removes it on any failure.
+    let mut outcome = PreparedImport {
+        paths: paths.clone(),
+        profile,
+        report,
+        cleanup: true,
+    };
+    if outcome.report.info.target.as_ref() != Some(&target) {
+        return Err("The pack changed while it was being imported; no instance was kept.".into());
+    }
+    progress("Installing Minecraft files…");
+    crate::minecraft::install_version_with_progress(paths, &target.minecraft_version, |message| {
+        progress(message)
+    })
+    .map_err(|error| format!("Failed to install Minecraft: {error}"))?;
+    if target.loader != ModLoader::Vanilla {
+        progress(&format!("Installing {}…", target.loader.label()));
+        crate::loaders::install_version(
+            paths,
+            &target.minecraft_version,
+            target.loader,
+            target.loader_version.as_deref(),
+        )
+        .map_err(|error| format!("Failed to install {}: {error}", target.loader.label()))?;
+        if let Some(requested) = target.loader_version.as_deref() {
+            let installed = crate::loaders::installed_loader_version(
+                paths,
+                &target.minecraft_version,
+                target.loader,
+            );
+            if installed.as_deref() != Some(requested) {
+                return Err(format!(
+                    "The pack needs {} {requested}, but Ferrite installed {}.",
+                    target.loader.label(),
+                    installed.as_deref().unwrap_or("an unknown version")
+                ));
+            }
+        }
+    }
+    eprintln!(
+        "Ferrite: imported {} ({} files, {})",
+        source.display(),
+        outcome.report.files_written,
+        crate::core::migration::format_size(outcome.report.bytes_written)
+    );
+    outcome.report.warnings.dedup();
+    Ok(outcome)
 }
 
 /// Metadata and file-selection policy for [`export`].
@@ -597,6 +723,17 @@ pub enum ImportBlocker {
     NeedsCurseForgeKey { mods: usize },
 }
 
+impl fmt::Display for ImportBlocker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self::NeedsCurseForgeKey { mods } = self;
+        write!(
+            f,
+            "This CurseForge pack lists {mods} mods that have to be downloaded from CurseForge, \
+         which needs an API key Ferrite doesn't have. Ferrite can't import it yet."
+        )
+    }
+}
+
 /// Everything the import preview shows, gathered without network access or
 /// extraction. Counts are best effort and only cover what the archive declares.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -840,7 +977,7 @@ fn scan_archive(path: &Path, limits: ArchiveLimits) -> Result<ArchiveCatalog> {
 // Enforce a cross-platform relative-path subset rather than merely relying on `Path`.
 // This blocks traversal/absolute paths and Windows aliases such as device names, drive
 // prefixes, alternate-data-stream colons, and trailing dot/space normalization.
-fn validate_zip_name(raw: &str, is_dir: bool) -> Result<String> {
+pub(crate) fn validate_zip_name(raw: &str, is_dir: bool) -> Result<String> {
     if raw.is_empty() || raw.chars().any(char::is_control) || raw.contains('\\') {
         return Err(PackError::Security(format!("invalid ZIP path {raw:?}")));
     }
@@ -906,7 +1043,7 @@ fn is_windows_reserved_component(component: &str) -> bool {
             })
 }
 
-fn validate_unix_mode(mode: Option<u32>, is_dir: bool, name: &str) -> Result<()> {
+pub(crate) fn validate_unix_mode(mode: Option<u32>, is_dir: bool, name: &str) -> Result<()> {
     if let Some(mode) = mode {
         let kind = mode & 0o170000;
         let expected = if is_dir { 0o040000 } else { 0o100000 };
@@ -2066,7 +2203,7 @@ fn check_output(output: &Path, replace_existing: bool) -> Result<()> {
 ///   meanwhile. File systems without hard links (FAT32/exFAT report `EPERM`, others
 ///   `ENOTSUP`/`ERROR_INVALID_FUNCTION`) fall back to renaming the temporary file (already
 ///   complete and synced, in the same folder) into place with
-///   [`ferrite_launcher::core::fsutil::rename_no_replace`], which never replaces an
+///   [`crate::core::fsutil::rename_no_replace`], which never replaces an
 ///   existing file. Both paths are atomic: the output is either absent or complete.
 ///   Where the OS has no exclusive rename for that file system (rare; e.g. some macOS
 ///   network mounts), `rename_no_replace` checks for the output right before a plain
@@ -2089,7 +2226,7 @@ fn publish_export(temporary: &Path, output: &Path, replace: bool, link: LinkFn<'
             // No hard links (FAT32/exFAT, some network shares): the finished temp file
             // already sits in the destination folder and is synced, so rename it into
             // place without replacing anything. The output is never half-written.
-            match ferrite_launcher::core::fsutil::rename_no_replace(temporary, output) {
+            match crate::core::fsutil::rename_no_replace(temporary, output) {
                 Ok(()) => {
                     eprintln!(
                         "Ferrite export: hard links unavailable for {} ({link_error}); \
@@ -2114,7 +2251,7 @@ fn publish_export(temporary: &Path, output: &Path, replace: bool, link: LinkFn<'
 /// Best-effort durability for the publishing rename/link.
 fn sync_parent(output: &Path) {
     if let Some(parent) = output.parent() {
-        let _ = ferrite_launcher::core::fsutil::sync_dir(parent);
+        let _ = crate::core::fsutil::sync_dir(parent);
     }
 }
 
@@ -2304,6 +2441,111 @@ fn cfg_value(value: &str) -> String {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    fn prepared_import_fixture() -> (tempfile::TempDir, AppPaths, PreparedImport) {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_base_dirs(crate::core::paths::BaseDirs {
+            config: temp.path().join("config"),
+            data_local: temp.path().join("data"),
+            cache: temp.path().join("cache"),
+        })
+        .unwrap();
+        let profile = crate::instances::new_instance_profile(
+            &paths,
+            "Imported",
+            "1.20.1",
+            "Vanilla",
+            &[],
+            &[],
+        )
+        .unwrap();
+        crate::instances::create_game_dir(&paths, &profile).unwrap();
+        fs::write(
+            profile.game_dir(&paths).join("level.dat"),
+            b"imported world",
+        )
+        .unwrap();
+        let prepared = PreparedImport {
+            paths: paths.clone(),
+            profile,
+            report: ImportReport {
+                info: PackInfo {
+                    format: PackFormat::GenericZip,
+                    name: "Imported".into(),
+                    version: None,
+                    summary: None,
+                    target: None,
+                    warnings: vec![],
+                },
+                files_written: 1,
+                bytes_written: 14,
+                warnings: vec![],
+            },
+            cleanup: true,
+        };
+        (temp, paths, prepared)
+    }
+
+    #[test]
+    fn import_outcome_removes_only_uncommitted_game_files() {
+        for committed in [false, true] {
+            let (_temp, paths, outcome) = prepared_import_fixture();
+            let directory = outcome.profile().game_dir(&paths);
+            let world = directory.join("level.dat");
+            if committed {
+                let mut profiles = vec![];
+                assert_eq!(outcome.commit(&mut profiles, &[]).unwrap(), 0);
+                assert_eq!(crate::instances::load(&paths).unwrap().profiles, profiles);
+            } else {
+                drop(outcome);
+            }
+            assert_eq!(directory.exists(), committed);
+            if committed {
+                assert_eq!(fs::read(world).unwrap(), b"imported world");
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_import_failed_commit_cleans_new_files() {
+        let (_temp, paths, outcome) = prepared_import_fixture();
+        let directory = outcome.profile().game_dir(&paths);
+        fs::write(paths.instances_manifest(), b"broken manifest").unwrap();
+        let mut profiles = vec![];
+        assert!(outcome.commit(&mut profiles, &[]).is_err());
+        assert!(profiles.is_empty());
+        assert!(!directory.exists());
+        assert_eq!(
+            fs::read(paths.instances_manifest()).unwrap(),
+            b"broken manifest"
+        );
+    }
+
+    #[test]
+    fn prepared_import_failed_commit_preserves_claimed_folder() {
+        let (_temp, paths, outcome) = prepared_import_fixture();
+        let directory = outcome.profile().game_dir(&paths);
+        let mut profiles = vec![outcome.profile().clone()];
+        assert!(matches!(
+            outcome.commit(&mut profiles, &[]),
+            Err(crate::instances::InstanceError::FolderShared { .. })
+        ));
+        assert_eq!(
+            fs::read(directory.join("level.dat")).unwrap(),
+            b"imported world"
+        );
+        assert_eq!(profiles.len(), 1);
+    }
+
+    #[test]
+    fn prepared_import_disconnected_result_removes_unaccepted_files() {
+        let (_temp, paths, outcome) = prepared_import_fixture();
+        let directory = outcome.profile().game_dir(&paths);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        drop(receiver);
+        drop(sender.send(outcome).unwrap_err());
+        assert!(!directory.exists());
+    }
 
     struct TempDir(PathBuf);
     impl TempDir {

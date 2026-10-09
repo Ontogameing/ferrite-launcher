@@ -6,10 +6,19 @@ license = "GPL-3.0-only"
 repository = "https://github.com/Ontogameing/ferrite-launcher"
 description = "A lightweight, customizable Minecraft launcher written in Rust"
 
+[features]
+default = ["gui"]
+gui = ["dep:eframe", "dep:egui", "dep:image", "dep:rfd"]
+
+[[bin]]
+name = "ferrite-launcher"
+path = "src/main.rs"
+required-features = ["gui"]
+
 [dependencies]
-eframe = "0.36.1"
-egui = "0.36.1"
-image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
+eframe = { version = "0.36.1", optional = true }
+egui = { version = "0.36.1", optional = true }
+image = { version = "0.25.10", optional = true, default-features = false, features = ["png", "jpeg", "webp"] }
 reqwest = { version = "0.12", features = ["blocking"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -20,7 +29,7 @@ zip = "0.6"
 discord-rich-presence = "1.1.0"
 directories = "6.0"
 toml = "0.8"
-rfd = "0.15"
+rfd = { version = "0.15", optional = true }
 semver = "1"
 # Moves deleted instances to the OS trash (Recycle Bin / Trash / freedesktop trash).
 # Default features: COM apartment-threaded init on Windows (Ferrite calls it on a

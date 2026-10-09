@@ -1,16 +1,16 @@
 //! Link-safe tree scanning and copying shared by the storage migration and
 //! instance duplication.
 //!
-//! * [`scan_tree`] lists a tree without following links. Genuine links (symlinks;
+//! * `scan_tree` lists a tree without following links. Genuine links (symlinks;
 //!   on Windows junctions and other name-surrogate reparse points) are recorded in
-//!   [`TreeScan::links`] and never traversed or copied. Entries that are not links but
-//!   can't be copied (special files, unreadable folders) go in [`TreeScan::blocked`].
-//! * [`copy_tree`] copies a scanned tree into a destination Ferrite owns. Every file
+//!   `TreeScan::links` and never traversed or copied. Entries that are not links but
+//!   can't be copied (special files, unreadable folders) go in `TreeScan::blocked`.
+//! * `copy_tree` copies a scanned tree into a destination Ferrite owns. Every file
 //!   is written to a `.ferrite-partial` name, given its original timestamp, fsynced,
 //!   then renamed, so a file with its final name is always complete. Files are always
 //!   copied, never hard-linked. Source files that can't be read are collected and
-//!   reported together as [`CopyFailure::Uncopyable`].
-//! * [`describe_change`] compares two scans so callers can refuse to commit a copy of
+//!   reported together as `CopyFailure::Uncopyable`.
+//! * `describe_change` compares two scans so callers can refuse to commit a copy of
 //!   a tree that changed while it was being copied.
 
 use crate::core::fsutil;
@@ -95,7 +95,7 @@ impl TreeScan {
     }
 }
 
-/// Progress, cancellation and test hooks for [`copy_tree`].
+/// Progress, cancellation and test hooks for `copy_tree`.
 pub(crate) trait CopyObserver {
     /// Checked before every file and every chunk.
     fn cancelled(&self) -> bool;
@@ -126,7 +126,7 @@ fn exists_no_follow(path: &Path) -> bool {
 }
 
 /// Lists `root` without following links. Only a failure to read `root` itself is an
-/// error; problems further down are recorded in [`TreeScan::blocked`].
+/// error; problems further down are recorded in `TreeScan::blocked`.
 pub(crate) fn scan_tree(root: &Path) -> Result<TreeScan, CopyFailure> {
     let mut scan = TreeScan::default();
     fs::read_dir(root).map_err(io_ctx(format!("read {}", root.display())))?;

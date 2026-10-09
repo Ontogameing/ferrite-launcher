@@ -781,9 +781,39 @@ fn identical_candidates_do_not_prompt() {
     let dir = tempfile::tempdir().unwrap();
     let first = legacy_tree(&dir.path().join("one"));
     let second = legacy_tree(&dir.path().join("two"));
+    for candidate in [&first, &second] {
+        fs::write(
+            candidate.join("versions/1.21.1/client.jar"),
+            vec![7; 16_385],
+        )
+        .unwrap();
+    }
     let paths = paths_in(&dir.path().join("ferrite"));
     let (_, candidate, _) = expect_migration(plan(&paths, &[first.clone(), second]).unwrap());
     assert_eq!(candidate.path, first);
+}
+
+#[test]
+fn same_size_different_worlds_require_a_user_choice() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = legacy_tree(&dir.path().join("one"));
+    let second = legacy_tree(&dir.path().join("two"));
+    let world = "instances/survival/saves/world/level.dat";
+    let mut bytes = vec![7; 16_385];
+    fs::write(first.join(world), &bytes).unwrap();
+    bytes[16_384] = 8;
+    fs::write(second.join(world), &bytes).unwrap();
+    let paths = paths_in(&dir.path().join("ferrite"));
+    match plan(&paths, &[first.clone(), second.clone()]).unwrap() {
+        StartupPlan::NeedsUserChoice { candidates, .. } => {
+            assert_eq!(candidates.len(), 2);
+            assert_eq!(candidates[0].path, first);
+            assert_eq!(candidates[1].path, second);
+        }
+        other => panic!("expected NeedsUserChoice for different worlds, got {other:?}"),
+    }
+    assert!(!paths.storage_root().exists());
+    assert!(!paths.migration_state_file().exists());
 }
 
 #[test]
